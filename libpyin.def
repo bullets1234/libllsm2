@@ -1,0 +1,5 @@
+EXPORTS
+	pyin_init
+	pyin_trange
+	pyin_analyze
+	pyin_free

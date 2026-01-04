@@ -1,0 +1,57 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "demo-stretch", "demo-stretch.vcxproj", "{ABCD1234-5678-9ABC-DEF0-123456789ABC}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ciglet", "test\ciglet\ciglet.vcxproj", "{6FD573BB-3F2E-4EA9-8A29-752448730E11}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libpyin", "test\libpyin\libpyin.vcxproj", "{B2A7ABCD-1234-4321-ABCD-12345678ABCD}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libllsm2", "libllsm2.vcxproj", "{F2EB8A73-D2F7-4BBF-8054-1F4D67C4B778}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libgvps", "test\libgvps\libgvps.vcxproj", "{6AB4E505-C7C0-420C-8E33-D424CD817A67}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libllsm2_dll", "libllsm2_dll.vcxproj", "{2E1F6C9E-4E4C-4A1B-9B3A-6B4B4B1C8D1F}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libpyin_dll", "libpyin_dll.vcxproj", "{A5B8B0E3-1E20-4F21-9D43-5F5596D1E2A9}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{ABCD1234-5678-9ABC-DEF0-123456789ABC}.Debug|x64.ActiveCfg = Debug|x64
+		{ABCD1234-5678-9ABC-DEF0-123456789ABC}.Debug|x64.Build.0 = Debug|x64
+		{ABCD1234-5678-9ABC-DEF0-123456789ABC}.Release|x64.ActiveCfg = Release|x64
+		{ABCD1234-5678-9ABC-DEF0-123456789ABC}.Release|x64.Build.0 = Release|x64
+		{6FD573BB-3F2E-4EA9-8A29-752448730E11}.Debug|x64.ActiveCfg = Debug|x64
+		{6FD573BB-3F2E-4EA9-8A29-752448730E11}.Debug|x64.Build.0 = Debug|x64
+		{6FD573BB-3F2E-4EA9-8A29-752448730E11}.Release|x64.ActiveCfg = Release|x64
+		{6FD573BB-3F2E-4EA9-8A29-752448730E11}.Release|x64.Build.0 = Release|x64
+		{B2A7ABCD-1234-4321-ABCD-12345678ABCD}.Debug|x64.ActiveCfg = Debug|x64
+		{B2A7ABCD-1234-4321-ABCD-12345678ABCD}.Debug|x64.Build.0 = Debug|x64
+		{B2A7ABCD-1234-4321-ABCD-12345678ABCD}.Release|x64.ActiveCfg = Release|x64
+		{B2A7ABCD-1234-4321-ABCD-12345678ABCD}.Release|x64.Build.0 = Release|x64
+		{F2EB8A73-D2F7-4BBF-8054-1F4D67C4B778}.Debug|x64.ActiveCfg = Debug|x64
+		{F2EB8A73-D2F7-4BBF-8054-1F4D67C4B778}.Debug|x64.Build.0 = Debug|x64
+		{F2EB8A73-D2F7-4BBF-8054-1F4D67C4B778}.Release|x64.ActiveCfg = Release|x64
+		{F2EB8A73-D2F7-4BBF-8054-1F4D67C4B778}.Release|x64.Build.0 = Release|x64
+		{6AB4E505-C7C0-420C-8E33-D424CD817A67}.Debug|x64.ActiveCfg = Debug|x64
+		{6AB4E505-C7C0-420C-8E33-D424CD817A67}.Debug|x64.Build.0 = Debug|x64
+		{6AB4E505-C7C0-420C-8E33-D424CD817A67}.Release|x64.ActiveCfg = Release|x64
+		{6AB4E505-C7C0-420C-8E33-D424CD817A67}.Release|x64.Build.0 = Release|x64
+		{2E1F6C9E-4E4C-4A1B-9B3A-6B4B4B1C8D1F}.Debug|x64.ActiveCfg = Debug|x64
+		{2E1F6C9E-4E4C-4A1B-9B3A-6B4B4B1C8D1F}.Debug|x64.Build.0 = Debug|x64
+		{2E1F6C9E-4E4C-4A1B-9B3A-6B4B4B1C8D1F}.Release|x64.ActiveCfg = Release|x64
+		{2E1F6C9E-4E4C-4A1B-9B3A-6B4B4B1C8D1F}.Release|x64.Build.0 = Release|x64
+		{A5B8B0E3-1E20-4F21-9D43-5F5596D1E2A9}.Debug|x64.ActiveCfg = Debug|x64
+		{A5B8B0E3-1E20-4F21-9D43-5F5596D1E2A9}.Debug|x64.Build.0 = Debug|x64
+		{A5B8B0E3-1E20-4F21-9D43-5F5596D1E2A9}.Release|x64.ActiveCfg = Release|x64
+		{A5B8B0E3-1E20-4F21-9D43-5F5596D1E2A9}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
