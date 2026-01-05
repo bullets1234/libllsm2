@@ -1,6 +1,15 @@
+/* demo-stretch: time-stretch example using libllsm2 + pyin */
 #include "../llsm.h"
-#include "nebula.h"
 #include "ciglet.h"
+#include "pyin.h"
+#include <math.h>
+
+/* Use definitions from included headers (FP_TYPE, linterp, max/min, cos_2/sin_2). */
+/* Local helpers only for added functionality below. */
+
+#ifndef EPS
+#define EPS 1e-8f
+#endif
 
 // circular interpolation of two radian values
 static FP_TYPE linterpc(FP_TYPE a, FP_TYPE b, FP_TYPE ratio) {
@@ -45,12 +54,14 @@ static void interp_nmframe(llsm_nmframe* dst, llsm_nmframe* src,
 }
 
 #define LOG2DB (20.0 / 2.3025851)
-#define mag2db(x) (log_2(x) * LOG2DB)
+static FP_TYPE mag2db(FP_TYPE mag) {
+    return 20.0f * log10f(mag);
+}
 
 // dst <- (dst &> src)
 static void interp_llsm_frame(llsm_container* dst, llsm_container* src,
   FP_TYPE ratio) {
-# define EPS 1e-8
+/* EPS already defined globally if needed; avoid redefinition warnings. */
   FP_TYPE dst_f0 = *((FP_TYPE*)llsm_container_get(dst, LLSM_FRAME_F0));
   FP_TYPE src_f0 = *((FP_TYPE*)llsm_container_get(src, LLSM_FRAME_F0));
   llsm_nmframe* dst_nm = llsm_container_get(dst, LLSM_FRAME_NM);
@@ -125,7 +136,6 @@ static void interp_llsm_frame(llsm_container* dst, llsm_container* src,
   for(int i = 0; i < nspec; i ++) dst_vtmagn[i] = max(-80, dst_vtmagn[i]);
 
   interp_nmframe(dst_nm, src_nm, ratio, dst_f0 > 0, src_f0 > 0);
-# undef EPS
 }
 
 int main() {

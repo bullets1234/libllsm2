@@ -1,0 +1,95 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio cache/options
+.vs/
+.vscode/
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build artifacts
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.iobj
+*.ipdb
+*.obj
+*.pch
+*.res
+*.tlog
+*.lastbuildstate
+*.log
+*.idb
+*.ipch
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+
+# Data files
+*.wav
+*.csv
+
+# Test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+
+# NuGet Packages
+*.nupkg
+*.snupkg
+**/packages/*
+!**/packages/build/
+
+# Visual Studio profiler
+*.psess
+*.vsp
+*.vspx
+*.sap
+
+# Visual C++ cache files
+ipch/
+*.aps
+*.ncb
+*.opendb
+*.cachefile
+*.VC.db-shm
+*.VC.db-wal
+
+# Build folders
+build/
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# C# build artifacts
+**/bin/
+**/obj/
+*.dll.config
+*.cache
+*.nuget.props
+*.nuget.targets
+*.nuget.dgspec.json
+project.assets.json
+
+# Exceptions - include certain files if needed
+!libllsm2.def
+!libpyin.def
