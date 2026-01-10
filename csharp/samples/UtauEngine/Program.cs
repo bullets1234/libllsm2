@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Text;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using LlsmBindings;
@@ -293,6 +294,29 @@ class Program
         // 低音での子音明瞭度向上、高音での倍音豊かさ向上
         bool useAdaptiveWindow = flags.Contains("W", StringComparison.OrdinalIgnoreCase);
         
+        // Uフラグ: Unvoiced attenuation（無声音減衰）
+        // U9 = -9dB（標準）、U12 = -12dB（強調）、U15 = -15dB（最大）
+        // 無声子音（さ行/た行等）の明瞭度向上、有声成分混入を防止
+        int unvoicedAttenuation = 0;  // 0 = オフ
+        var uMatch = Regex.Match(flags, @"U(\d+)", RegexOptions.IgnoreCase);
+        if (uMatch.Success)
+        {
+            unvoicedAttenuation = int.Parse(uMatch.Groups[1].Value);
+            unvoicedAttenuation = Math.Clamp(unvoicedAttenuation, 6, 20);  // 6-20dB範囲
+            Console.WriteLine($"  [Unvoiced] Attenuation: -{unvoicedAttenuation}dB");
+        }
+        
+        // Tフラグ: Spectral Tilt（スペクトル傾斜）
+        // T0 = フラット、T-6 = -6dB/oct（暗い声）、T+6 = +6dB/oct（明るい声）
+        // 周波数全域でスペクトル傾斜を調整、声質の明るさ/暗さをコントロール
+        int spectralTilt = 0;  // デフォルト0 = フラット
+        var tMatch = Regex.Match(flags, @"T([+-]?\d+)", RegexOptions.IgnoreCase);
+        if (tMatch.Success)
+        {
+            spectralTilt = int.Parse(tMatch.Groups[1].Value);
+            spectralTilt = Math.Clamp(spectralTilt, -12, 12);  // ±12dB/oct範囲
+        }
+        
         // 分析オプション最適化（高品質設定）
         int maxnhar, maxnhar_e;
         
@@ -305,19 +329,23 @@ class Program
             maxnhar = (int)Math.Ceiling(maxFreq / srcF0);
             maxnhar = Math.Clamp(maxnhar, 100, 2000);  // 100-2000倍音の範囲に制限
             
-            // エンベロープ倍音数: 絶対値で5-10（元実装の範囲、maxnharに依存しない）
-            // test-layer0-anasynth.c: maxnhar=400でmaxnhar_e=5（1.25%）
-            // デフォルト: maxnhar=100でmaxnhar_e=4（4%）
-            // → 絶対値5-10が適切（maxnharが変わっても固定）
-            maxnhar_e = Math.Clamp((int)(maxnhar * 0.025f), 5, 10);
+            // エンベロープ倍音数: F0依存の動的調整（子音品質向上）
+            // 低F0（80-150Hz）: 15-20倍音 → 周波数分解能 4-10Hz（細かい子音変化を捉える）
+            // 中F0（150-300Hz）: 10-12倍音 → 周波数分解能 12-25Hz（バランス重視）
+            // 高F0（300-600Hz）: 8-10倍音  → 周波数分解能 30-60Hz（計算効率重視）
+            float maxnhar_e_ratio = srcF0 < 120f ? 0.12f :   // 低音: 12%
+                                    srcF0 < 200f ? 0.08f :   // 中低音: 8%
+                                    srcF0 < 350f ? 0.05f :   // 中音: 5%
+                                                   0.03f;    // 高音: 3%
+            maxnhar_e = Math.Clamp((int)(maxnhar * maxnhar_e_ratio), 8, 20);
             
             Console.WriteLine($"  [High-Res] Dynamic harmonics: maxnhar={maxnhar}, maxnhar_e={maxnhar_e} (F0={srcF0:F1}Hz)");
         }
         else
         {
-            // 標準モード: 固定値（互換性重視）
+            // 標準モード: 固定値（子音品質向上のため8に引き上げ）
             maxnhar = 800;       // 最大倍音数（8kHzまでカバー、F0=100Hz時）
-            maxnhar_e = 5;       // エンベロープ最大倍音数
+            maxnhar_e = 8;       // エンベロープ最大倍音数（旧5→8、子音明瞭度向上）
         }
         
         unsafe
@@ -568,7 +596,7 @@ class Program
         {
             // 子音部velocity + 伸縮部ストレッチ
             output = SynthesizeWithConsonantAndStretch(chunk, fs, srcF0, targetF0, 
-                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs);
+                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt);
         }
         
         // ボリューム適用
@@ -660,7 +688,7 @@ class Program
     /// 子音部velocity + 伸縮部ストレッチして合成
     /// </summary>
     static float[] SynthesizeWithConsonantAndStretch(ChunkHandle srcChunk, int fs, float srcF0, float targetF0,
-                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0)
+                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0)
     {
         float basePitchRatio = targetF0 / srcF0;
         
@@ -1078,6 +1106,48 @@ class Program
                     }
                 }
             }
+        }
+        
+        // Tフラグ: スペクトル傾斜調整（Layer1状態で実行）
+        // VTMAGNが存在するLayer1で周波数依存のゲイン調整を適用
+        if (spectralTilt != 0)
+        {
+            Console.WriteLine($"[Synthesis] Spectral tilt: {spectralTilt:+0;-0}dB/oct (T flag, Layer1)");
+            
+            for (int i = 0; i < dstNfrm; i++)
+            {
+                var frame = Llsm.GetFrame(dstChunk, i);
+                float f0 = Llsm.GetFrameF0(frame);
+                if (f0 <= 0) continue;  // 無声音はスキップ
+                
+                // VTMAGNを取得（対数振幅スペクトル）
+                var vtmagnPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+                if (vtmagnPtr == IntPtr.Zero) continue;
+                
+                int nspec = NativeLLSM.llsm_fparray_length(vtmagnPtr);
+                float[] vtmagn = new float[nspec];
+                Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
+                
+                // 周波数ビンごとにスペクトル傾斜を適用
+                for (int j = 0; j < nspec; j++)
+                {
+                    // 周波数計算（kHz単位）
+                    float freqKhz = (float)j / nspec * (fs / 2000.0f);
+                    // 傾斜計算: dB/oct → log2スケール
+                    float tiltDb = spectralTilt * MathF.Log2(MathF.Max(freqKhz, 0.1f));
+                    vtmagn[j] += tiltDb;
+                }
+                
+                Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
+            }
+        }
+        
+        // Uフラグ: 無声音減衰（Layer1状態で実行）
+        // F0=0フレームのVTMAGNを減衰し、無声子音の明瞭度を向上
+        if (unvoicedAttenuation > 0)
+        {
+            Console.WriteLine($"[Synthesis] Unvoiced attenuation: -{unvoicedAttenuation}dB (U flag, Layer1)");
+            Llsm.AttenuateUnvoiced(dstChunk, uvDb: -unvoicedAttenuation);
         }
         
         // Layer0 に変換
@@ -2799,7 +2869,7 @@ class Program
             // 子音部固定で 2.0x ストレッチ（比較用）
             using var chunkFixed = Llsm.CopyChunk(masterChunk);
             var fixedStretch = SynthesizeWithConsonantAndStretch(chunkFixed, wavFs, avgF0, avgF0, 
-                                                                  consonantFrames, 1.0f, 2.0f, new List<int>(), 120);
+                                                                  consonantFrames, 1.0f, 2.0f, new List<int>(), 120, 50, 0, 100, 0.005f, false, false, 100, false, 0, 0, 0);
             Wav.WriteMono16("utau_stretch_consonant_fixed.wav", fixedStretch, wavFs);
             Console.WriteLine($"  Fixed consonant stretch: {fixedStretch.Length} samples");
             

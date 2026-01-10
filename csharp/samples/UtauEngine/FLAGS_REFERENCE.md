@@ -277,6 +277,81 @@ L2R.exe input.wav output.wav C4 100 W
 
 ---
 
+### **Uフラグ** - Unvoiced Attenuation（無声音減衰）
+
+**書式**: `U<6-20>`
+
+**デフォルト**: オフ（未指定）
+
+**説明**: F0=0フレーム（無声音）のVTMAGN（声道スペクトル）を減衰させ、無声子音の明瞭度を向上します。
+
+**推奨値**:
+- `U9`: -9dB減衰（標準、推奨）
+- `U12`: -12dB減衰（強調）
+- `U15`: -15dB減衰（最大明瞭度）
+
+**効果**:
+- ✅ さ行/ざ行の区別明確化（無声/有声の分離）
+- ✅ 破裂音（た行/だ行）のアタック鋭角化
+- ✅ 無声子音連続時の個別性向上
+- ✅ 息継ぎ・ブレスの自然化
+
+**メカニズム**: Layer1分析時に無声部に有声音のスペクトル特性が漏れる現象を補正
+
+**推奨**: さ行・た行が不明瞭な音源、子音明瞭度重視の用途
+
+**例**:
+```
+L2R.exe input.wav output.wav C4 100 U9   # 標準
+L2R.exe input.wav output.wav C4 100 U12  # 強調
+```
+
+---
+
+### **Tフラグ** - Spectral Tilt（スペクトル傾斜）
+
+**書式**: `T<±0-12>`
+
+**デフォルト**: `T0`（フラット）
+
+**説明**: 周波数全域でスペクトル傾斜を調整し、声質の明るさ/暗さを制御します。
+
+**原理**: VTMAGNに対して周波数依存のゲイン調整（dB/octave）を適用
+
+**推奨値**:
+
+| 値 | 効果 | 用途 |
+|----|------|------|
+| `T-12` | 超暗い声（高域-12dB/oct） | 重低音、ダークな雰囲気 |
+| `T-6` | 暗い声（高域-6dB/oct） | 柔らかい声質、バラード |
+| `T0` | フラット（標準） | **デフォルト推奨** |
+| `T+3` | やや明るい | ポップス、クリアな発音 |
+| `T+6` | 明るい声（高域+6dB/oct） | アニメ声、明瞭度重視 |
+| `T+12` | 超明るい声（高域+12dB/oct） | 強調、特殊効果 |
+
+**効果**:
+- ✅ 声質の明るさ/暗さを直感的に調整
+- ✅ ウィスパー（T-10）～叫び声（T+10）の表現
+- ✅ 既存音源の音質補正に有効
+
+**計算式**: `gain(f) = tilt × log₂(f[kHz])`
+
+**他フラグとの組み合わせ**:
+- `g-12 T+6`: 女性化 + 明るい声質
+- `B80 T-6`: 息声 + 柔らかい声
+- `U9 T+3`: 子音明瞭 + クリアな発音
+
+**注意**: 過度な値（±10以上）は不自然になる可能性あり
+
+**例**:
+```
+L2R.exe input.wav output.wav C4 100 T+6   # 明るい声
+L2R.exe input.wav output.wav C4 100 T-6   # 暗い声
+L2R.exe input.wav output.wav C4 100 T0    # フラット（標準）
+```
+
+---
+
 ### **M+フラグ** - Modulation Boundary Fade
 
 **書式**: `M+` (値なし)
@@ -352,17 +427,23 @@ L2R.exe input.wav output.wav C4 100 HRQF50
 # 適応的窓 + 高品質（低音男声・高音女声に推奨）
 L2R.exe input.wav output.wav C4 100 HRWF50
 
-# フル品質セット（Q+W+R+高品質）
-L2R.exe input.wav output.wav C4 100 HRQWRF50
+# 無声音明瞭化 + 高品質（子音重視）
+L2R.exe input.wav output.wav C4 100 HRU9F50
 
-# 超高品質セット（オーバーサンプル込み）
-L2R.exe input.wav output.wav C4 100 HROQWRF50
+# スペクトル傾斜 + 高品質（明るい声質）
+L2R.exe input.wav output.wav C4 100 HRT+6F50
+
+# フル品質セット（Q+W+U+T+R）
+L2R.exe input.wav output.wav C4 100 HRQWU9T+3RF50
+
+# 超高品質セット（全機能有効）
+L2R.exe input.wav output.wav C4 100 HROQWU9T+6RF50
 
 # 息声 + フォルマント固定 + 高解像度
 L2R.exe input.wav output.wav C4 100 B80F0H
 
-# 女性的 + 自然なフォルマント + RPS
-L2R.exe input.wav output.wav C4 100 g-30F50R
+# 女性的 + 明るい声質 + RPS
+L2R.exe input.wav output.wav C4 100 g-30T+6F50R
 
 # ピッチ自動検出 + 標準設定
 L2R.exe input.wav output.wav C4 100 P
