@@ -248,6 +248,35 @@ L2R.exe input.wav output.wav C4 100 Q
 
 ---
 
+### **Wフラグ** - Adaptive Window Size（適応的窓サイズ）
+
+**書式**: `W` (値なし)
+
+**デフォルト**: オフ（固定4.0周期）
+
+**説明**: F0に応じて分析窓サイズを動的に調整します。
+
+**調整ロジック**:
+- **低音域 (F0<120Hz)**: rel_winsize=3.0 → 時間分解能向上
+- **中音域**: rel_winsize=4.0 → 標準バランス
+- **高音域 (F0>350Hz)**: rel_winsize=5.0 → 周波数分解能向上
+
+**効果**:
+- ✅ 低音での子音明瞭度向上（窓が狭まり速い変化に追従）
+- ✅ 高音での倍音豊かさ向上（窓が広がり詳細な周波数解析）
+- ✅ 滑舌・発音の自然さ改善
+
+**推奨**: 低音男声（<150Hz）、高音女声（>350Hz）で特に効果大
+
+**注意**: 計算コスト約10-20%増加
+
+**例**:
+```
+L2R.exe input.wav output.wav C4 100 W
+```
+
+---
+
 ### **M+フラグ** - Modulation Boundary Fade
 
 **書式**: `M+` (値なし)
@@ -320,8 +349,14 @@ L2R.exe input.wav output.wav C4 100 HROF50
 # F0精密化 + 高品質（ビブラート曲に推奨）
 L2R.exe input.wav output.wav C4 100 HRQF50
 
-# F0精密化 + RPS + 高品質（最大品質）
-L2R.exe input.wav output.wav C4 100 HRQRF50
+# 適応的窓 + 高品質（低音男声・高音女声に推奨）
+L2R.exe input.wav output.wav C4 100 HRWF50
+
+# フル品質セット（Q+W+R+高品質）
+L2R.exe input.wav output.wav C4 100 HRQWRF50
+
+# 超高品質セット（オーバーサンプル込み）
+L2R.exe input.wav output.wav C4 100 HROQWRF50
 
 # 息声 + フォルマント固定 + 高解像度
 L2R.exe input.wav output.wav C4 100 B80F0H

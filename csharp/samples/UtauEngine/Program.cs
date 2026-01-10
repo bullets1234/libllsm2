@@ -288,6 +288,11 @@ class Program
         // ビブラート・ポルタメントの滑らかさ向上、子音→母音遷移の自然さ向上
         bool useF0Refine = flags.Contains("Q", StringComparison.OrdinalIgnoreCase);
         
+        // Wフラグ: Adaptive Window Size（適応的窓サイズ）
+        // 指定なし=固定4.0周期、指定あり=F0に応じて動的調整（低音→3.0、高音→5.0）
+        // 低音での子音明瞭度向上、高音での倍音豊かさ向上
+        bool useAdaptiveWindow = flags.Contains("W", StringComparison.OrdinalIgnoreCase);
+        
         // 分析オプション最適化（高品質設定）
         int maxnhar, maxnhar_e;
         
@@ -332,6 +337,39 @@ class Program
             else
             {
                 aoptPtr->f0_refine = 0;   // 標準（デフォルト）
+            }
+            
+            // Wフラグ: 適応的窓サイズ調整
+            if (useAdaptiveWindow)
+            {
+                // F0統計を計算（有音部のみ）
+                var validF0 = f0.Where(x => x > 0).ToArray();
+                if (validF0.Length > 0)
+                {
+                    float avgF0 = validF0.Average();
+                    float minF0 = validF0.Min();
+                    float maxF0 = validF0.Max();
+                    float f0Range = maxF0 - minF0;
+                    
+                    // F0範囲が広い場合は中間値、狭い場合は平均値を使用
+                    float refF0 = (f0Range > 200) ? (minF0 + maxF0) / 2 : avgF0;
+                    
+                    // 対数スケールで滑らかに調整（200Hzを基準点）
+                    float logF0 = MathF.Log(refF0 / 200.0f);
+                    float rel_winsize = 4.0f * MathF.Exp(-0.2f * logF0);
+                    rel_winsize = Math.Clamp(rel_winsize, 2.5f, 6.0f);  // 安全範囲
+                    
+                    aoptPtr->rel_winsize = rel_winsize;
+                    Console.WriteLine($"  [Window] Adaptive: F0={refF0:F1}Hz → rel_winsize={rel_winsize:F2} (W flag)");
+                }
+                else
+                {
+                    aoptPtr->rel_winsize = 4.0f;  // F0が全て0の場合はデフォルト
+                }
+            }
+            else
+            {
+                aoptPtr->rel_winsize = 4.0f;  // 標準（デフォルト: 4周期）
             }
         }
         
