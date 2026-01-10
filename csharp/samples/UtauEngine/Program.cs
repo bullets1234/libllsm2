@@ -283,6 +283,11 @@ class Program
         // 分析オプション設定で使用するため、ここで先に解析
         bool useHighResolution = flags.Contains("H", StringComparison.OrdinalIgnoreCase);
         
+        // Qフラグ: Quality F0 refinement（F0精密化）
+        // 指定なし=標準F0、指定あり=高調波解析ベースのF0精密化
+        // ビブラート・ポルタメントの滑らかさ向上、子音→母音遷移の自然さ向上
+        bool useF0Refine = flags.Contains("Q", StringComparison.OrdinalIgnoreCase);
+        
         // 分析オプション最適化（高品質設定）
         int maxnhar, maxnhar_e;
         
@@ -317,6 +322,17 @@ class Program
             aoptPtr->maxnhar = maxnhar;
             aoptPtr->maxnhar_e = maxnhar_e;
             aoptPtr->hm_method = 1;       // LLSM_AOPTION_HMCZT（CZT法、高品質）
+            
+            // Qフラグ: F0リファインメント有効化
+            if (useF0Refine)
+            {
+                aoptPtr->f0_refine = 1;   // 高調波解析ベースのF0精密化
+                Console.WriteLine($"  [Quality] F0 refinement enabled (Q flag)");
+            }
+            else
+            {
+                aoptPtr->f0_refine = 0;   // 標準（デフォルト）
+            }
         }
         
         using var chunk = Llsm.Analyze(aopt, segment, fs, f0, f0.Length);
@@ -365,9 +381,9 @@ class Program
             neuralVocoderStrength = Math.Clamp(neuralVocoderStrength, 0, 100);  // 0-100%に制限
         }
         
-        // Rフラグ: Residual noise copy（指定なし=補間PSDRES使用、指定あり=ランダムコピー有効）
-        // 注意: R指定は長時間ストレッチで末尾がノイジーになる可能性があります
-        bool useResidualCopy = flags.Contains("R", StringComparison.OrdinalIgnoreCase);
+        // Rフラグ: RPS (Repeated Phase Synchronization)（指定なし=Frame-levelのみ、指定あり=Chunk-level RPSも有効化）
+        // 長時間タイムストレッチ時の位相歪み補正に効果的
+        bool useChunkRPS = flags.Contains("R", StringComparison.OrdinalIgnoreCase);
         
         // M+フラグ: Modulation+（ノート境界でmodulationをフェード、クロスフェード時のピッチずれを防止）
         bool useModPlus = flags.Contains("M+", StringComparison.Ordinal) || flags.Contains("M1", StringComparison.OrdinalIgnoreCase);
@@ -514,7 +530,7 @@ class Program
         {
             // 子音部velocity + 伸縮部ストレッチ
             output = SynthesizeWithConsonantAndStretch(chunk, fs, srcF0, targetF0, 
-                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useResidualCopy, modulation, useModPlus, overlapMs);
+                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs);
         }
         
         // ボリューム適用
@@ -606,7 +622,7 @@ class Program
     /// 子音部velocity + 伸縮部ストレッチして合成
     /// </summary>
     static float[] SynthesizeWithConsonantAndStretch(ChunkHandle srcChunk, int fs, float srcF0, float targetF0,
-                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useResidualCopy = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0)
+                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0)
     {
         float basePitchRatio = targetF0 / srcF0;
         
@@ -813,10 +829,11 @@ class Program
             // 子音部低品質の判定（gフラグ・Fフラグでも使用）
             bool isConsonantLowQuality = isConsonant && (originalF0 > 0 && originalF0 < 150.0f);
             
-            // PSDRES（残差ノイズ）を近傍ランダムフレームからコピー（ノイズの自然な変動を保つ）
-            // Rフラグで制御: 指定なし=補間PSDRES使用（デフォルト）、R指定=ランダムコピー（demo-stretch.c互換）
-            // 注意: R指定は長時間ストレッチで末尾がノイジーになる可能性があります
-            if (useResidualCopy)
+            // PSDRES（残差ノイズ）処理
+            // 注意: 以前のR flag（ランダムコピー）機能は廃止されました
+            // 現在のR flagはRPS (Repeated Phase Synchronization)専用です
+            // PSDRESは常に補間されたものを使用します（品質向上のため）
+            if (false)  // 旧機能は無効化
             {
                 Random rnd = new Random(i); // フレーム番号をシードにして再現性を保つ
                 int residualOffset = rnd.Next(5) - 2; // -2 ~ +2
@@ -1029,14 +1046,18 @@ class Program
         Console.WriteLine($"[Synthesis] Converting {dstNfrm} frames to Layer0...");
         Llsm.ChunkToLayer0(dstChunk);
         
-        // 位相同期処理（RPS: Repeated Phase Sync）
-        Console.WriteLine($"[Synthesis] Phase sync RPS...");
-        unsafe
+        // Chunk-level RPS（Rフラグ有効時のみ）
+        // チャンク全体で位相同期を行い、長時間ストレッチでの位相歪みを補正
+        if (useChunkRPS)
         {
-            // F0配列を準備
-            fixed (float* f0Ptr = dstF0)
+            Console.WriteLine($"[Synthesis] Chunk-level RPS (R flag enabled)...");
+            unsafe
             {
-                NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), (IntPtr)f0Ptr, dstNfrm);
+                // F0配列を準備
+                fixed (float* f0Ptr = dstF0)
+                {
+                    NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), (IntPtr)f0Ptr, dstNfrm);
+                }
             }
         }
         

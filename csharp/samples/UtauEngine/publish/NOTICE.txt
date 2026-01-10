@@ -1,0 +1,40 @@
+L2R - LLSM2 Resampler for UTAU
+===============================
+
+This software is licensed under the GNU General Public License v3.0 (GPL-3.0).
+
+Third-Party Libraries
+---------------------
+
+This software uses the following open-source libraries:
+
+1. libllsm2 (GPL-3.0)
+   Copyright (c) 2017-2019 Kanru Hua
+   https://github.com/Sleepwalking/libllsm2
+   
+   A low-level speech model (LLSM) vocoder for high-quality speech synthesis.
+
+2. libpyin (BSD 3-Clause)
+   Copyright (c) 2015-2017 Kanru Hua
+   https://github.com/Sleepwalking/libpyin
+   
+   Probabilistic YIN implementation for fundamental frequency extraction.
+
+3. Microsoft.ML.OnnxRuntime
+   MIT License
+   https://github.com/microsoft/onnxruntime
+   
+   ONNX Runtime for neural network inference (used for Neural Vocoder feature).
+
+Source Code Availability
+------------------------
+
+The complete source code for this software is available at:
+[YOUR_GITHUB_REPOSITORY_URL]
+
+As required by the GPL-3.0 license, you have the right to:
+- Use this software for any purpose
+- Study and modify the source code
+- Share the software and your modifications
+
+See LICENSE.txt for full license terms.
