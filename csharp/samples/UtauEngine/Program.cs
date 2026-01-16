@@ -31,6 +31,15 @@ class Program
     static readonly CopyFpArrayDelegate _copyFpArrayFunc = NativeLLSM.llsm_copy_fparray;
     static readonly CopyFpArrayDelegate _copyNm = NativeLLSM.llsm_copy_nmframe;
     
+    // PBP (Pulse-by-Pulse) 関連デリゲート
+    static readonly DeleteFpDelegate _deletePbpEffect = NativeLLSM.llsm_delete_pbpeffect;
+    static readonly CopyFpArrayDelegate _copyPbpEffect = NativeLLSM.llsm_copy_pbpeffect;
+    static readonly DeleteFpDelegate _deleteInt = NativeLLSM.llsm_delete_int;
+    static readonly NativeLLSM.CopyFunc _copyInt = NativeLLSM.llsm_copy_int;
+    
+    // グロウルコールバック用のGC保護(デリゲートがガベージコレクトされないように)
+    static NativeLLSM.llsm_fgfm _growlCallback = null;
+    
     static void Main(string[] args)
     {
         // Shift-JIS エンコーディングを有効化（UTAU は Shift-JIS を使用）
@@ -317,6 +326,28 @@ class Program
             spectralTilt = Math.Clamp(spectralTilt, -12, 12);  // ±12dB/oct範囲
         }
         
+        // Sフラグ: Shift-noise（ノイズ成分ピッチシフト追従）
+        // 指定なし = ノイズ成分はピッチシフトしない（デフォルト、自然な息成分維持）
+        // 指定あり = ノイズ成分もピッチシフトに追従（高音で明るく、低音で暗くなる）
+        bool pitchShiftNoise = flags.Contains("S", StringComparison.OrdinalIgnoreCase);
+        if (pitchShiftNoise)
+        {
+            Console.WriteLine($"  [Noise] Shift-noise enabled (S flag) - NM follows pitch");
+        }
+        
+        // Gフラグ: Growl（グロウル効果）
+        // G0 = なし（デフォルト）、G1-G100 = 弱い～強いグロウル
+        // 声帯の不規則な振動をシミュレート：サブハーモニクス、ジッター、声門波形変調
+        // 注意: 大文字Gのみ（小文字gはジェンダーファクター）
+        int growlStrength = 0;  // 0 = オフ
+        var growlMatch = Regex.Match(flags, @"G(\d+)");  // 大文字Gのみ
+        if (growlMatch.Success)
+        {
+            growlStrength = int.Parse(growlMatch.Groups[1].Value);
+            growlStrength = Math.Clamp(growlStrength, 1, 100);  // 1-100範囲
+            Console.WriteLine($"  [Growl] Strength: {growlStrength}% (G flag, PBP synthesis)");
+        }
+        
         // 分析オプション最適化（高品質設定）
         int maxnhar, maxnhar_e;
         
@@ -324,8 +355,8 @@ class Program
         {
             // Hフラグ: 超解像度モード - 動的倍音数調整
             // サンプリングレート44.1kHzでナイキスト周波数22.05kHzまでカバー
-            // 低音（F0=100Hz）→ 200倍音で20kHz、高音（F0=500Hz）→ 40倍音で20kHz
-            float maxFreq = 20000.0f;  // 20kHz（ナイキスト周波数の余裕を持った上限）
+            // 低音（F0=100Hz）→ 210倍音で21kHz、高音（F0=500Hz）→ 42倍音で21kHz
+            float maxFreq = 21000.0f;  // 21kHz（高音の劣化防止、ナイキスト周波数22.05kHzの95%）
             maxnhar = (int)Math.Ceiling(maxFreq / srcF0);
             maxnhar = Math.Clamp(maxnhar, 100, 2000);  // 100-2000倍音の範囲に制限
             
@@ -421,8 +452,9 @@ class Program
         }
         
         // gフラグ: ジェンダーファクター（デフォルト0 = 変化なし、+値 = 男性的、-値 = 女性的）
+        // 注意: 小文字gのみ（大文字Gはグロウル効果）
         int genderFactor = 0;
-        var gMatch = System.Text.RegularExpressions.Regex.Match(flags, @"g([+-]?\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var gMatch = System.Text.RegularExpressions.Regex.Match(flags, @"g([+-]?\d+)");  // 小文字gのみ
         if (gMatch.Success)
         {
             genderFactor = int.Parse(gMatch.Groups[1].Value);
@@ -596,7 +628,7 @@ class Program
         {
             // 子音部velocity + 伸縮部ストレッチ
             output = SynthesizeWithConsonantAndStretch(chunk, fs, srcF0, targetF0, 
-                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt);
+                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength);
         }
         
         // ボリューム適用
@@ -688,7 +720,7 @@ class Program
     /// 子音部velocity + 伸縮部ストレッチして合成
     /// </summary>
     static float[] SynthesizeWithConsonantAndStretch(ChunkHandle srcChunk, int fs, float srcF0, float targetF0,
-                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0)
+                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0)
     {
         float basePitchRatio = targetF0 / srcF0;
         
@@ -925,22 +957,27 @@ class Program
                 ApplyBreathiness(newFrameRef, breathiness);
             }
             
-            // ノイズ成分（PSDRES + NM）をピッチシフトから保護するため、Breathiness適用後にバックアップ
-            // ノイズは本質的にピッチを持たないため、ピッチシフトすると不自然な変化が生じる
+            // ノイズ成分（PSDRES + NM）のバックアップ（Sフラグで制御）
+            // Sフラグなし（デフォルト）: ノイズをピッチシフトから保護（自然な息成分維持）
+            // Sフラグあり: ノイズもピッチシフトに追従（高音で明るく、低音で暗くなる）
             IntPtr originalPsdres = IntPtr.Zero;
             IntPtr originalNm = IntPtr.Zero;
             
-            var currentPsdresPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_PSDRES);
-            if (currentPsdresPtr != IntPtr.Zero)
+            if (!pitchShiftNoise)
             {
-                originalPsdres = NativeLLSM.llsm_copy_fparray(currentPsdresPtr);
-            }
-            
-            // NM（Noise Model）全体もバックアップ（子音の自然さを保つ）
-            var currentNmPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_NM);
-            if (currentNmPtr != IntPtr.Zero)
-            {
-                originalNm = NativeLLSM.llsm_copy_nmframe(currentNmPtr);
+                // デフォルト動作: ノイズ成分をバックアップしてピッチシフトから保護
+                var currentPsdresPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_PSDRES);
+                if (currentPsdresPtr != IntPtr.Zero)
+                {
+                    originalPsdres = NativeLLSM.llsm_copy_fparray(currentPsdresPtr);
+                }
+                
+                // NM（Noise Model）全体もバックアップ（子音の自然さを保つ）
+                var currentNmPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_NM);
+                if (currentNmPtr != IntPtr.Zero)
+                {
+                    originalNm = NativeLLSM.llsm_copy_nmframe(currentNmPtr);
+                }
             }
             
             if (originalF0 > 0)
@@ -1027,21 +1064,25 @@ class Program
                 ApplyAdaptiveFormantToFparray(newFrameRef, pitchShiftRatio, formantFollow);
             }
             
-            // ノイズ成分（PSDRES + NM）を復元: ピッチシフト/フォルマント処理の影響を受けないようにする
-            // ピッチシフトは調和成分のみに適用し、ノイズ成分は元の周波数特性を維持
-            if (originalPsdres != IntPtr.Zero)
+            // ノイズ成分（PSDRES + NM）の復元（Sフラグなし時のみ）
+            // Sフラグなし: ピッチシフト前の状態に復元（ノイズは元の周波数特性を維持）
+            // Sフラグあり: 復元しない（ピッチシフト後の状態を保持、ノイズも追従）
+            if (!pitchShiftNoise)
             {
-                NativeLLSM.llsm_container_attach_(newFramePtr, NativeLLSM.LLSM_FRAME_PSDRES,
-                    originalPsdres, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
-                    Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
-            }
-            
-            // NM（Noise Model）も復元して子音の自然な特性を保持
-            if (originalNm != IntPtr.Zero)
-            {
-                NativeLLSM.llsm_container_attach_(newFramePtr, NativeLLSM.LLSM_FRAME_NM,
-                    originalNm, Marshal.GetFunctionPointerForDelegate(_deleteNm), 
-                    Marshal.GetFunctionPointerForDelegate(_copyNm));
+                if (originalPsdres != IntPtr.Zero)
+                {
+                    NativeLLSM.llsm_container_attach_(newFramePtr, NativeLLSM.LLSM_FRAME_PSDRES,
+                        originalPsdres, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
+                        Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+                }
+                
+                // NM（Noise Model）も復元して子音の自然な特性を保持
+                if (originalNm != IntPtr.Zero)
+                {
+                    NativeLLSM.llsm_container_attach_(newFramePtr, NativeLLSM.LLSM_FRAME_NM,
+                        originalNm, Marshal.GetFunctionPointerForDelegate(_deleteNm), 
+                        Marshal.GetFunctionPointerForDelegate(_copyNm));
+                }
             }
             
             Llsm.SetFrame(dstChunk, i, newFramePtr);
@@ -1150,23 +1191,81 @@ class Program
             Llsm.AttenuateUnvoiced(dstChunk, uvDb: -unvoicedAttenuation);
         }
         
-        // Layer0 に変換
-        Console.WriteLine($"[Synthesis] Converting {dstNfrm} frames to Layer0...");
-        Llsm.ChunkToLayer0(dstChunk);
+        // Gフラグ: グロウル効果（Layer1状態、PBP synthesis使用）
+        // 声帯の不規則な振動をシミュレート：サブハーモニクス、ジッター、声門波形変調
+        if (growlStrength > 0)
+        {
+            Console.WriteLine($"[Synthesis] Growl effect: {growlStrength}% (G flag, PBP synthesis)");
+            
+            // グロウルコールバック初期化（GCから保護）
+            var growlState = new GrowlEffectState(growlStrength);
+            GCHandle stateHandle = GCHandle.Alloc(growlState);
+            IntPtr statePtr = GCHandle.ToIntPtr(stateHandle);
+            
+            // コールバックデリゲートを作成してGC保護
+            _growlCallback = GrowlEffectCallback;
+            IntPtr callbackPtr = Marshal.GetFunctionPointerForDelegate(_growlCallback);
+            
+            // 各フレームにPBP効果を設定
+            for (int i = 0; i < dstNfrm; i++)
+            {
+                var frame = Llsm.GetFrame(dstChunk, i);
+                float f0 = Llsm.GetFrameF0(frame);
+                
+                // HMをNULLに設定（Layer1から直接合成するため）
+                // test-pbpeffects.c line 118: llsm_container_attach(chunk->frames[i], LLSM_FRAME_HM, NULL, NULL, NULL);
+                NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_HM, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                
+                // 有声音フレームのみにグロウルを適用
+                if (f0 > 0)
+                {
+                    // PBPSYNフラグを有効化
+                    IntPtr pbpsynPtr = NativeLLSM.llsm_create_int(1);
+                    NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_PBPSYN,
+                        pbpsynPtr, Marshal.GetFunctionPointerForDelegate(_deleteInt), 
+                        Marshal.GetFunctionPointerForDelegate(_copyInt));
+                    
+                    // PBP効果オブジェクトを作成
+                    IntPtr pbpeffPtr = NativeLLSM.llsm_create_pbpeffect(callbackPtr, statePtr);
+                    NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_PBPEFF,
+                        pbpeffPtr, Marshal.GetFunctionPointerForDelegate(_deletePbpEffect),
+                        Marshal.GetFunctionPointerForDelegate(_copyPbpEffect));
+                }
+            }
+            
+            // 注意: stateHandleは合成完了まで保持される必要があるため、
+            // ここではFreeしない（関数終了後に自動的にGC対象になる）
+            
+            // Phase propagation（位相伝搬）- test-pbpeffects.c line 133
+            // PBP効果適用後、位相の一貫性を保つために必要
+            Console.WriteLine($"[Synthesis] Phase propagation for PBP synthesis...");
+            NativeLLSM.llsm_chunk_phasepropagate(dstChunk.DangerousGetHandle(), 1);
+        }
+        
+        // Layer0 変換（Gフラグ使用時はスキップ）
+        // PBP synthesisはLayer1状態で実行する必要があるため、
+        // グロウル効果使用時はLayer0に変換せずにLayer1のまま合成
+        bool useLayer1Synthesis = (growlStrength > 0);
+        
+        if (!useLayer1Synthesis)
+        {
+            Console.WriteLine($"[Synthesis] Converting {dstNfrm} frames to Layer0...");
+            Llsm.ChunkToLayer0(dstChunk);
+        }
+        else
+        {
+            Console.WriteLine($"[Synthesis] Keeping Layer1 for PBP synthesis (Growl effect active)...");
+            // Layer1状態を維持、合成時にuse_l1=1を設定
+        }
         
         // Chunk-level RPS（Rフラグ有効時のみ）
         // チャンク全体で位相同期を行い、長時間ストレッチでの位相歪みを補正
         if (useChunkRPS)
         {
             Console.WriteLine($"[Synthesis] Chunk-level RPS (R flag enabled)...");
-            unsafe
-            {
-                // F0配列を準備
-                fixed (float* f0Ptr = dstF0)
-                {
-                    NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), (IntPtr)f0Ptr, dstNfrm);
-                }
-            }
+            // layer1_basedフラグを現在の状態に応じて設定
+            int layer1Based = useLayer1Synthesis ? 1 : 0;
+            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), layer1Based);
         }
         
         // 順方向位相伝播
@@ -1182,6 +1281,18 @@ class Program
             int synthesisFs = fs * oversampleRate;
             Console.WriteLine($"[Synthesis] Oversampling enabled: {oversampleRate}x ({synthesisFs}Hz)");
             using var sopt = Llsm.CreateSynthesisOptions(synthesisFs);
+            
+            // Gフラグ使用時はuse_l1=1を設定（Layer1状態で合成）
+            if (useLayer1Synthesis)
+            {
+                unsafe
+                {
+                    var soptPtr = (NativeLLSM.llsm_soptions*)sopt.DangerousGetHandle().ToPointer();
+                    soptPtr->use_l1 = 1;
+                    Console.WriteLine($"[Synthesis] use_l1=1 (Layer1 synthesis for PBP/Growl)");
+                }
+            }
+            
             using var output = Llsm.Synthesize(sopt, dstChunk);
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($"[Synthesis] llsm_synthesize succeeded");
@@ -1198,6 +1309,18 @@ class Program
             // 直接44.1kHzで合成（オーバーサンプリングなし）
             Console.WriteLine($"[Synthesis] Direct synthesis at {fs}Hz (no oversampling)");
             using var sopt = Llsm.CreateSynthesisOptions(fs);
+            
+            // Gフラグ使用時はuse_l1=1を設定（Layer1状態で合成）
+            if (useLayer1Synthesis)
+            {
+                unsafe
+                {
+                    var soptPtr = (NativeLLSM.llsm_soptions*)sopt.DangerousGetHandle().ToPointer();
+                    soptPtr->use_l1 = 1;
+                    Console.WriteLine($"[Synthesis] use_l1=1 (Layer1 synthesis for PBP/Growl)");
+                }
+            }
+            
             using var output = Llsm.Synthesize(sopt, dstChunk);
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($"[Synthesis] llsm_synthesize succeeded");
@@ -1363,28 +1486,44 @@ class Program
             int nspec1 = NativeLLSM.llsm_fparray_length(vtmagn1Ptr);
             int nspec2 = NativeLLSM.llsm_fparray_length(vtmagn2Ptr);
             int nspec3 = NativeLLSM.llsm_fparray_length(vtmagn3Ptr);
-            int nspec = Math.Min(Math.Min(nspec0, nspec1), Math.Min(nspec2, nspec3));
+            int minspec = Math.Min(Math.Min(nspec0, nspec1), Math.Min(nspec2, nspec3));
+            int maxspec = Math.Max(Math.Max(nspec0, nspec1), Math.Max(nspec2, nspec3));
             
-            if (nspec > 0)
+            if (maxspec > 0)
             {
-                float[] vtmagn0 = new float[nspec];
-                float[] vtmagn1 = new float[nspec];
-                float[] vtmagn2 = new float[nspec];
-                float[] vtmagn3 = new float[nspec];
-                Marshal.Copy(vtmagn0Ptr, vtmagn0, 0, nspec);
-                Marshal.Copy(vtmagn1Ptr, vtmagn1, 0, nspec);
-                Marshal.Copy(vtmagn2Ptr, vtmagn2, 0, nspec);
-                Marshal.Copy(vtmagn3Ptr, vtmagn3, 0, nspec);
+                float[] vtmagn0 = new float[nspec0];
+                float[] vtmagn1 = new float[nspec1];
+                float[] vtmagn2 = new float[nspec2];
+                float[] vtmagn3 = new float[nspec3];
+                Marshal.Copy(vtmagn0Ptr, vtmagn0, 0, nspec0);
+                Marshal.Copy(vtmagn1Ptr, vtmagn1, 0, nspec1);
+                Marshal.Copy(vtmagn2Ptr, vtmagn2, 0, nspec2);
+                Marshal.Copy(vtmagn3Ptr, vtmagn3, 0, nspec3);
                 
-                vtmagn_interp = new float[nspec];
-                for (int i = 0; i < nspec; i++)
+                vtmagn_interp = new float[maxspec];
+                for (int i = 0; i < maxspec; i++)
                 {
-                    vtmagn_interp[i] = USE_MONOTONIC_CUBIC
-                        ? MonotonicCubicInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio)
-                        : CubicInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio);
-                    if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
+                    // 共通範囲は補間、範囲外は外挿または最長データを使用
+                    if (i < minspec)
                     {
-                        vtmagn_interp[i] = vtmagn1[i] * (1 - ratio) + vtmagn2[i] * ratio;
+                        vtmagn_interp[i] = USE_MONOTONIC_CUBIC
+                            ? MonotonicCubicInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio)
+                            : CubicInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio);
+                        if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
+                        {
+                            vtmagn_interp[i] = vtmagn1[i] * (1 - ratio) + vtmagn2[i] * ratio;
+                        }
+                    }
+                    else
+                    {
+                        // 範囲外の高周波成分: 利用可能な最長データから取得
+                        // vtmagn1とvtmagn2を優先（補間の中心点）、無ければvtmagn2/3を使用
+                        float val = -80.0f;
+                        if (i < nspec1) val = vtmagn1[i];
+                        else if (i < nspec2) val = vtmagn2[i];
+                        else if (i < nspec3) val = vtmagn3[i];
+                        else if (i < nspec0) val = vtmagn0[i];
+                        vtmagn_interp[i] = val;
                     }
                     vtmagn_interp[i] = Math.Max(-80.0f, vtmagn_interp[i]);
                 }
@@ -1416,10 +1555,24 @@ class Program
                     // 円形補間を使用（demo-stretch.c の linterpc 実装）
                     vsphse_interp[i] = CircularInterpolatePhase(vsphse1[i], vsphse2[i], ratio);
                 }
-                if (nhar2 > minnhar)
+                // 範囲外の高次倍音: 線形外挿または利用可能なデータを使用
+                for (int i = minnhar; i < maxnhar; i++)
                 {
-                    for (int i = minnhar; i < maxnhar; i++)
+                    if (i < nhar1 && i < nhar2)
+                    {
+                        // 両方にデータがある（ありえないが安全のため）
+                        vsphse_interp[i] = CircularInterpolatePhase(vsphse1[i], vsphse2[i], ratio);
+                    }
+                    else if (i < nhar2)
+                    {
+                        // vsphse2だけにデータがある
                         vsphse_interp[i] = vsphse2[i];
+                    }
+                    else if (i < nhar1)
+                    {
+                        // vsphse1だけにデータがある
+                        vsphse_interp[i] = vsphse1[i];
+                    }
                 }
             }
         }
@@ -1653,23 +1806,32 @@ class Program
         {
             int nspec0 = NativeLLSM.llsm_fparray_length(vtmagn0Ptr);
             int nspec1 = NativeLLSM.llsm_fparray_length(vtmagn1Ptr);
-            int nspec = Math.Min(nspec0, nspec1);
+            int minspec = Math.Min(nspec0, nspec1);
+            int maxspec = Math.Max(nspec0, nspec1);
             
-            if (nspec > 0)
+            if (maxspec > 0)
             {
-                float[] vtmagn0 = new float[nspec];
-                float[] vtmagn1 = new float[nspec];
-                Marshal.Copy(vtmagn0Ptr, vtmagn0, 0, nspec);
-                Marshal.Copy(vtmagn1Ptr, vtmagn1, 0, nspec);
+                float[] vtmagn0 = new float[nspec0];
+                float[] vtmagn1 = new float[nspec1];
+                Marshal.Copy(vtmagn0Ptr, vtmagn0, 0, nspec0);
+                Marshal.Copy(vtmagn1Ptr, vtmagn1, 0, nspec1);
                 
-                vtmagn_interp = new float[nspec];
-                for (int i = 0; i < nspec; i++)
+                vtmagn_interp = new float[maxspec];
+                for (int i = 0; i < maxspec; i++)
                 {
-                    vtmagn_interp[i] = vtmagn0[i] * (1 - ratio) + vtmagn1[i] * ratio;
-                    // NaN/Inf チェック
-                    if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
+                    if (i < minspec)
                     {
-                        vtmagn_interp[i] = Math.Max(vtmagn0[i], vtmagn1[i]);
+                        vtmagn_interp[i] = vtmagn0[i] * (1 - ratio) + vtmagn1[i] * ratio;
+                        // NaN/Inf チェック
+                        if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
+                        {
+                            vtmagn_interp[i] = Math.Max(vtmagn0[i], vtmagn1[i]);
+                        }
+                    }
+                    else
+                    {
+                        // 範囲外の高周波成分: 利用可能なデータから取得
+                        vtmagn_interp[i] = (i < nspec1) ? vtmagn1[i] : vtmagn0[i];
                     }
                     // -80dB以下にはしない（demo-stretch.cと同じ）
                     vtmagn_interp[i] = Math.Max(-80.0f, vtmagn_interp[i]);
@@ -1702,11 +1864,21 @@ class Program
                 {
                     vsphse_interp[i] = CircularInterpolatePhase(vsphse0[i], vsphse1[i], ratio);
                 }
-                // 長い方の余分な部分はそのままコピー
-                if (nhar0 < nhar1)
+                // 範囲外の高次倍音: 利用可能なデータから取得
+                for (int i = minnhar; i < maxnhar; i++)
                 {
-                    for (int i = minnhar; i < maxnhar; i++)
+                    if (i < nhar0 && i < nhar1)
+                    {
+                        vsphse_interp[i] = CircularInterpolatePhase(vsphse0[i], vsphse1[i], ratio);
+                    }
+                    else if (i < nhar1)
+                    {
                         vsphse_interp[i] = vsphse1[i];
+                    }
+                    else if (i < nhar0)
+                    {
+                        vsphse_interp[i] = vsphse0[i];
+                    }
                 }
             }
         }
@@ -2318,6 +2490,55 @@ class Program
     }
     
     /// <summary>
+    /// グロウル効果のPBPコールバック（Pulse-by-Pulse synthesis）
+    /// 声帯の不規則な振動をシミュレート：サブハーモニクス、ジッター、声門波形変調
+    /// </summary>
+    class GrowlEffectState
+    {
+        public int PeriodCount;
+        public float Oscillator;
+        public Random Random;
+        public float Strength;  // 0.0-1.0
+        
+        public GrowlEffectState(float strength)
+        {
+            PeriodCount = 0;
+            Oscillator = 0;
+            Random = new Random();
+            Strength = strength / 100.0f;  // 1-100 → 0.01-1.0
+        }
+    }
+    
+    static void GrowlEffectCallback(ref NativeLLSM.llsm_gfm gfm, ref float delta_t, IntPtr info, IntPtr src_frame)
+    {
+        // infoポインタからGrowlEffectStateを取得
+        GCHandle handle = GCHandle.FromIntPtr(info);
+        GrowlEffectState state = (GrowlEffectState)handle.Target;
+        
+        state.PeriodCount++;
+        
+        // LFO（低周波オシレーター）：50周期ごとの周期的変動
+        float lfo = MathF.Sin(state.PeriodCount * 2 * MathF.PI / 50.0f);
+        
+        // サブハーモニクスオシレーター：F0の約1/6の周波数成分を追加
+        state.Oscillator += 2 * MathF.PI / (6.0f + lfo);
+        float osc = MathF.Sin(state.Oscillator);
+        
+        // 1. タイミングジッター：ランダムな時間揺らぎ（クリーキーボイス効果）
+        float jitter = (float)(state.Random.NextDouble() * 2 - 1);  // -1 to 1
+        delta_t = gfm.T0 * 0.01f * jitter * state.Strength;
+        
+        // 2. 声門開放周波数の変調（Fa）：サブハーモニクスのうねり
+        gfm.Fa *= 1.0f - osc * 0.5f * state.Strength;
+        
+        // 3. 減衰率の変調（Rk）：パルス形状の不規則性
+        gfm.Rk *= 1.0f + osc * 0.3f * state.Strength;
+        
+        // 4. エネルギーの変調（Ee）：H1エネルギーの揺らぎを抑制
+        gfm.Ee *= 1.0f - osc * 0.5f * state.Strength;
+    }
+    
+    /// <summary>
     /// ノート名を Hz に変換 (例: "C4" -> 261.63)
     /// </summary>
     static float NoteNameToHz(string noteName)
@@ -2869,7 +3090,7 @@ class Program
             // 子音部固定で 2.0x ストレッチ（比較用）
             using var chunkFixed = Llsm.CopyChunk(masterChunk);
             var fixedStretch = SynthesizeWithConsonantAndStretch(chunkFixed, wavFs, avgF0, avgF0, 
-                                                                  consonantFrames, 1.0f, 2.0f, new List<int>(), 120, 50, 0, 100, 0.005f, false, false, 100, false, 0, 0, 0);
+                                                                  consonantFrames, 1.0f, 2.0f, new List<int>(), 120, 50, 0, 100, 0.005f, false, false, 100, false, 0, 0, 0, false, 0);
             Wav.WriteMono16("utau_stretch_consonant_fixed.wav", fixedStretch, wavFs);
             Console.WriteLine($"  Fixed consonant stretch: {fixedStretch.Length} samples");
             
