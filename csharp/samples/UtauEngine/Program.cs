@@ -1197,6 +1197,10 @@ class Program
         {
             Console.WriteLine($"[Synthesis] Growl effect: {growlStrength}% (G flag, PBP synthesis)");
             
+            // Backward phase propagationは削除
+            // ピッチベンド適用後はすでに位相が整っているため、
+            // ここでbackward (-1) を実行するとピッチベンドがリセットされてしまう
+            
             // グロウルコールバック初期化（GCから保護）
             var growlState = new GrowlEffectState(growlStrength);
             GCHandle stateHandle = GCHandle.Alloc(growlState);
@@ -1212,13 +1216,13 @@ class Program
                 var frame = Llsm.GetFrame(dstChunk, i);
                 float f0 = Llsm.GetFrameF0(frame);
                 
-                // HMをNULLに設定（Layer1から直接合成するため）
-                // test-pbpeffects.c line 118: llsm_container_attach(chunk->frames[i], LLSM_FRAME_HM, NULL, NULL, NULL);
-                NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_HM, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-                
-                // 有声音フレームのみにグロウルを適用
+                // 有声音フレーム（F0>0）のみにグロウルを適用
                 if (f0 > 0)
                 {
+                    // HMをNULLに設定（Layer1から直接合成するため）
+                    // 有声フレームだけをLayer1に変換
+                    NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_HM, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                    
                     // PBPSYNフラグを有効化
                     IntPtr pbpsynPtr = NativeLLSM.llsm_create_int(1);
                     NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_PBPSYN,
@@ -1231,6 +1235,7 @@ class Program
                         pbpeffPtr, Marshal.GetFunctionPointerForDelegate(_deletePbpEffect),
                         Marshal.GetFunctionPointerForDelegate(_copyPbpEffect));
                 }
+                // F0=0の無声フレームはHMをそのまま残す（Layer0で合成）
             }
             
             // 注意: stateHandleは合成完了まで保持される必要があるため、
@@ -1238,7 +1243,6 @@ class Program
             
             // Phase propagation（位相伝搬）- test-pbpeffects.c line 133
             // PBP効果適用後、位相の一貫性を保つために必要
-            Console.WriteLine($"[Synthesis] Phase propagation for PBP synthesis...");
             NativeLLSM.llsm_chunk_phasepropagate(dstChunk.DangerousGetHandle(), 1);
         }
         
@@ -1251,26 +1255,24 @@ class Program
         {
             Console.WriteLine($"[Synthesis] Converting {dstNfrm} frames to Layer0...");
             Llsm.ChunkToLayer0(dstChunk);
+            
+            // Chunk-level RPS（Rフラグ有効時のみ、Layer0でのみ実行）
+            if (useChunkRPS)
+            {
+                Console.WriteLine($"[Synthesis] Chunk-level RPS (R flag enabled, Layer0)...");
+                NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+            }
+            
+            // 順方向位相伝播（Layer0）
+            Console.WriteLine($"[Synthesis] Phase propagate (Layer0)...");
+            Llsm.ChunkPhasePropagate(dstChunk, +1);
         }
         else
         {
             Console.WriteLine($"[Synthesis] Keeping Layer1 for PBP synthesis (Growl effect active)...");
             // Layer1状態を維持、合成時にuse_l1=1を設定
+            // Phase propagationはGrowl効果内で既に1回実行済み
         }
-        
-        // Chunk-level RPS（Rフラグ有効時のみ）
-        // チャンク全体で位相同期を行い、長時間ストレッチでの位相歪みを補正
-        if (useChunkRPS)
-        {
-            Console.WriteLine($"[Synthesis] Chunk-level RPS (R flag enabled)...");
-            // layer1_basedフラグを現在の状態に応じて設定
-            int layer1Based = useLayer1Synthesis ? 1 : 0;
-            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), layer1Based);
-        }
-        
-        // 順方向位相伝播
-        Console.WriteLine($"[Synthesis] Phase propagate...");
-        Llsm.ChunkPhasePropagate(dstChunk, +1);
         
         // オーバーサンプリング（Oフラグ有効時のみ）
         float[] oversampledOutput;
@@ -1707,6 +1709,19 @@ class Program
                 vtmagnPtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
                 Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
         }
+        else
+        {
+            // 補間失敗時: frame1またはframe2からコピー（4点補間）
+            var vtmagnSrc = ratio < 0.5 ? frame1 : frame2;
+            var vtmagnSrcPtr = NativeLLSM.llsm_container_get(vtmagnSrc.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            if (vtmagnSrcPtr != IntPtr.Zero)
+            {
+                var vtmagnPtr = NativeLLSM.llsm_copy_fparray(vtmagnSrcPtr);
+                NativeLLSM.llsm_container_attach_(newFrame, NativeLLSM.LLSM_FRAME_VTMAGN,
+                    vtmagnPtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
+                    Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+            }
+        }
         
         if (vsphse_interp != null)
         {
@@ -1715,6 +1730,19 @@ class Program
             NativeLLSM.llsm_container_attach_(newFrame, NativeLLSM.LLSM_FRAME_VSPHSE,
                 vsphsePtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
                 Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+        }
+        else
+        {
+            // 補間失敗時: frame1またはframe2からコピー（4点補間）
+            var vsphseSrc = ratio < 0.5 ? frame1 : frame2;
+            var vsphseSrcPtr = NativeLLSM.llsm_container_get(vsphseSrc.Ptr, NativeLLSM.LLSM_FRAME_VSPHSE);
+            if (vsphseSrcPtr != IntPtr.Zero)
+            {
+                var vsphsePtr = NativeLLSM.llsm_copy_fparray(vsphseSrcPtr);
+                NativeLLSM.llsm_container_attach_(newFrame, NativeLLSM.LLSM_FRAME_VSPHSE,
+                    vsphsePtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
+                    Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+            }
         }
         
         if (nmInterpPtr != IntPtr.Zero)
@@ -2020,6 +2048,19 @@ class Program
                 vtmagnPtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
                 Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
         }
+        else
+        {
+            // 補間失敗時: frame0またはframe1からコピー（2点補間）
+            var vtmagnSrc = ratio < 0.5 ? frame0 : frame1;
+            var vtmagnSrcPtr = NativeLLSM.llsm_container_get(vtmagnSrc.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            if (vtmagnSrcPtr != IntPtr.Zero)
+            {
+                var vtmagnPtr = NativeLLSM.llsm_copy_fparray(vtmagnSrcPtr);
+                NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_VTMAGN,
+                    vtmagnPtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
+                    Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+            }
+        }
         
         // VSPHSEを設定
         if (vsphse_interp != null)
@@ -2029,6 +2070,19 @@ class Program
             NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_VSPHSE,
                 vsphsePtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
                 Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+        }
+        else
+        {
+            // 補間失敗時: frame0またはframe1からコピー（2点補間）
+            var vsphseSrc = ratio < 0.5 ? frame0 : frame1;
+            var vsphseSrcPtr = NativeLLSM.llsm_container_get(vsphseSrc.Ptr, NativeLLSM.LLSM_FRAME_VSPHSE);
+            if (vsphseSrcPtr != IntPtr.Zero)
+            {
+                var vsphsePtr = NativeLLSM.llsm_copy_fparray(vsphseSrcPtr);
+                NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_VSPHSE,
+                    vsphsePtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
+                    Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+            }
         }
         
         // NMを設定
