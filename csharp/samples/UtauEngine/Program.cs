@@ -2550,14 +2550,16 @@ class Program
     class GrowlEffectState
     {
         public int PeriodCount;
-        public float Oscillator;
+        public float Oscillator1;  // F0/3 のサブハーモニクス
+        public float Oscillator2;  // F0/5 のサブハーモニクス
         public Random Random;
         public float Strength;  // 0.0-1.0
         
         public GrowlEffectState(float strength)
         {
             PeriodCount = 0;
-            Oscillator = 0;
+            Oscillator1 = 0;
+            Oscillator2 = 0;
             Random = new Random();
             Strength = strength / 100.0f;  // 1-100 → 0.01-1.0
         }
@@ -2571,24 +2573,34 @@ class Program
         
         state.PeriodCount++;
         
-        // LFO（低周波オシレーター）：50周期ごとの周期的変動
-        float lfo = MathF.Sin(state.PeriodCount * 2 * MathF.PI / 50.0f);
+        // 複数のLFOを組み合わせて自然な揺らぎを生成（素数周期で規則性を回避）
+        float lfo1 = MathF.Sin(state.PeriodCount * 2 * MathF.PI / 47.3f);
+        float lfo2 = MathF.Sin(state.PeriodCount * 2 * MathF.PI / 31.7f);
+        float lfo = (lfo1 + lfo2 * 0.6f) / 1.6f;
         
-        // サブハーモニクスオシレーター：F0の約1/6の周波数成分を追加
-        state.Oscillator += 2 * MathF.PI / (6.0f + lfo);
-        float osc = MathF.Sin(state.Oscillator);
+        // 複数のサブハーモニクスを混合（F0/3 と F0/5）
+        // 周波数をLFOで微妙に揺らす
+        float subfreq1 = 3.0f + lfo * 0.3f;  // F0/3 ± 10%
+        float subfreq2 = 5.0f + lfo * 0.5f;  // F0/5 ± 10%
         
-        // 1. タイミングジッター：ランダムな時間揺らぎ（クリーキーボイス効果）
-        float jitter = (float)(state.Random.NextDouble() * 2 - 1);  // -1 to 1
+        state.Oscillator1 += 2 * MathF.PI / subfreq1;
+        state.Oscillator2 += 2 * MathF.PI / subfreq2;
+        
+        float osc1 = MathF.Sin(state.Oscillator1);
+        float osc2 = MathF.Sin(state.Oscillator2);
+        
+        // 2つのサブハーモニクスを混合（F0/3を主、F0/5を副）
+        float osc = osc1 * 0.7f + osc2 * 0.3f;
+        
+        // ガウス分布的なジッター（Box-Muller近似）
+        float jitter1 = (float)state.Random.NextDouble() - 0.5f;
+        float jitter2 = (float)state.Random.NextDouble() - 0.5f;
+        float jitter = (jitter1 + jitter2) * 1.4142f;
         delta_t = gfm.T0 * 0.01f * jitter * state.Strength;
         
-        // 2. 声門開放周波数の変調（Fa）：サブハーモニクスのうねり
+        // 元の変調量を維持（クランプなし）
         gfm.Fa *= 1.0f - osc * 0.5f * state.Strength;
-        
-        // 3. 減衰率の変調（Rk）：パルス形状の不規則性
         gfm.Rk *= 1.0f + osc * 0.3f * state.Strength;
-        
-        // 4. エネルギーの変調（Ee）：H1エネルギーの揺らぎを抑制
         gfm.Ee *= 1.0f - osc * 0.5f * state.Strength;
     }
     
