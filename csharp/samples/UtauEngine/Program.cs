@@ -348,6 +348,21 @@ class Program
             Console.WriteLine($"  [Growl] Strength: {growlStrength}% (G flag, PBP synthesis)");
         }
         
+        // Kフラグ: 声門閉鎖係数（Glottal Closure）調整
+        // K50 = 標準（デフォルト）、K0 = 完全開放（息漏れ声）、K100 = 完全閉鎖（硬い声）
+        // GFMパラメータのRg（声門閉鎖係数）を調整して声質を変更
+        int glottalClosure = 50;  // デフォルト50 = 標準
+        var kMatch = Regex.Match(flags, @"K(\d+)", RegexOptions.IgnoreCase);
+        if (kMatch.Success)
+        {
+            glottalClosure = int.Parse(kMatch.Groups[1].Value);
+            glottalClosure = Math.Clamp(glottalClosure, 0, 100);  // 0-100範囲
+            if (glottalClosure != 50)
+            {
+                Console.WriteLine($"  [GlottalClosure] K{glottalClosure} (Rg adjustment)");
+            }
+        }
+        
         // 分析オプション最適化（高品質設定）
         int maxnhar, maxnhar_e;
         
@@ -628,7 +643,7 @@ class Program
         {
             // 子音部velocity + 伸縮部ストレッチ
             output = SynthesizeWithConsonantAndStretch(chunk, fs, srcF0, targetF0, 
-                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength);
+                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength, glottalClosure);
         }
         
         // ボリューム適用
@@ -720,7 +735,7 @@ class Program
     /// 子音部velocity + 伸縮部ストレッチして合成
     /// </summary>
     static float[] SynthesizeWithConsonantAndStretch(ChunkHandle srcChunk, int fs, float srcF0, float targetF0,
-                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0)
+                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0, int glottalClosure = 50)
     {
         float basePitchRatio = targetF0 / srcF0;
         
@@ -1208,6 +1223,35 @@ class Program
                 }
                 
                 Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
+            }
+        }
+        
+        // Kフラグ: 声門閉鎖係数調整（Layer1状態で実行）
+        // GFMのRgパラメータを直接編集
+        if (glottalClosure != 50)
+        {
+            Console.WriteLine($"[Synthesis] Adjusting glottal closure: K{glottalClosure} (Layer1)");
+            
+            for (int i = 0; i < dstNfrm; i++)
+            {
+                var frame = Llsm.GetFrame(dstChunk, i);
+                float f0 = Llsm.GetFrameF0(frame);
+                if (f0 <= 0) continue;  // 無声音はスキップ
+                
+                // Rdパラメータを取得・編集
+                var rdPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_RD);
+                if (rdPtr == IntPtr.Zero) continue;
+                
+                // Rdの標準値は約0.8～2.5
+                // K0（息漏れ声）→ Rd = 2.5（緩い声門閉鎖）
+                // K50（標準）→ Rd = 1.0（変更なし）
+                // K100（硬い声）→ Rd = 0.3（強い声門閉鎖）
+                float rdScale = 2.5f - (glottalClosure / 100.0f) * 2.2f;
+                
+                float currentRd = Marshal.PtrToStructure<float>(rdPtr);
+                float newRd = currentRd * rdScale;
+                
+                Marshal.StructureToPtr(newRd, rdPtr, false);
             }
         }
         
