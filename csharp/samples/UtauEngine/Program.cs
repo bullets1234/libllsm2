@@ -1150,10 +1150,10 @@ class Program
         }
         
         // Tフラグ: スペクトル傾斜調整（Layer1状態で実行）
-        // VTMAGNが存在するLayer1で周波数依存のゲイン調整を適用
+        // フォルマント保存型：チルト適用後にフォルマントピークのレベルを復元
         if (spectralTilt != 0)
         {
-            Console.WriteLine($"[Synthesis] Spectral tilt: {spectralTilt:+0;-0}dB/oct (T flag, Layer1)");
+            Console.WriteLine($"[Synthesis] Spectral tilt: {spectralTilt:+0;-0}dB/oct (T flag, Layer1, formant-preserving)");
             
             for (int i = 0; i < dstNfrm; i++)
             {
@@ -1169,14 +1169,42 @@ class Program
                 float[] vtmagn = new float[nspec];
                 Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
                 
-                // 周波数ビンごとにスペクトル傾斜を適用
+                // Step 1: フォルマントピーク検出（元のスペクトルから）
+                List<(int index, float magnitude)> formantPeaks = DetectFormantPeaks(vtmagn, fs, nspec);
+                
+                // Step 2: スペクトル傾斜を適用
                 for (int j = 0; j < nspec; j++)
                 {
-                    // 周波数計算（kHz単位）
                     float freqKhz = (float)j / nspec * (fs / 2000.0f);
-                    // 傾斜計算: dB/oct → log2スケール
                     float tiltDb = spectralTilt * MathF.Log2(MathF.Max(freqKhz, 0.1f));
                     vtmagn[j] += tiltDb;
+                }
+                
+                // Step 3: フォルマントピーク周辺の振幅を元のレベルに復元（適応的強度）
+                foreach (var (peakIdx, origMagnitude) in formantPeaks)
+                {
+                    float currentMagnitude = vtmagn[peakIdx];
+                    float correction = origMagnitude - currentMagnitude;
+                    
+                    // 復元強度を方向に応じて調整
+                    // マイナス方向（暗く）: 50%復元でこもりを軽減
+                    // プラス方向（明るく）: 70%復元でパリパリ感を軽減（高域の過度な強調を抑制）
+                    float strength = spectralTilt < 0 ? 0.5f : 0.7f;
+                    correction *= strength;
+                    
+                    // ガウシアンウィンドウで周辺に復元を適用（帯域幅 = サンプリングレートに応じた適応的幅）
+                    int bandwidthBins = Math.Max(3, nspec / 100);  // 全体の1%程度の帯域幅
+                    for (int k = -bandwidthBins; k <= bandwidthBins; k++)
+                    {
+                        int idx = peakIdx + k;
+                        if (idx >= 0 && idx < nspec)
+                        {
+                            // ガウシアンウェイト（σ = bandwidth/2）
+                            float sigma = bandwidthBins / 2.0f;
+                            float weight = MathF.Exp(-(k * k) / (2 * sigma * sigma));
+                            vtmagn[idx] += correction * weight;
+                        }
+                    }
                 }
                 
                 Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
@@ -2093,6 +2121,46 @@ class Program
         }
         
         return frameInterpPtr;
+    }
+    
+    /// <summary>
+    /// フォルマントピーク検出
+    /// スペクトル包絡からローカルピークを検出し、フォルマントと推定される位置を返す
+    /// </summary>
+    /// <param name="vtmagn">声道振幅スペクトル（対数dB）</param>
+    /// <param name="fs">サンプリング周波数</param>
+    /// <param name="nspec">スペクトルの長さ</param>
+    /// <returns>フォルマントピークのリスト（インデックスと振幅）</returns>
+    static List<(int index, float magnitude)> DetectFormantPeaks(float[] vtmagn, int fs, int nspec)
+    {
+        var peaks = new List<(int, float)>();
+        
+        // フォルマント検出範囲：200Hz～5000Hz（音声フォルマントの典型的範囲）
+        int minBin = (int)(200.0f / (fs / 2.0f) * nspec);
+        int maxBin = (int)(5000.0f / (fs / 2.0f) * nspec);
+        minBin = Math.Max(1, minBin);
+        maxBin = Math.Min(nspec - 2, maxBin);
+        
+        // ピーク検出：前後のビンより大きい点 + 最小閾値
+        float threshold = -40.0f;  // -40dB以上のピークのみ検出
+        for (int i = minBin; i <= maxBin; i++)
+        {
+            if (vtmagn[i] > threshold &&
+                vtmagn[i] > vtmagn[i - 1] &&
+                vtmagn[i] > vtmagn[i + 1])
+            {
+                // ローカルピーク発見
+                peaks.Add((i, vtmagn[i]));
+            }
+        }
+        
+        // ピークが多すぎる場合、上位5つに制限（F1～F5相当）
+        if (peaks.Count > 5)
+        {
+            peaks = peaks.OrderByDescending(p => p.Item2).Take(5).ToList();
+        }
+        
+        return peaks;
     }
     
     /// <summary>
