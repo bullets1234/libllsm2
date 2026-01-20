@@ -92,6 +92,9 @@ artifacts/
 *.nuget.dgspec.json
 project.assets.json
 
+#exclusion folders
+[Tt]est/
+
 # Exceptions - include certain files if needed
 !libllsm2.def
 !libpyin.def
