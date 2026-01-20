@@ -23,6 +23,8 @@ bld/
 
 # Build artifacts
 *.exe
+*.onnx
+*.onnx.data
 *.dll
 *.pdb
 *.ilk
