@@ -20,6 +20,27 @@ class Program
     // 補間方式切り替え: true=Monotonic Cubic（子音速度変更で高品質）, false=Catmull-Rom（従来）
     const bool USE_MONOTONIC_CUBIC = true;
     
+    /// <summary>
+    /// ピッチマーク: F0情報から抽出されたピッチ周期の境界点
+    /// </summary>
+    struct PitchMark
+    {
+        public float Time;         // 時刻 (秒)
+        public int FrameIndex;     // フレームインデックス
+        public float Period;       // ピッチ周期 (秒)
+        public bool IsVoiced;      // 有声/無声フラグ
+        public float F0;           // 基本周波数 (Hz)
+        
+        public PitchMark(float time, int frameIndex, float period, bool isVoiced, float f0)
+        {
+            Time = time;
+            FrameIndex = frameIndex;
+            Period = period;
+            IsVoiced = isVoiced;
+            F0 = f0;
+        }
+    }
+    
     // ネイティブ関数デリゲート
     delegate void DeleteFpDelegate(IntPtr ptr);
     static readonly DeleteFpDelegate _deleteFp = NativeLLSM.llsm_delete_fp;
@@ -363,6 +384,13 @@ class Program
             }
         }
         
+        // Lフラグ: 声門パラメータ自動推定 + リップ放射フィルタ（デフォルトoff）
+        bool useGlottalAutoEstimate = flags.Contains("L", StringComparison.OrdinalIgnoreCase);
+        if (useGlottalAutoEstimate)
+        {
+            Console.WriteLine($"  [GlottalEstimate] Auto-estimate Rd parameter from source (L flag)");
+        }
+        
         // 分析オプション最適化（高品質設定）
         int maxnhar, maxnhar_e;
         
@@ -497,6 +525,22 @@ class Program
         // Rフラグ: RPS (Repeated Phase Synchronization)（指定なし=Frame-levelのみ、指定あり=Chunk-level RPSも有効化）
         // 長時間タイムストレッチ時の位相歪み補正に効果的
         bool useChunkRPS = flags.Contains("R", StringComparison.OrdinalIgnoreCase);
+        
+        // eフラグ: Elastic stretch (Élastiqueスタイル、トランジェント保護）
+        // 指定なし=標準タイムストレッチ、指定あり=適応的タイムストレッチ（子音の明瞭度向上）
+        bool useElasticStretch = flags.Contains("e", StringComparison.OrdinalIgnoreCase);
+        
+        // Aフラグ: Pitch-mark driven stretch (ピッチマーク駆動、連続音最適化、Approach A)
+        bool usePitchMarkStretch = flags.Contains("A", StringComparison.OrdinalIgnoreCase);
+        
+        if (useElasticStretch)
+        {
+            Console.WriteLine($"  [Elastic] e flag enabled: transient-preserving time stretch");
+        }
+        if (usePitchMarkStretch)
+        {
+            Console.WriteLine($"  [PitchMark] A flag enabled: pitch-mark driven stretch (Approach A)");
+        }
         
         // M+フラグ: Modulation+（ノート境界でmodulationをフェード、クロスフェード時のピッチずれを防止）
         bool useModPlus = flags.Contains("M+", StringComparison.Ordinal) || flags.Contains("M1", StringComparison.OrdinalIgnoreCase);
@@ -641,9 +685,25 @@ class Program
         }
         else
         {
-            // 子音部velocity + 伸縮部ストレッチ
-            output = SynthesizeWithConsonantAndStretch(chunk, fs, srcF0, targetF0, 
-                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength, glottalClosure);
+            // 子音部velocity + 伸縮部ストレッチ（フラグでElastic/PitchMark/標準を切り替え）
+            if (usePitchMarkStretch)
+            {
+                // Aフラグ: ピッチマーク駆動ストレッチ（連続音最適化、Approach A）
+                output = ApplyPitchMarkDrivenStretch(chunk, fs, srcF0, targetF0, 
+                                                      consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength, glottalClosure, useGlottalAutoEstimate);
+            }
+            else if (useElasticStretch)
+            {
+                // eフラグ: Elasticストレッチ（トランジェント保護）
+                output = SynthesizeWithElasticStretch(chunk, fs, srcF0, targetF0, 
+                                                        consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength, glottalClosure, useGlottalAutoEstimate);
+            }
+            else
+            {
+                // 標準: 均一な補間ベースのストレッチ
+                output = SynthesizeWithConsonantAndStretch(chunk, fs, srcF0, targetF0, 
+                                                            consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength, glottalClosure, useGlottalAutoEstimate);
+            }
         }
         
         // ボリューム適用
@@ -732,15 +792,400 @@ class Program
     }
     
     /// <summary>
+    /// ピッチマークを抽出（F0情報からピッチ周期の境界点を検出）
+    /// </summary>
+    static List<PitchMark> ExtractPitchMarks(ChunkHandle chunk, float thop)
+    {
+        var marks = new List<PitchMark>();
+        int nfrm = Llsm.GetNumFrames(chunk);
+        
+        // 各フレームのF0を取得
+        float[] f0Array = new float[nfrm];
+        for (int i = 0; i < nfrm; i++)
+        {
+            var frame = Llsm.GetFrame(chunk, i);
+            f0Array[i] = Llsm.GetFrameF0(frame);
+        }
+        
+        // ピッチマークを生成（各フレームの開始点）
+        // 注意: LLSMフレームは固定間隔（thop）で並んでいる
+        float accumulatedTime = 0;
+        for (int i = 0; i < nfrm; i++)
+        {
+            float f0 = f0Array[i];
+            bool isVoiced = (f0 > 10.0f);  // 10Hz以上を有声とする
+            
+            marks.Add(new PitchMark(
+                time: accumulatedTime,
+                frameIndex: i,
+                period: thop,  // フレーム間隔はthopで固定
+                isVoiced: isVoiced,
+                f0: f0
+            ));
+            
+            accumulatedTime += thop;
+        }
+        
+        return marks;
+    }
+    
+    /// <summary>
+    /// ピッチマーク駆動ストレッチ: F0情報に基づいてフレームをピッチ周期境界に配置
+    /// </summary>
+    static float[] ApplyPitchMarkDrivenStretch(ChunkHandle srcChunk, int fs, float srcF0, float targetF0,
+                                                int consonantFrames, float consonantStretch, float stretchRatio, 
+                                                List<int> pitchBend, int tempo = 120, int breathiness = 50, 
+                                                int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, 
+                                                bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, 
+                                                bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, 
+                                                int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0, 
+                                                int glottalClosure = 50, bool useGlottalAutoEstimate = false)
+    {
+        Console.WriteLine($"[PitchMark] Using pitch-mark driven stretch (Approach A)");
+        
+        // ピッチベンドのラップアラウンドを補正
+        var unwrappedPb = UnwrapPitchBend(pitchBend);
+        
+        int srcNfrm = Llsm.GetNumFrames(srcChunk);
+        
+        // ★Lフラグ: 声門パラメータ自動推定（Layer1変換前に実行）
+        if (useGlottalAutoEstimate)
+        {
+            EstimateAndApplyGlottalParameters(srcChunk, srcNfrm, fs);
+        }
+        
+        // 逆位相伝播（編集前に位相依存性を除去）
+        Llsm.ChunkPhasePropagate(srcChunk, -1);
+        
+        // Layer1に変換
+        Llsm.ChunkToLayer1(srcChunk, 8192);
+        
+        // ピッチマークを抽出
+        var srcMarks = ExtractPitchMarks(srcChunk, actualThop);
+        Console.WriteLine($"[PitchMark] Extracted {srcMarks.Count} pitch marks from source");
+        
+        // 出力フレーム数を計算（標準的なストレッチロジック）
+        int stretchableFrames = srcNfrm - consonantFrames;
+        int dstConsonantFrames = (int)(consonantFrames * consonantStretch);
+        int dstStretchedFrames = (int)(stretchableFrames * stretchRatio);
+        int dstNfrm = dstConsonantFrames + dstStretchedFrames;
+        
+        Console.WriteLine($"[PitchMark] Consonant frames: {consonantFrames} -> {dstConsonantFrames} (stretch={consonantStretch:F3})");
+        Console.WriteLine($"[PitchMark] Vowel frames: {stretchableFrames} -> {dstStretchedFrames} (stretch={stretchRatio:F3})");
+        Console.WriteLine($"[PitchMark] Total output frames: {dstNfrm}");
+        
+        // ピッチベンドを出力フレーム数に合わせて補間
+        float[] interpolatedPb = new float[dstNfrm];
+        if (unwrappedPb.Count > 0)
+        {
+            float outputDurationMs = dstNfrm * actualThop * 1000f;
+            float utauPbIntervalMs = 60.0f / 96.0f / tempo * 1000f;
+            int utauPbLength = (int)(outputDurationMs / utauPbIntervalMs) + 1;
+            
+            float[] paddedPb = new float[utauPbLength];
+            for (int j = 0; j < utauPbLength; j++)
+            {
+                if (j < unwrappedPb.Count)
+                    paddedPb[j] = unwrappedPb[j];
+                else
+                    paddedPb[j] = 0;
+            }
+            
+            float[] utauT = new float[utauPbLength];
+            for (int j = 0; j < utauPbLength; j++)
+            {
+                utauT[j] = j * utauPbIntervalMs;
+            }
+            
+            float[] outputT = new float[dstNfrm];
+            for (int j = 0; j < dstNfrm; j++)
+            {
+                outputT[j] = j * actualThop * 1000f;
+            }
+            
+            interpolatedPb = InterpolatePitchBend(utauT, outputT, paddedPb);
+        }
+        
+        // 逆位相伝播（編集前に位相依存性を除去）
+        Console.WriteLine($"[PitchMark] Applying backward phase propagation...");
+        Llsm.ChunkPhasePropagate(srcChunk, -1);
+        
+        // Layer1に変換（NFFT=8192で高域まで正確に表現）
+        Console.WriteLine($"[PitchMark] Converting to Layer1 (NFFT=8192)...");
+        Llsm.ChunkToLayer1(srcChunk, 8192);
+        
+        // 新しいchunkを構築（Layer1状態）
+        Console.WriteLine($"[PitchMark] Building chunk from pitch marks (dstNfrm={dstNfrm})...");
+        var dstChunk = BuildChunkFromPitchMarks(srcChunk, srcMarks, dstNfrm, dstConsonantFrames, 
+                                                 consonantStretch, stretchRatio, srcF0, targetF0, interpolatedPb, 
+                                                 breathiness, genderFactor, formantFollow, 
+                                                 unvoicedAttenuation, spectralTilt, pitchShiftNoise, 
+                                                 growlStrength, glottalClosure);
+        
+        Console.WriteLine($"[PitchMark] Chunk built successfully");
+        
+        // T flag: スペクトル傾斜（Layer1状態で実行）
+        if (spectralTilt != 0)
+        {
+            Console.WriteLine($"[PitchMark] Applying spectral tilt: {spectralTilt:+0;-0}dB/oct (T flag)");
+            ApplySpectralTilt(dstChunk, spectralTilt, fs);
+        }
+        
+        // U flag: 無声音減衰（Layer1状態で実行）
+        if (unvoicedAttenuation > 0)
+        {
+            Console.WriteLine($"[PitchMark] Applying unvoiced attenuation: -{unvoicedAttenuation}dB (U flag)");
+            Llsm.AttenuateUnvoiced(dstChunk, uvDb: -unvoicedAttenuation);
+        }
+        
+        // Layer0に変換（F0/フォルマント変更を音響合成に反映）
+        Console.WriteLine($"[PitchMark] Converting to Layer0 for synthesis...");
+        Llsm.ChunkToLayer0(dstChunk);
+        
+        // 順方向位相伝播
+        Console.WriteLine($"[PitchMark] Applying forward phase propagation...");
+        Llsm.ChunkPhasePropagate(dstChunk, 1);
+        
+        // 合成
+        Console.WriteLine($"[PitchMark] Synthesizing output...");
+        var sopts = Llsm.CreateSynthesisOptions(fs);
+        var outputHandle = Llsm.Synthesize(sopts, dstChunk);
+        Console.WriteLine($"[PitchMark] Synthesis completed");
+        var output = Llsm.ReadOutput(outputHandle);
+        
+        // クリーンアップ
+        outputHandle.Dispose();
+        sopts.Dispose();
+        
+        return output;
+    }
+    
+    /// <summary>
+    /// ピッチマークからchunkを構築（有声部はコピー、無声部は補間）
+    /// </summary>
+    static ChunkHandle BuildChunkFromPitchMarks(ChunkHandle srcChunk, List<PitchMark> srcMarks, 
+                                                 int dstNfrm, int dstConsonantFrames, 
+                                                 float consonantStretch, float stretchRatio, float srcF0, float targetF0,
+                                                 float[] interpolatedPb,
+                                                 int breathiness, int genderFactor, int formantFollow,
+                                                 int unvoicedAttenuation, int spectralTilt, 
+                                                 bool pitchShiftNoise, int growlStrength, int glottalClosure)
+    {
+        int srcNfrm = srcMarks.Count;
+        Console.WriteLine($"[BuildChunk] srcNfrm={srcNfrm}, dstNfrm={dstNfrm}");
+        
+        // 新しいchunkを作成（標準実装と同じパターン）
+        var conf = Llsm.GetConf(srcChunk);
+        var confCopy = Llsm.CopyContainer(conf);
+        var nfrmPtr = NativeLLSM.llsm_container_get(confCopy.Ptr, NativeLLSM.LLSM_CONF_NFRM);
+        Marshal.WriteInt32(nfrmPtr, dstNfrm);
+        
+        var dstChunk = Llsm.CreateChunk(confCopy, 0);
+        Console.WriteLine($"[BuildChunk] Created new destination chunk");
+        
+        // 各出力フレームを生成（補間なしでストレッチマッピングをテスト）
+        int stretchableFrames = srcNfrm - dstConsonantFrames;
+        int dstStretchedFrames = dstNfrm - dstConsonantFrames;
+        
+        Console.WriteLine($"[BuildChunk] Applying stretch mapping (interpolation disabled for stability)");
+        for (int i = 0; i < dstNfrm; i++)
+        {
+            // ソースフレーム位置を計算
+            float srcPosFloat;
+            if (i < dstConsonantFrames)
+            {
+                // 子音部: consonantStretch
+                float consonantPos = (float)i / dstConsonantFrames;
+                srcPosFloat = consonantPos * dstConsonantFrames / consonantStretch;
+            }
+            else
+            {
+                // 母音部: stretchRatio
+                float stretchedPos = (float)(i - dstConsonantFrames) / dstStretchedFrames;
+                srcPosFloat = dstConsonantFrames / consonantStretch + stretchedPos * stretchableFrames;
+            }
+            
+            // 最も近いフレームを選択（補間は後で実装）
+            int srcIdx = (int)Math.Round(srcPosFloat);
+            srcIdx = Math.Max(0, Math.Min(srcIdx, srcNfrm - 1));
+            
+            // ソースF0を取得（0の場合は平均F0を使用）
+            float srcF0Val = srcMarks[srcIdx].F0;
+            if (srcF0Val < 10.0f)  // 無声フレームの場合
+            {
+                srcF0Val = srcF0;  // 平均/中央値F0を使用
+            }
+            
+            // 基本ピッチ比率（ピッチベンド適用前）
+            float basePitchRatio = targetF0 / srcF0Val;
+            
+            // ピッチベンドを適用
+            float pitchBendCents = (i < interpolatedPb.Length) ? interpolatedPb[i] : 0;
+            float pitchBendRatio = (float)Math.Pow(2.0, pitchBendCents / 1200.0);
+            float dstF0 = targetF0 * pitchBendRatio;
+            
+            // 出力フレームの有声/無声は dstF0 で判定（srcではなく）
+            bool dstIsVoiced = dstF0 > 10.0f;
+            
+            var srcFrame = Llsm.GetFrame(srcChunk, srcIdx);
+            var frameCopy = Llsm.CopyFrame(srcFrame);
+            NativeLLSM.llsm_frame_phasesync_rps(frameCopy, 1);
+            
+            // フレーム参照を作成
+            var frameRef = new ContainerRef(frameCopy);
+            
+            // F0を設定（ピッチシフトを適用）
+            Llsm.SetFrameF0(frameRef, dstIsVoiced ? dstF0 : 0);
+            
+            // フォルマント追従（Fフラグ）
+            // 出力が有声の場合のみ適用
+            // 注意: basePitchRatioを使用（ピッチベンド含まない基本比率）
+            // F=100（デフォルト）: 何もしない = フォルマントがピッチに追従（自然な動作）
+            // F<100: 部分的にフォルマントを固定
+            if (dstIsVoiced && formantFollow != 100 && Math.Abs(basePitchRatio - 1.0f) > 0.05f)
+            {
+                ApplyAdaptiveFormantToFparray(frameRef, basePitchRatio, formantFollow);
+            }
+            
+            // パラメータフラグを適用（B/g）
+            if (breathiness != 50)
+            {
+                ApplyBreathiness(frameRef, breathiness);
+            }
+            
+            if (genderFactor != 0)
+            {
+                ApplyGenderFactor(frameRef, genderFactor);
+            }
+            
+            Llsm.SetFrame(dstChunk, i, frameCopy);
+        }
+        
+        Console.WriteLine($"[BuildChunk] All frames processed successfully (B/g/F flags enabled)");
+        return dstChunk;
+    }
+    
+    /// <summary>
+    /// 声門パラメータ自動推定：原音からRdパラメータを推定し、全フレームに適用
+    /// Lフラグで有効化
+    /// </summary>
+    static void EstimateAndApplyGlottalParameters(ChunkHandle chunk, int nfrm, int fs)
+    {
+        // Rdパラメータの範囲を作成（0.3～2.7の範囲、0.01刻み）
+        int nparam = 241;
+        float[] rdParams = new float[nparam];
+        for (int i = 0; i < nparam; i++)
+        {
+            rdParams[i] = 0.3f + i * 0.01f;
+        }
+
+        // キャッシュされた声門モデルを作成（最大100ハーモニクスまで）
+        int maxHar = 100;
+        IntPtr glottalModel = IntPtr.Zero;
+        try
+        {
+            glottalModel = NativeLLSM.llsm_create_cached_glottal_model(rdParams, nparam, maxHar);
+            if (glottalModel == IntPtr.Zero)
+            {
+                Console.WriteLine("  [GlottalEstimate] Failed to create glottal model");
+                return;
+            }
+
+            // 各フレームの声門パラメータを推定
+            List<float> estimatedRdList = new List<float>();
+            for (int i = 0; i < nfrm; i++)
+            {
+                var framePtr = Llsm.GetFrame(chunk, i);
+                float f0 = Llsm.GetFrameF0(framePtr);
+                
+                // 無声フレームはスキップ
+                if (f0 < 50 || f0 > 800)
+                    continue;
+
+                // ハーモニクスモデルを取得
+                IntPtr hmPtr = Llsm.GetFrameHM(framePtr);
+                if (hmPtr == IntPtr.Zero)
+                    continue;
+
+                int nhar = Llsm.GetHMNHar(hmPtr);
+                if (nhar <= 0)
+                    continue;
+
+                // 振幅データを取得
+                float[] ampl = Llsm.GetHMAmpl(hmPtr, nhar);
+                
+                // 声門パラメータを推定
+                float estimatedRd = NativeLLSM.llsm_spectral_glottal_fitting(ampl, nhar, glottalModel);
+                estimatedRdList.Add(estimatedRd);
+            }
+
+            // 推定結果の統計情報
+            if (estimatedRdList.Count > 0)
+            {
+                float meanRd = estimatedRdList.Average();
+                float stdRd = 0;
+                if (estimatedRdList.Count > 1)
+                {
+                    float variance = estimatedRdList.Select(x => (x - meanRd) * (x - meanRd)).Average();
+                    stdRd = MathF.Sqrt(variance);
+                }
+                
+                // Rd値の妥当性チェック（0.3～2.7の範囲外なら警告）
+                if (meanRd < 0.3f || meanRd > 2.7f)
+                {
+                    Console.WriteLine($"  [GlottalEstimate] WARNING: Rd={meanRd:F3} is out of normal range [0.3, 2.7]");
+                    meanRd = Math.Clamp(meanRd, 0.3f, 2.7f);
+                }
+                
+                Console.WriteLine($"  [GlottalEstimate] Analyzed {estimatedRdList.Count}/{nfrm} frames");
+                Console.WriteLine($"  [GlottalEstimate] Rd parameter: mean={meanRd:F3}, std={stdRd:F3}");
+                Console.WriteLine($"  [GlottalEstimate] Range: [{estimatedRdList.Min():F3}, {estimatedRdList.Max():F3}]");
+
+                // 平均Rd値を有声フレームのみに適用
+                for (int i = 0; i < nfrm; i++)
+                {
+                    var framePtr = Llsm.GetFrame(chunk, i);
+                    float f0 = Llsm.GetFrameF0(framePtr);
+                    
+                    // 有声フレームのみに適用
+                    if (f0 >= 50 && f0 <= 800)
+                    {
+                        Llsm.SetFrameRd(framePtr, meanRd);
+                    }
+                }
+            }
+            else
+            {
+                Console.WriteLine("  [GlottalEstimate] No voiced frames found for estimation");
+            }
+        }
+        finally
+        {
+            if (glottalModel != IntPtr.Zero)
+            {
+                NativeLLSM.llsm_delete_cached_glottal_model(glottalModel);
+            }
+        }
+    }
+    
+    /// <summary>
     /// 子音部velocity + 伸縮部ストレッチして合成
     /// </summary>
     static float[] SynthesizeWithConsonantAndStretch(ChunkHandle srcChunk, int fs, float srcF0, float targetF0,
-                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0, int glottalClosure = 50)
+                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0, int glottalClosure = 50, bool useGlottalAutoEstimate = false)
     {
         float basePitchRatio = targetF0 / srcF0;
         
         // ピッチベンドのラップアラウンドを補正
         var unwrappedPb = UnwrapPitchBend(pitchBend);
+        
+        int srcNfrm = Llsm.GetNumFrames(srcChunk);
+        
+        // ★Lフラグ: 声門パラメータ自動推定（Layer1変換前、HMフレームが存在する状態で実行）
+        if (useGlottalAutoEstimate)
+        {
+            EstimateAndApplyGlottalParameters(srcChunk, srcNfrm, fs);
+        }
         
         // 重要: 逆位相伝播はLayer0状態で実行する必要がある（Layer1には位相情報がない）
         // 逆位相伝播（編集前に位相依存性を除去）
@@ -748,8 +1193,6 @@ class Program
         
         // Layer1 に変換（NFFT=8192で高域まで正確に表現）
         Llsm.ChunkToLayer1(srcChunk, 8192);
-        
-        int srcNfrm = Llsm.GetNumFrames(srcChunk);
         int stretchableFrames = srcNfrm - consonantFrames;
         
         // 子音部はvelocityでストレッチ、伸縮部は lengthReq でストレッチ
@@ -818,6 +1261,26 @@ class Program
         float pitchShiftRatio = targetF0 / srcF0;
         Console.WriteLine($"[TimeStretch] Pitch shift ratio: {pitchShiftRatio:F4} ({srcF0:F1}Hz -> {targetF0:F1}Hz)");
         
+        // ★トランジェント検出：LLSMのスペクトルデータからトランジェントフレームを特定
+        // スペクトルフラックス（VTMAGN差分）を使い、子音アタックを検出
+        // VCV構造でも正しく動作（VC領域の母音部分は定常状態、子音部分はトランジェント）
+        List<ContainerRef> srcFrameList = new List<ContainerRef>();
+        for (int i = 0; i < srcNfrm; i++)
+        {
+            srcFrameList.Add(Llsm.GetFrame(srcChunk, i));
+        }
+        bool[] isTransient = DetectTransientFrames(srcFrameList, fs);
+        
+        // ★子音部内の定常状態フレーム（VC母音）を特定
+        // VCV構造では子音部にVC母音が含まれるため、これを保護する必要がある
+        Console.WriteLine($"[Synthesis] Detecting steady-state frames in consonant region...");
+        int steadyStateCount = 0;
+        for (int i = 0; i < Math.Min(consonantFrames, isTransient.Length); i++)
+        {
+            if (!isTransient[i]) steadyStateCount++;
+        }
+        Console.WriteLine($"[Synthesis] Consonant region: {consonantFrames} frames, {steadyStateCount} steady-state (protected from interpolation)");
+        
         // dstF0配列を準備（位相同期処理用）
         float[] dstF0 = new float[dstNfrm];
         
@@ -850,82 +1313,87 @@ class Program
             // 子音部の判定（補間とピッチシフトで使用）
             bool isConsonant = (i < dstConsonantFrames);
             
-            // フレーム補間
+            // ★子音部定常状態判定（VC母音保護）
+            // 子音領域内でも定常状態フレームは最近傍コピーで処理し、補間による劣化を防ぐ
+            int nearestSrc = (int)Math.Round(srcPosFloat);
+            nearestSrc = Math.Max(0, Math.Min(nearestSrc, srcNfrm - 1));
+            bool isSteadyStateInConsonant = isConsonant && 
+                                            (nearestSrc < isTransient.Length) && 
+                                            !isTransient[nearestSrc];
+            
+            // ★トランジェント補間判定：元フレームのトランジェント状態を確認
+            // トランジェント = スペクトル変化が大きい（子音アタック、破裂音など）
+            // 定常状態 = スペクトルが安定（母音、クロスフェード部分など）
+            bool isSrcTransient1 = (srcIdx1 < isTransient.Length && isTransient[srcIdx1]);
+            bool isSrcTransient2 = (srcIdx2 < isTransient.Length && isTransient[srcIdx2]);
+            bool isTransientRegion = isSrcTransient1 || isSrcTransient2;
+            
+            // フレーム補間（★品質改善：トランジェント保護 + Chunk-level RPS + VC母音保護）
             IntPtr newFramePtr;
-            if (srcIdx1 == srcIdx2 || ratio < 0.01f)
+            if (isSteadyStateInConsonant)
             {
-                // 整数位置またはratioがほぼ0: RPSを適用してコピー
+                // ★VCV子音部の定常状態フレーム（VC母音）：補間なしで最近傍コピー
+                // 補間による品質劣化を防ぐため、最も近いフレームをそのままコピー
+                var srcFrame = Llsm.GetFrame(srcChunk, nearestSrc);
+                newFramePtr = Llsm.CopyFrame(srcFrame);
+            }
+            else if (srcIdx1 == srcIdx2 || ratio < 0.01f)
+            {
+                // 整数位置またはratioがほぼ0: そのままコピー
                 var srcFrame = Llsm.GetFrame(srcChunk, srcIdx1);
                 var frameCopy = Llsm.CopyFrame(srcFrame);
-                NativeLLSM.llsm_frame_phasesync_rps(frameCopy, 1);  // Layer1用RPS適用
+                // RPS削除：Chunk-levelで実行するため不要
                 newFramePtr = frameCopy;
             }
             else if (ratio > 0.99f)
             {
-                // ratioがほぼ1: RPSを適用してコピー
+                // ratioがほぼ1: そのままコピー
                 var srcFrame = Llsm.GetFrame(srcChunk, srcIdx2);
                 var frameCopy = Llsm.CopyFrame(srcFrame);
-                NativeLLSM.llsm_frame_phasesync_rps(frameCopy, 1);  // Layer1用RPS適用
+                // RPS削除：Chunk-levelで実行するため不要
                 newFramePtr = frameCopy;
             }
             else
             {
-                // 全フレームでキュービック補間を使用（高品質・位相連続性重視）
-                // 子音/母音の境界での補間方式の違いをなくし、滑らかな位相遷移を保証
+                // ★トランジェント保護：音響特徴に基づいて補間方式を選択
+                // - トランジェント領域（子音アタック）→ 最近傍補間（鋭さを保護）
+                // - 定常状態領域（母音、クロスフェード）→ キュービック補間（滑らかに）
+                // VCV構造でも正しく動作：VC領域の母音は定常状態、子音アタックはトランジェント
                 
-                // キュービック補間が可能かチェック（前後1フレームずつ必要）
-                bool canUseCubic = (srcIdx1 > 0) && (srcIdx2 < srcNfrm - 1);
-                
-                if (canUseCubic)
+                if (isTransientRegion)
                 {
-                    // 4点Catmull-Rom補間（高品質なスペクトル補間）
-                    // 位相連続性を改善するため、補間前にRPSを適用
-                    // 現在Layer1状態なのでlayer1_based=1を指定
-                    var srcFrame0 = Llsm.GetFrame(srcChunk, srcIdx1 - 1);
-                    var srcFrame1 = Llsm.GetFrame(srcChunk, srcIdx1);
-                    var srcFrame2 = Llsm.GetFrame(srcChunk, srcIdx2);
-                    var srcFrame3 = Llsm.GetFrame(srcChunk, srcIdx2 + 1);
-                    
-                    // 元のフレームを保護するためコピーしてからRPSを適用
-                    var frame0Copy = Llsm.CopyFrame(srcFrame0);
-                    var frame1Copy = Llsm.CopyFrame(srcFrame1);
-                    var frame2Copy = Llsm.CopyFrame(srcFrame2);
-                    var frame3Copy = Llsm.CopyFrame(srcFrame3);
-                    NativeLLSM.llsm_frame_phasesync_rps(frame0Copy, 1);  // Layer1用
-                    NativeLLSM.llsm_frame_phasesync_rps(frame1Copy, 1);  // Layer1用
-                    NativeLLSM.llsm_frame_phasesync_rps(frame2Copy, 1);  // Layer1用
-                    NativeLLSM.llsm_frame_phasesync_rps(frame3Copy, 1);  // Layer1用
-                    
-                    var frame0Ref = new ContainerRef(frame0Copy);
-                    var frame1Ref = new ContainerRef(frame1Copy);
-                    var frame2Ref = new ContainerRef(frame2Copy);
-                    var frame3Ref = new ContainerRef(frame3Copy);
-                    newFramePtr = InterpolateFrameCubic(frame0Ref, frame1Ref, frame2Ref, frame3Ref, ratio);
-                    
-                    // コピーしたフレームを解放
-                    NativeLLSM.llsm_delete_container(frame0Copy);
-                    NativeLLSM.llsm_delete_container(frame1Copy);
-                    NativeLLSM.llsm_delete_container(frame2Copy);
-                    NativeLLSM.llsm_delete_container(frame3Copy);
+                    // トランジェント領域：最近傍補間でアタックを保護
+                    int nearestIdx = (ratio < 0.5f) ? srcIdx1 : srcIdx2;
+                    var nearestFrame = Llsm.GetFrame(srcChunk, nearestIdx);
+                    newFramePtr = Llsm.CopyFrame(nearestFrame);
                 }
                 else
                 {
-                    // 境界付近では線形補間にフォールバック（前後フレームが不足）
-                    // 位相連続性を改善するため、補間前にRPSを適用
-                    var srcFrame1 = Llsm.GetFrame(srcChunk, srcIdx1);
-                    var srcFrame2 = Llsm.GetFrame(srcChunk, srcIdx2);
+                    // 定常状態領域：キュービック補間で滑らかに
+                    // キュービック補間が可能かチェック（前後1フレームずつ必要）
+                    bool canUseCubic = (srcIdx1 > 0) && (srcIdx2 < srcNfrm - 1);
                     
-                    var frame1Copy = Llsm.CopyFrame(srcFrame1);
-                    var frame2Copy = Llsm.CopyFrame(srcFrame2);
-                    NativeLLSM.llsm_frame_phasesync_rps(frame1Copy, 1);  // Layer1用
-                    NativeLLSM.llsm_frame_phasesync_rps(frame2Copy, 1);  // Layer1用
-                    
-                    var frame1Ref = new ContainerRef(frame1Copy);
-                    var frame2Ref = new ContainerRef(frame2Copy);
-                    newFramePtr = InterpolateFrame(frame1Ref, frame2Ref, ratio);
-                    
-                    NativeLLSM.llsm_delete_container(frame1Copy);
-                    NativeLLSM.llsm_delete_container(frame2Copy);
+                    if (canUseCubic)
+                    {
+                        // 4点Catmull-Rom補間（高品質なスペクトル補間）
+                        // ★品質改善：RPSなしで直接補間、Chunk-levelで後処理
+                        var srcFrame0 = Llsm.GetFrame(srcChunk, srcIdx1 - 1);
+                        var srcFrame1 = Llsm.GetFrame(srcChunk, srcIdx1);
+                        var srcFrame2 = Llsm.GetFrame(srcChunk, srcIdx2);
+                        var srcFrame3 = Llsm.GetFrame(srcChunk, srcIdx2 + 1);
+                        
+                        // 元フレームを直接使用（ContainerRefからContainerRefへ渡す）
+                        newFramePtr = InterpolateFrameCubic(srcFrame0, srcFrame1, srcFrame2, srcFrame3, ratio);
+                    }
+                    else
+                    {
+                        // 境界付近では線形補間にフォールバック（前後フレームが不足）
+                        // ★品質改善：RPSなしで直接補間
+                        var srcFrame1 = Llsm.GetFrame(srcChunk, srcIdx1);
+                        var srcFrame2 = Llsm.GetFrame(srcChunk, srcIdx2);
+                        
+                        newFramePtr = InterpolateFrame(srcFrame1, srcFrame2, ratio);
+                    }
                 }
             }
             
@@ -940,7 +1408,8 @@ class Program
             float newF0 = 0;
             
             // 子音部低品質の判定（gフラグ・Fフラグでも使用）
-            bool isConsonantLowQuality = isConsonant && (originalF0 > 0 && originalF0 < 150.0f);
+            // ★品質改善：閾値を150Hz→100Hzに緩和、自然な子音を保持
+            bool isConsonantLowQuality = isConsonant && (originalF0 > 0 && originalF0 < 100.0f);
             
             // PSDRES（残差ノイズ）処理
             // 注意: 以前のR flag（ランダムコピー）機能は廃止されました
@@ -1030,23 +1499,20 @@ class Program
                         newF0 *= (float)Math.Pow(2, pbCents / 1200.0);
                     }
                     
+                    // ★品質改善：振幅補正を全フレームに適用（子音/母音の区別なし）
                     // ピッチシフトによる振幅補正（test-layer1-anasynth.cと同じ）
-                    // 子音部は振幅補正をスキップ（オーバーシュートを防ぐ）
-                    if (!isConsonant)
+                    float amplitudeCompensation = -20.0f * MathF.Log10(pitchRatio);
+                    var vtmagnPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_VTMAGN);
+                    if (vtmagnPtr != IntPtr.Zero)
                     {
-                        float amplitudeCompensation = -20.0f * MathF.Log10(pitchRatio);
-                        var vtmagnPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_VTMAGN);
-                        if (vtmagnPtr != IntPtr.Zero)
+                        int nspec = NativeLLSM.llsm_fparray_length(vtmagnPtr);
+                        float[] vtmagn = new float[nspec];
+                        Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
+                        for (int j = 0; j < nspec; j++)
                         {
-                            int nspec = NativeLLSM.llsm_fparray_length(vtmagnPtr);
-                            float[] vtmagn = new float[nspec];
-                            Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
-                            for (int j = 0; j < nspec; j++)
-                            {
-                                vtmagn[j] += amplitudeCompensation;
-                            }
-                            Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
+                            vtmagn[j] += amplitudeCompensation;
                         }
+                        Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
                     }
                 }
                 
@@ -1328,12 +1794,9 @@ class Program
             Console.WriteLine($"[Synthesis] Converting {dstNfrm} frames to Layer0...");
             Llsm.ChunkToLayer0(dstChunk);
             
-            // Chunk-level RPS（Rフラグ有効時のみ、Layer0でのみ実行）
-            if (useChunkRPS)
-            {
-                Console.WriteLine($"[Synthesis] Chunk-level RPS (R flag enabled, Layer0)...");
-                NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
-            }
+            // ★品質改善：Chunk-level RPSを必須化（Rフラグ不要、位相連続性確保）
+            Console.WriteLine($"[Synthesis] Chunk-level RPS (Layer0, mandatory for quality)...");
+            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
             
             // 順方向位相伝播（Layer0）
             Console.WriteLine($"[Synthesis] Phase propagate (Layer0)...");
@@ -1398,6 +1861,424 @@ class Program
             using var output = Llsm.Synthesize(sopt, dstChunk);
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($"[Synthesis] llsm_synthesize succeeded");
+            Console.ResetColor();
+            
+            return Llsm.ReadOutput(output);
+        }
+    }
+    
+    /// <summary>
+    /// Élastiqueスタイルの適応的タイムストレッチ合成
+    /// トランジェント（子音など急激な変化）を検出し、保護しながら母音部を伸縮
+    /// </summary>
+    static float[] SynthesizeWithElasticStretch(ChunkHandle srcChunk, int fs, float srcF0, float targetF0,
+                                                 int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0, int glottalClosure = 50, bool useGlottalAutoEstimate = false)
+    {
+        float basePitchRatio = targetF0 / srcF0;
+        
+        // ピッチベンドのラップアラウンドを補正
+        var unwrappedPb = UnwrapPitchBend(pitchBend);
+        
+        int srcNfrm = Llsm.GetNumFrames(srcChunk);
+        
+        // ★Lフラグ: 声門パラメータ自動推定（Layer1変換前に実行）
+        if (useGlottalAutoEstimate)
+        {
+            EstimateAndApplyGlottalParameters(srcChunk, srcNfrm, fs);
+        }
+        
+        // 逆位相伝播（編集前に位相依存性を除去）
+        Llsm.ChunkPhasePropagate(srcChunk, -1);
+        
+        // Layer1 に変換（NFFT=8192で高域まで正確に表現）
+        Llsm.ChunkToLayer1(srcChunk, 8192);
+        
+        // 全フレームを取得
+        var srcFrames = new List<ContainerRef>();
+        for (int i = 0; i < srcNfrm; i++)
+        {
+            srcFrames.Add(Llsm.GetFrame(srcChunk, i));
+        }
+        
+        // トランジェント検出
+        bool[] isTransient = DetectTransientFrames(srcFrames, fs);
+        
+        // ★子音部内の定常状態フレーム（VC母音）を特定
+        Console.WriteLine($"[Elastic Synthesis] Detecting steady-state frames in consonant region...");
+        int steadyStateCount = 0;
+        for (int i = 0; i < Math.Min(consonantFrames, isTransient.Length); i++)
+        {
+            if (!isTransient[i]) steadyStateCount++;
+        }
+        Console.WriteLine($"[Elastic Synthesis] Consonant region: {consonantFrames} frames, {steadyStateCount} steady-state (protected from interpolation)");
+        
+        // 子音部はvelocityでストレッチ、伸縮部は lengthReq でストレッチ
+        int stretchableFrames = srcNfrm - consonantFrames;
+        int dstConsonantFrames = (int)(consonantFrames * consonantStretch);
+        int dstStretchedFrames = (int)(stretchableFrames * stretchRatio);
+        int dstNfrm = dstConsonantFrames + dstStretchedFrames;
+        
+        // ピッチベンドを出力フレーム数に合わせて補間
+        float[] interpolatedPb = new float[dstNfrm];
+        if (unwrappedPb.Count > 0)
+        {
+            float outputDurationMs = dstNfrm * actualThop * 1000f;
+            float utauPbIntervalMs = 60.0f / 96.0f / tempo * 1000f;
+            int utauPbLength = (int)(outputDurationMs / utauPbIntervalMs) + 1;
+            
+            float[] paddedPb = new float[utauPbLength];
+            for (int j = 0; j < utauPbLength; j++)
+            {
+                if (j < unwrappedPb.Count)
+                    paddedPb[j] = unwrappedPb[j];
+                else
+                    paddedPb[j] = 0;
+            }
+            
+            float[] utauT = new float[utauPbLength];
+            for (int j = 0; j < utauPbLength; j++)
+            {
+                utauT[j] = j * utauPbIntervalMs;
+            }
+            
+            float[] outputT = new float[dstNfrm];
+            for (int j = 0; j < dstNfrm; j++)
+            {
+                outputT[j] = j * actualThop * 1000f;
+            }
+            
+            interpolatedPb = InterpolatePitchBend(utauT, outputT, paddedPb);
+        }
+        
+        // 新しい chunk を作成
+        var conf = Llsm.GetConf(srcChunk);
+        var confCopy = Llsm.CopyContainer(conf);
+        var nfrmPtr = NativeLLSM.llsm_container_get(confCopy.Ptr, NativeLLSM.LLSM_CONF_NFRM);
+        Marshal.WriteInt32(nfrmPtr, dstNfrm);
+        
+        var dstChunk = Llsm.CreateChunk(confCopy, 0);
+        
+        float[] dstF0 = new float[dstNfrm];
+        
+        // フレーム生成
+        for (int i = 0; i < dstNfrm; i++)
+        {
+            bool isConsonant = i < dstConsonantFrames;
+            
+            // 元フレームインデックスを計算
+            float srcIdx;
+            if (isConsonant)
+            {
+                srcIdx = consonantStretch > 0 ? i / consonantStretch : 0;
+            }
+            else
+            {
+                int stretchFrameIdx = i - dstConsonantFrames;
+                srcIdx = stretchRatio > 0 
+                    ? consonantFrames + stretchFrameIdx / stretchRatio 
+                    : consonantFrames;
+            }
+            
+            srcIdx = Math.Max(0, Math.Min(srcNfrm - 1, srcIdx));
+            int srcIdx0 = (int)Math.Floor(srcIdx);
+            int srcIdx1 = Math.Min(srcIdx0 + 1, srcNfrm - 1);
+            float ratio = srcIdx - srcIdx0;
+            
+            // ★子音部定常状態判定（VC母音保護）
+            int nearestSrc = (int)Math.Round(srcIdx);
+            nearestSrc = Math.Max(0, Math.Min(nearestSrc, srcNfrm - 1));
+            bool isSteadyStateInConsonant = isConsonant && 
+                                            (nearestSrc < isTransient.Length) && 
+                                            !isTransient[nearestSrc];
+            
+            // トランジェント判定: 現在または隣接フレームがトランジェントなら保護
+            bool isTransientRegion = isTransient[srcIdx0] || isTransient[srcIdx1];
+            
+            IntPtr newFramePtr;
+            
+            if (isSteadyStateInConsonant)
+            {
+                // ★VCV子音部の定常状態フレーム（VC母音）：補間なしで最近傍コピー
+                var srcFrame = Llsm.GetFrame(srcChunk, nearestSrc);
+                newFramePtr = Llsm.CopyFrame(srcFrame);
+            }
+            else if (isTransientRegion)
+            {
+                // トランジェントフレーム: 最近接フレームをコピー（補間なし）
+                int nearestIdx = ratio < 0.5f ? srcIdx0 : srcIdx1;
+                var nearestFrame = Llsm.GetFrame(srcChunk, nearestIdx);
+                newFramePtr = Llsm.CopyFrame(nearestFrame);
+            }
+            else
+            {
+                // 定常フレーム: スプライン補間
+                int srcIdx_1 = Math.Max(0, srcIdx0 - 1);
+                int srcIdx2 = Math.Min(srcIdx1 + 1, srcNfrm - 1);
+                
+                var frame_1Ref = Llsm.GetFrame(srcChunk, srcIdx_1);
+                var frame0Ref = Llsm.GetFrame(srcChunk, srcIdx0);
+                var frame1Ref = Llsm.GetFrame(srcChunk, srcIdx1);
+                var frame2Ref = Llsm.GetFrame(srcChunk, srcIdx2);
+                
+                bool canUseCubic = (srcIdx_1 != srcIdx0 && srcIdx2 != srcIdx1);
+                
+                if (canUseCubic)
+                {
+                    newFramePtr = InterpolateFrameCubic(frame_1Ref, frame0Ref, frame1Ref, frame2Ref, ratio);
+                }
+                else
+                {
+                    newFramePtr = InterpolateFrame(frame0Ref, frame1Ref, ratio);
+                }
+            }
+            
+            var newFrameRef = new ContainerRef(newFramePtr);
+            
+            // Frame-level RPS適用
+            NativeLLSM.llsm_frame_phasesync_rps(newFramePtr, 1);
+            
+            // ピッチシフトとF0設定
+            float newF0 = 0;
+            float originalF0 = Llsm.GetFrameF0(newFrameRef);
+            
+            if (originalF0 > 0)
+            {
+                float deviation = originalF0 - srcF0;
+                float modRatio = modulation / 100.0f;
+                if (useModPlus)
+                {
+                    modRatio = GetDynamicModulation(i, dstNfrm, modulation, actualThop, overlapMs) / 100.0f;
+                }
+                float adjustedSourceF0 = srcF0 + deviation * modRatio;
+                
+                float pitchRatio = targetF0 / srcF0;
+                newF0 = adjustedSourceF0 * pitchRatio;
+                
+                if (interpolatedPb.Length > 0 && i < interpolatedPb.Length)
+                {
+                    float pbCents = interpolatedPb[i];
+                    newF0 *= (float)Math.Pow(2, pbCents / 1200.0);
+                }
+                
+                // 振幅補正（非子音部のみ）
+                if (!isConsonant)
+                {
+                    float amplitudeCompensation = -20.0f * MathF.Log10(basePitchRatio);
+                    var vtmagnPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_VTMAGN);
+                    if (vtmagnPtr != IntPtr.Zero)
+                    {
+                        int nspec = NativeLLSM.llsm_fparray_length(vtmagnPtr);
+                        float[] vtmagn = new float[nspec];
+                        Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
+                        for (int j = 0; j < nspec; j++)
+                        {
+                            vtmagn[j] += amplitudeCompensation;
+                        }
+                        Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
+                    }
+                }
+                
+                var newF0Ptr = NativeLLSM.llsm_create_fp(newF0);
+                NativeLLSM.llsm_container_attach_(newFramePtr, NativeLLSM.LLSM_FRAME_F0,
+                    newF0Ptr, Marshal.GetFunctionPointerForDelegate(_deleteFp), IntPtr.Zero);
+                dstF0[i] = newF0;
+            }
+            
+            // 各種フラグ処理（既存コードと同様）
+            if (genderFactor != 0)
+            {
+                ApplyGenderFactor(newFrameRef, genderFactor);
+            }
+            
+            if (formantFollow != 100)
+            {
+                ApplyAdaptiveFormantToFparray(newFrameRef, basePitchRatio, formantFollow);
+            }
+            
+            Llsm.SetFrame(dstChunk, i, newFramePtr);
+        }
+        
+        // 以降は既存の処理と同様（完全実装）
+        
+        // Tフラグ: スペクトル傾斜調整
+        if (spectralTilt != 0)
+        {
+            Console.WriteLine($"[Elastic Synthesis] Spectral tilt: {spectralTilt:+0;-0}dB/oct (T flag, Layer1)");
+            for (int i = 0; i < dstNfrm; i++)
+            {
+                var frame = Llsm.GetFrame(dstChunk, i);
+                float f0_frame = Llsm.GetFrameF0(frame);
+                if (f0_frame <= 0) continue;
+                
+                var vtmagnPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+                if (vtmagnPtr == IntPtr.Zero) continue;
+                
+                int nspec = NativeLLSM.llsm_fparray_length(vtmagnPtr);
+                float[] vtmagn = new float[nspec];
+                Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
+                
+                var formantPeaks = DetectFormantPeaks(vtmagn, fs, nspec);
+                
+                for (int j = 0; j < nspec; j++)
+                {
+                    float freqKhz = (float)j / nspec * (fs / 2000.0f);
+                    float tiltDb = spectralTilt * MathF.Log2(MathF.Max(freqKhz, 0.1f));
+                    vtmagn[j] += tiltDb;
+                }
+                
+                foreach (var (peakIdx, origMagnitude) in formantPeaks)
+                {
+                    float currentMagnitude = vtmagn[peakIdx];
+                    float correction = origMagnitude - currentMagnitude;
+                    float strength = spectralTilt < 0 ? 0.5f : 0.7f;
+                    correction *= strength;
+                    
+                    int bandwidthBins = Math.Max(3, nspec / 100);
+                    for (int k = -bandwidthBins; k <= bandwidthBins; k++)
+                    {
+                        int idx = peakIdx + k;
+                        if (idx >= 0 && idx < nspec)
+                        {
+                            float sigma = bandwidthBins / 2.0f;
+                            float weight = MathF.Exp(-(k * k) / (2 * sigma * sigma));
+                            vtmagn[idx] += correction * weight;
+                        }
+                    }
+                }
+                
+                Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
+            }
+        }
+        
+        // Kフラグ: 声門閉鎖係数調整
+        if (glottalClosure != 50)
+        {
+            Console.WriteLine($"[Elastic Synthesis] Adjusting glottal closure: K{glottalClosure} (Layer1)");
+            for (int i = 0; i < dstNfrm; i++)
+            {
+                var frame = Llsm.GetFrame(dstChunk, i);
+                float f0_frame = Llsm.GetFrameF0(frame);
+                if (f0_frame <= 0) continue;
+                
+                var rdPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_RD);
+                if (rdPtr == IntPtr.Zero) continue;
+                
+                float rdScale = 2.5f - (glottalClosure / 100.0f) * 2.2f;
+                float currentRd = Marshal.PtrToStructure<float>(rdPtr);
+                float newRd = currentRd * rdScale;
+                Marshal.StructureToPtr(newRd, rdPtr, false);
+            }
+        }
+        
+        // Uフラグ: 無声音減衰
+        if (unvoicedAttenuation > 0)
+        {
+            Console.WriteLine($"[Elastic Synthesis] Unvoiced attenuation: -{unvoicedAttenuation}dB (U flag, Layer1)");
+            Llsm.AttenuateUnvoiced(dstChunk, uvDb: -unvoicedAttenuation);
+        }
+        
+        // Gフラグ: グロウル効果
+        if (growlStrength > 0)
+        {
+            Console.WriteLine($"[Elastic Synthesis] Growl effect: {growlStrength}% (G flag, PBP synthesis)");
+            var growlState = new GrowlEffectState(growlStrength);
+            GCHandle stateHandle = GCHandle.Alloc(growlState);
+            IntPtr statePtr = GCHandle.ToIntPtr(stateHandle);
+            
+            _growlCallback = GrowlEffectCallback;
+            IntPtr callbackPtr = Marshal.GetFunctionPointerForDelegate(_growlCallback);
+            
+            for (int i = 0; i < dstNfrm; i++)
+            {
+                var frame = Llsm.GetFrame(dstChunk, i);
+                float f0_frame = Llsm.GetFrameF0(frame);
+                
+                if (f0_frame > 0)
+                {
+                    NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_HM, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                    
+                    IntPtr pbpsynPtr = NativeLLSM.llsm_create_int(1);
+                    NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_PBPSYN,
+                        pbpsynPtr, Marshal.GetFunctionPointerForDelegate(_deleteInt), 
+                        Marshal.GetFunctionPointerForDelegate(_copyInt));
+                    
+                    IntPtr pbpeffPtr = NativeLLSM.llsm_create_pbpeffect(callbackPtr, statePtr);
+                    NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_PBPEFF,
+                        pbpeffPtr, Marshal.GetFunctionPointerForDelegate(_deletePbpEffect),
+                        Marshal.GetFunctionPointerForDelegate(_copyPbpEffect));
+                }
+            }
+            
+            NativeLLSM.llsm_chunk_phasepropagate(dstChunk.DangerousGetHandle(), 1);
+        }
+        
+        // Layer0変換とRPS
+        bool useLayer1Synthesis = (growlStrength > 0);
+        
+        if (!useLayer1Synthesis)
+        {
+            Console.WriteLine($"[Elastic Synthesis] Converting {dstNfrm} frames to Layer0...");
+            Llsm.ChunkToLayer0(dstChunk);
+            
+            if (useChunkRPS)
+            {
+                Console.WriteLine($"[Elastic Synthesis] Chunk-level RPS (R flag enabled, Layer0)...");
+                NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+            }
+            
+            Console.WriteLine($"[Elastic Synthesis] Phase propagate (Layer0)...");
+            Llsm.ChunkPhasePropagate(dstChunk, +1);
+        }
+        else
+        {
+            Console.WriteLine($"[Elastic Synthesis] Keeping Layer1 for PBP synthesis (Growl effect active)...");
+        }
+        
+        // オーバーサンプリング
+        if (useOversampling)
+        {
+            int oversampleRate = 4;
+            int synthesisFs = fs * oversampleRate;
+            Console.WriteLine($"[Elastic Synthesis] Oversampling enabled: {oversampleRate}x ({synthesisFs}Hz)");
+            using var sopt = Llsm.CreateSynthesisOptions(synthesisFs);
+            
+            if (useLayer1Synthesis)
+            {
+                unsafe
+                {
+                    var soptPtr = (NativeLLSM.llsm_soptions*)sopt.DangerousGetHandle().ToPointer();
+                    soptPtr->use_l1 = 1;
+                    Console.WriteLine($"[Elastic Synthesis] use_l1=1 (Layer1 synthesis for PBP/Growl)");
+                }
+            }
+            
+            using var output = Llsm.Synthesize(sopt, dstChunk);
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Elastic Synthesis] llsm_synthesize succeeded");
+            Console.ResetColor();
+            
+            var oversampledOutput = Llsm.ReadOutput(output);
+            Console.WriteLine($"[Elastic Synthesis] Downsampling from {synthesisFs}Hz to {fs}Hz...");
+            return Downsample(oversampledOutput, oversampleRate);
+        }
+        else
+        {
+            Console.WriteLine($"[Elastic Synthesis] Direct synthesis at {fs}Hz (no oversampling)");
+            using var sopt = Llsm.CreateSynthesisOptions(fs);
+            
+            if (useLayer1Synthesis)
+            {
+                unsafe
+                {
+                    var soptPtr = (NativeLLSM.llsm_soptions*)sopt.DangerousGetHandle().ToPointer();
+                    soptPtr->use_l1 = 1;
+                    Console.WriteLine($"[Elastic Synthesis] use_l1=1 (Layer1 synthesis for PBP/Growl)");
+                }
+            }
+            
+            using var output = Llsm.Synthesize(sopt, dstChunk);
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Elastic Synthesis] llsm_synthesize succeeded");
             Console.ResetColor();
             
             return Llsm.ReadOutput(output);
@@ -1491,6 +2372,76 @@ class Program
         }
         
         return coeffs;
+    }
+    
+    /// <summary>
+    /// Spectral Flux を使用してトランジェント（子音など急激な変化）を検出
+    /// </summary>
+    /// <returns>各フレームがトランジェントかどうかの配列</returns>
+    static bool[] DetectTransientFrames(List<ContainerRef> frames, int fs)
+    {
+        int nFrames = frames.Count;
+        bool[] isTransient = new bool[nFrames];
+        
+        if (nFrames < 2)
+            return isTransient;
+        
+        // 各フレームのスペクトルエネルギーを取得
+        float[] spectralFlux = new float[nFrames];
+        
+        for (int i = 1; i < nFrames; i++)
+        {
+            var prevFrame = frames[i - 1];
+            var currFrame = frames[i];
+            
+            // VTMAGN (スペクトル振幅) を取得
+            var prevVtmagnPtr = NativeLLSM.llsm_container_get(prevFrame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            var currVtmagnPtr = NativeLLSM.llsm_container_get(currFrame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            
+            if (prevVtmagnPtr != IntPtr.Zero && currVtmagnPtr != IntPtr.Zero)
+            {
+                int prevLen = NativeLLSM.llsm_fparray_length(prevVtmagnPtr);
+                int currLen = NativeLLSM.llsm_fparray_length(currVtmagnPtr);
+                int minLen = Math.Min(prevLen, currLen);
+                
+                if (minLen > 0)
+                {
+                    float[] prevMagn = new float[prevLen];
+                    float[] currMagn = new float[currLen];
+                    Marshal.Copy(prevVtmagnPtr, prevMagn, 0, prevLen);
+                    Marshal.Copy(currVtmagnPtr, currMagn, 0, currLen);
+                    
+                    // Spectral Flux: 正の差分の合計 (エネルギー増加)
+                    float flux = 0.0f;
+                    for (int j = 0; j < minLen; j++)
+                    {
+                        float diff = currMagn[j] - prevMagn[j];
+                        if (diff > 0)
+                            flux += diff;
+                    }
+                    spectralFlux[i] = flux;
+                }
+            }
+        }
+        
+        // 統計値を計算
+        float mean = spectralFlux.Average();
+        float variance = 0.0f;
+        foreach (float flux in spectralFlux)
+            variance += (flux - mean) * (flux - mean);
+        variance /= nFrames;
+        float stdDev = (float)Math.Sqrt(variance);
+        
+        // 閾値: 平均 + 2σ (標準的な外れ値検出)
+        float threshold = mean + 2.0f * stdDev;
+        
+        // トランジェント判定
+        for (int i = 0; i < nFrames; i++)
+        {
+            isTransient[i] = spectralFlux[i] > threshold;
+        }
+        
+        return isTransient;
     }
     
     /// <summary>
@@ -2601,6 +3552,67 @@ class Program
     }
     
     /// <summary>
+    /// スペクトル傾斜を適用（Tフラグ）
+    /// フォルマントを保持しながらスペクトル全体の傾きを変更
+    /// </summary>
+    static void ApplySpectralTilt(ChunkHandle chunk, int spectralTilt, int fs)
+    {
+        int nfrm = Llsm.GetNumFrames(chunk);
+        
+        for (int i = 0; i < nfrm; i++)
+        {
+            var frame = Llsm.GetFrame(chunk, i);
+            float f0 = Llsm.GetFrameF0(frame);
+            if (f0 <= 0) continue;  // 無声音はスキップ
+            
+            // VTMAGNを取得（対数振幅スペクトル）
+            var vtmagnPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            if (vtmagnPtr == IntPtr.Zero) continue;
+            
+            int nspec = NativeLLSM.llsm_fparray_length(vtmagnPtr);
+            float[] vtmagn = new float[nspec];
+            Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
+            
+            // Step 1: フォルマントピーク検出（元のスペクトルから）
+            List<(int index, float magnitude)> formantPeaks = DetectFormantPeaks(vtmagn, fs, nspec);
+            
+            // Step 2: スペクトル傾斜を適用
+            for (int j = 0; j < nspec; j++)
+            {
+                float freqKhz = (float)j / nspec * (fs / 2000.0f);
+                float tiltDb = spectralTilt * MathF.Log2(MathF.Max(freqKhz, 0.1f));
+                vtmagn[j] += tiltDb;
+            }
+            
+            // Step 3: フォルマントピーク周辺の振幅を元のレベルに復元（適応的強度）
+            foreach (var (peakIdx, origMagnitude) in formantPeaks)
+            {
+                float currentMagnitude = vtmagn[peakIdx];
+                float correction = origMagnitude - currentMagnitude;
+                
+                // 復元強度を方向に応じて調整
+                float strength = spectralTilt < 0 ? 0.5f : 0.7f;
+                correction *= strength;
+                
+                // ガウシアンウィンドウで周辺に復元を適用
+                int bandwidthBins = Math.Max(3, nspec / 100);
+                for (int k = -bandwidthBins; k <= bandwidthBins; k++)
+                {
+                    int idx = peakIdx + k;
+                    if (idx >= 0 && idx < nspec)
+                    {
+                        float sigma = bandwidthBins / 2.0f;
+                        float weight = MathF.Exp(-(k * k) / (2 * sigma * sigma));
+                        vtmagn[idx] += correction * weight;
+                    }
+                }
+            }
+            
+            Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
+        }
+    }
+    
+    /// <summary>
     /// fparrayフレーム（補間後のdstChunk）に対して適応的フォルマント処理を適用
     /// </summary>
     static void ApplyAdaptiveFormantToFparray(ContainerRef frame, float pitchRatio, int formantFollow)
@@ -2612,9 +3624,6 @@ class Program
         if (f0 <= 0) return;  // 無声音では処理しない
         
         // フォルマント追従率を計算
-        // Layer0変換時にLLSMが自動的にF0変化に応じてフォルマントを追従させる（pitchRatio倍）
-        // 追従を抑制するには、事前に逆方向にシフトして相殺する
-        // 
         // formantFollow=0 → 完全固定（1.0倍、声質保持）
         // formantFollow=50 → 50%追従（自然なバランス）
         // formantFollow=100 → 完全追従（処理スキップ、デフォルト動作）
@@ -2626,9 +3635,16 @@ class Program
         // followRatio=1.0 → pitchRatio（完全追従、でもここには来ない）
         float targetFormantRatio = 1.0f + (pitchRatio - 1.0f) * followRatio;
         
-        // Layer0変換後に目標比率になるよう、事前にシフト
-        // Layer0適用後: formantShiftRatio * pitchRatio = targetFormantRatio
-        float formantShiftRatio = targetFormantRatio / pitchRatio;
+        // ピッチがpitchRatio倍になると、F0が上がることでフォルマントもpitchRatio倍に聞こえる
+        // これを相殺してtargetFormantRatioにするため、VTMAGNを逆方向にシフト
+        // 
+        // formantShiftRatio = pitchRatio / targetFormantRatio
+        // 
+        // 例: pitchRatio=1.5（F0が1.5倍）、F=0（固定）の場合
+        //   targetFormantRatio = 1.0
+        //   formantShiftRatio = 1.5 / 1.0 = 1.5
+        //   VTMAGNを1.5倍に引き伸ばす
+        float formantShiftRatio = pitchRatio / targetFormantRatio;
         
         // VTMAGNを取得（fparrayとして）
         var vtmagnPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
@@ -3656,6 +4672,85 @@ class Program
         }
         
         Console.WriteLine("\nDone!");
+        
+        // Élastique スタイル比較テスト
+        RunElasticComparisonTest();
+    }
+    
+    /// <summary>
+    /// Élastique スタイルアルゴリズムの比較テスト
+    /// </summary>
+    static void RunElasticComparisonTest()
+    {
+        Console.WriteLine("\n=== Test 10: Elastic Stretch Comparison ===");
+        
+        string wavPath = @"G:\UTAU_voices\ARUARU\あ.wav";
+        if (!File.Exists(wavPath))
+        {
+            Console.WriteLine($"  Test wav file not found: {wavPath}");
+            return;
+        }
+        
+        var (segment, wavFs) = Wav.ReadMono(wavPath);
+        
+        Console.WriteLine($"  Loaded: {wavPath} ({segment.Length} samples, {wavFs}Hz)");
+        
+        // ピッチ検出
+        int nhop = (int)(Thop * wavFs);
+        var f0 = Pyin.Analyze(segment, wavFs, nhop, 60, 800);
+        Console.WriteLine($"  F0 estimation: {f0.Length} frames");
+        
+        float avgF0 = f0.Where(x => x > 0).DefaultIfEmpty(150).Average();
+        Console.WriteLine($"  Average F0: {avgF0:F1} Hz");
+        
+        // 解析
+        using var aopt = Llsm.CreateAnalysisOptions();
+        using var chunk = Llsm.Analyze(aopt, segment, wavFs, f0, f0.Length);
+        int nframes = Llsm.GetNumFrames(chunk);
+        Console.WriteLine($"  Analysis: {nframes} frames");
+        
+        // Test parameters: slow consonant (velocity=50)
+        int consonantFrames = Math.Min(10, nframes / 4);
+        float velocity = 50.0f;  // 50% = consonant will be slow and potentially blurred
+        float consonantStretch = 100.0f / velocity;
+        float lengthRatio = 1.0f;  // no stretch in vowel region
+        
+        Console.WriteLine($"  Test: consonant={consonantFrames} frames, velocity={velocity}% (stretch={consonantStretch:F2}x)");
+        
+        // Test 1: Current algorithm (uniform interpolation)
+        Console.WriteLine("\n  [1] Current algorithm (uniform cubic interpolation)...");
+        using (var chunkCopy1 = Llsm.CopyChunk(chunk))
+        {
+            var result1 = SynthesizeWithConsonantAndStretch(
+                chunkCopy1, wavFs, avgF0, avgF0,
+                consonantFrames, consonantStretch, lengthRatio,
+                new List<int>(), 120, 50, 0, 100, Thop,
+                false, false, 100, false, 0, 0, 0, false, 0, 50
+            );
+            
+            Wav.WriteMono16("test_stretch_current.wav", result1, wavFs);
+            Console.WriteLine($"      Wrote: test_stretch_current.wav ({result1.Length} samples)");
+        }
+        
+        // Test 2: Elastic algorithm (transient-preserving)
+        Console.WriteLine("\n  [2] Elastic algorithm (transient-preserving)...");
+        using (var chunkCopy2 = Llsm.CopyChunk(chunk))
+        {
+            var result2 = SynthesizeWithElasticStretch(
+                chunkCopy2, wavFs, avgF0, avgF0,
+                consonantFrames, consonantStretch, lengthRatio,
+                new List<int>(), 120, 50, 0, 100, Thop,
+                false, false, 100, false, 0, 0, 0, false, 0, 50
+            );
+            
+            Wav.WriteMono16("test_stretch_elastic.wav", result2, wavFs);
+            Console.WriteLine($"      Wrote: test_stretch_elastic.wav ({result2.Length} samples)");
+        }
+        
+        Console.WriteLine("\n  Compare the two files:");
+        Console.WriteLine("    - test_stretch_current.wav: uniform interpolation (may blur consonants)");
+        Console.WriteLine("    - test_stretch_elastic.wav: transient-preserving (clearer consonants)");
+        Console.WriteLine("  Expected: Elastic version should have sharper consonant attacks");
     }
     
     /// <summary>

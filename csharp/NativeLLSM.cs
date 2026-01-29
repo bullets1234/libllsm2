@@ -119,6 +119,9 @@ namespace LlsmBindings
         public static extern void llsm_delete_fp(IntPtr p);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_copy_fp(IntPtr p);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_delete_fparray(IntPtr p);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -130,6 +133,10 @@ namespace LlsmBindings
         // デストラクタ/コピー関数ポインタを伴う attach 変種（所有権移譲/ディープコピー制御）
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_container_attach_(IntPtr dst, int index, IntPtr ptr, IntPtr dtor, IntPtr copyctor);
+
+        // 簡易版: attach without delete/copy function pointers
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_container_attach(IntPtr dst, int index, IntPtr ptr, IntPtr dtor, IntPtr copyctor);
 
         // 出力構造体のミラー（メモリレイアウト固定）
         [StructLayout(LayoutKind.Sequential)]
@@ -273,5 +280,18 @@ namespace LlsmBindings
         // コピー関数ポインタのデリゲート型
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         public delegate IntPtr CopyFunc(IntPtr ptr);
+
+        // dsputils.c functions for glottal analysis
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_create_cached_glottal_model(float[] param, int nparam, int nhar);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_delete_cached_glottal_model(IntPtr model);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern float llsm_spectral_glottal_fitting(float[] ampl, int nhar, IntPtr model);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_lipfilter(float radius, float f0, int nhar, float[] dst_ampl, float[] dst_phse, int inverse);
     }
 }

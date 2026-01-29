@@ -406,6 +406,41 @@ namespace LlsmBindings
         }
 
         /// <summary>
+        /// フレームからハーモニクスモデル（HM）を取得
+        /// </summary>
+        public static IntPtr GetFrameHM(ContainerRef frame)
+        {
+            return NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_HM);
+        }
+
+        /// <summary>
+        /// ハーモニクスモデルからハーモニクス数を取得
+        /// </summary>
+        public static int GetHMNHar(IntPtr hmPtr)
+        {
+            if (hmPtr == IntPtr.Zero) return 0;
+            // llsm_hmframe構造体: {FP_TYPE* ampl, FP_TYPE* phse, int nhar}
+            // nharは2つのポインタの後（IntPtr.Size * 2バイト後）
+            return Marshal.ReadInt32(hmPtr + IntPtr.Size * 2);
+        }
+
+        /// <summary>
+        /// ハーモニクスモデルから振幅配列を取得
+        /// </summary>
+        public static float[] GetHMAmpl(IntPtr hmPtr, int nhar)
+        {
+            if (hmPtr == IntPtr.Zero || nhar <= 0) return new float[0];
+            // llsm_hmframe構造体: {FP_TYPE* ampl, FP_TYPE* phse, int nhar}
+            // amplは最初のメンバー（オフセット0）
+            IntPtr amplPtr = Marshal.ReadIntPtr(hmPtr);
+            if (amplPtr == IntPtr.Zero) return new float[0];
+            
+            float[] ampl = new float[nhar];
+            Marshal.Copy(amplPtr, ampl, 0, nhar);
+            return ampl;
+        }
+
+        /// <summary>
         /// 無声フレームで VTMAGN を一律減衰（dB）させます（残響的な有声痕跡の抑制）。
         /// </summary>
         public static void AttenuateUnvoiced(ChunkHandle chunk, float uvDb = -9f)
