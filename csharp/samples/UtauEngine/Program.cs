@@ -391,6 +391,16 @@ class Program
             Console.WriteLine($"  [GlottalEstimate] Auto-estimate Rd parameter from source (L flag)");
         }
         
+        // Dフラグ: HNR（倍音対雑音比）改善（デフォルト0 = off）
+        int hnrEnhancement = 0;
+        var dMatch = System.Text.RegularExpressions.Regex.Match(flags, @"D(\d+)");
+        if (dMatch.Success)
+        {
+            hnrEnhancement = int.Parse(dMatch.Groups[1].Value);
+            hnrEnhancement = Math.Clamp(hnrEnhancement, 1, 100);
+            Console.WriteLine($"  [HNR] D{hnrEnhancement} - noise reduction strength {hnrEnhancement}%");
+        }
+        
         // 分析オプション最適化（高品質設定）
         int maxnhar, maxnhar_e;
         
@@ -676,6 +686,12 @@ class Program
             }
         }
         
+        // HNR改善（Dフラグ）: Layer0状態でノイズ成分を適応的に低減
+        if (hnrEnhancement > 0)
+        {
+            EnhanceHNR(chunk, nfrm, fs, hnrEnhancement);
+        }
+        
         // 合成（子音部velocity + 伸縮部）
         float[] output;
         if (Math.Abs(stretchRatio - 1.0f) < 0.01f && Math.Abs(consonantStretch - 1.0f) < 0.01f && pitchBend.Count == 0)
@@ -724,9 +740,10 @@ class Program
             if (absVal > peak) peak = absVal;
         }
         
-        // 音量範囲調整：適切な範囲（-9dB～-0.5dB）に収める
-        const float minPeak = 0.35f;  // -9dB: これより小さい音声は引き上げる
-        const float maxPeak = 0.95f;  // -0.5dB: これより大きい音声は抑える
+        // 音量範囲調整：UTAUのミキサーでオーバーラップ加算されるため控えめに
+        // ノート単体で-3dB程度に抑えて、合成時のクリップを防止
+        const float minPeak = 0.25f;  // -12dB: これより小さい音声は引き上げる
+        const float maxPeak = 0.70f;  // -3dB: これより大きい音声は抑える
         
         if (peak > maxPeak)
         {
@@ -1060,6 +1077,88 @@ class Program
     }
     
     /// <summary>
+    /// HNR（倍音対雑音比）改善: フレームごとのSNRを計算し、
+    /// 低SNRフレームのノイズ成分を適応的に低減する。
+    /// Layer0状態（tolayer1前）で実行する必要がある。
+    /// Dフラグ（D1-D100）で強度を制御。
+    /// </summary>
+    static void EnhanceHNR(ChunkHandle chunk, int nfrm, int fs, int strength)
+    {
+        float maxReductionDb = 6.0f * (strength / 100.0f);  // D100で最大6dB低減
+        int processedFrames = 0;
+        
+        for (int i = 0; i < nfrm; i++)
+        {
+            var frame = Llsm.GetFrame(chunk, i);
+            
+            // HM（倍音）情報を取得
+            IntPtr hmPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_HM);
+            if (hmPtr == IntPtr.Zero) continue;
+            var hm = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(hmPtr);
+            if (hm.nhar <= 0) continue;  // 無声フレームはスキップ
+            
+            // NM（ノイズ）情報を取得
+            IntPtr nmPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_NM);
+            if (nmPtr == IntPtr.Zero) continue;
+            var nm = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nmPtr);
+            if (nm.npsd <= 0) continue;
+            
+            // 倍音パワーを計算（線形振幅 → パワー → dB）
+            float[] ampl = new float[hm.nhar];
+            Marshal.Copy(hm.ampl, ampl, 0, hm.nhar);
+            double harmonicPower = 0;
+            for (int h = 0; h < hm.nhar; h++)
+            {
+                harmonicPower += ampl[h] * ampl[h];
+            }
+            if (harmonicPower <= 1e-20) continue;  // 無音フレームはスキップ
+            double harmonicPowerDb = 10.0 * Math.Log10(harmonicPower);
+            
+            // ノイズPSD平均を計算（すでにdB）
+            float[] psd = new float[nm.npsd];
+            Marshal.Copy(nm.psd, psd, 0, nm.npsd);
+            double noiseMeanDb = 0;
+            for (int j = 0; j < nm.npsd; j++)
+            {
+                noiseMeanDb += psd[j];
+            }
+            noiseMeanDb /= nm.npsd;
+            
+            // フレームSNR = 倍音パワー(dB) - ノイズ平均(dB)
+            double snrDb = harmonicPowerDb - noiseMeanDb;
+            
+            // 適応的低減量の計算
+            // SNR < 10dB: 最大低減、SNR > 30dB: 低減なし
+            double adaptiveFactor;
+            if (snrDb <= 10.0)
+                adaptiveFactor = 1.0;
+            else if (snrDb >= 30.0)
+                adaptiveFactor = 0.0;
+            else
+                adaptiveFactor = 1.0 - (snrDb - 10.0) / 20.0;
+            
+            if (adaptiveFactor <= 0.01) continue;  // ほぼ低減不要
+            
+            double reductionDb = maxReductionDb * adaptiveFactor;
+            
+            // 周波数依存プロファイルでNM PSDを低減
+            // 低周波は控えめ（0.3倍）、高周波ほど強く（1.0倍）
+            for (int j = 0; j < nm.npsd; j++)
+            {
+                double freqRatio = (double)j / Math.Max(1, nm.npsd - 1);
+                double freqWeight = 0.3 + 0.7 * freqRatio;
+                psd[j] -= (float)(reductionDb * freqWeight);
+            }
+            
+            // 更新したPSDを書き戻し
+            Marshal.Copy(psd, 0, nm.psd, nm.npsd);
+            processedFrames++;
+        }
+        
+        Console.WriteLine($"[HNR] Enhanced {processedFrames}/{nfrm} frames (max reduction: {maxReductionDb:F1}dB)");
+    }
+    
+    /// <summary>
     /// 声門パラメータ自動推定：原音からRdパラメータを推定し、全フレームに適用
     /// Lフラグで有効化
     /// </summary>
@@ -1085,18 +1184,19 @@ class Program
                 return;
             }
 
-            // 各フレームの声門パラメータを推定
-            List<float> estimatedRdList = new List<float>();
+            // 各フレームの声門パラメータを推定（per-frame）
+            float[] rdPerFrame = new float[nfrm];
+            for (int i = 0; i < nfrm; i++) rdPerFrame[i] = float.NaN;
+            
+            int voicedCount = 0;
             for (int i = 0; i < nfrm; i++)
             {
                 var framePtr = Llsm.GetFrame(chunk, i);
                 float f0 = Llsm.GetFrameF0(framePtr);
                 
-                // 無声フレームはスキップ
                 if (f0 < 50 || f0 > 800)
                     continue;
 
-                // ハーモニクスモデルを取得
                 IntPtr hmPtr = Llsm.GetFrameHM(framePtr);
                 if (hmPtr == IntPtr.Zero)
                     continue;
@@ -1105,47 +1205,52 @@ class Program
                 if (nhar <= 0)
                     continue;
 
-                // 振幅データを取得
                 float[] ampl = Llsm.GetHMAmpl(hmPtr, nhar);
-                
-                // 声門パラメータを推定
                 float estimatedRd = NativeLLSM.llsm_spectral_glottal_fitting(ampl, nhar, glottalModel);
-                estimatedRdList.Add(estimatedRd);
+                rdPerFrame[i] = Math.Clamp(estimatedRd, 0.3f, 2.7f);
+                voicedCount++;
             }
 
-            // 推定結果の統計情報
-            if (estimatedRdList.Count > 0)
+            // 推定結果を移動平均で平滑化（窓幅5フレーム=25ms @5ms hop）
+            if (voicedCount > 0)
             {
-                float meanRd = estimatedRdList.Average();
-                float stdRd = 0;
-                if (estimatedRdList.Count > 1)
-                {
-                    float variance = estimatedRdList.Select(x => (x - meanRd) * (x - meanRd)).Average();
-                    stdRd = MathF.Sqrt(variance);
-                }
+                const int smoothWindow = 5;
+                float[] rdSmoothed = new float[nfrm];
+                for (int i = 0; i < nfrm; i++) rdSmoothed[i] = float.NaN;
                 
-                // Rd値の妥当性チェック（0.3～2.7の範囲外なら警告）
-                if (meanRd < 0.3f || meanRd > 2.7f)
-                {
-                    Console.WriteLine($"  [GlottalEstimate] WARNING: Rd={meanRd:F3} is out of normal range [0.3, 2.7]");
-                    meanRd = Math.Clamp(meanRd, 0.3f, 2.7f);
-                }
-                
-                Console.WriteLine($"  [GlottalEstimate] Analyzed {estimatedRdList.Count}/{nfrm} frames");
-                Console.WriteLine($"  [GlottalEstimate] Rd parameter: mean={meanRd:F3}, std={stdRd:F3}");
-                Console.WriteLine($"  [GlottalEstimate] Range: [{estimatedRdList.Min():F3}, {estimatedRdList.Max():F3}]");
-
-                // 平均Rd値を有声フレームのみに適用
                 for (int i = 0; i < nfrm; i++)
                 {
-                    var framePtr = Llsm.GetFrame(chunk, i);
-                    float f0 = Llsm.GetFrameF0(framePtr);
+                    if (float.IsNaN(rdPerFrame[i])) continue;
                     
-                    // 有声フレームのみに適用
-                    if (f0 >= 50 && f0 <= 800)
+                    float sum = 0;
+                    int count = 0;
+                    for (int j = Math.Max(0, i - smoothWindow / 2); j <= Math.Min(nfrm - 1, i + smoothWindow / 2); j++)
                     {
-                        Llsm.SetFrameRd(framePtr, meanRd);
+                        if (!float.IsNaN(rdPerFrame[j]))
+                        {
+                            sum += rdPerFrame[j];
+                            count++;
+                        }
                     }
+                    rdSmoothed[i] = Math.Clamp(sum / count, 0.3f, 2.7f);
+                }
+                
+                var validRd = rdSmoothed.Where(x => !float.IsNaN(x)).ToList();
+                float meanRd = validRd.Average();
+                float stdRd = validRd.Count > 1
+                    ? MathF.Sqrt(validRd.Select(x => (x - meanRd) * (x - meanRd)).Average())
+                    : 0;
+                
+                Console.WriteLine($"  [GlottalEstimate] Analyzed {voicedCount}/{nfrm} frames (per-frame + smoothed)");
+                Console.WriteLine($"  [GlottalEstimate] Rd parameter: mean={meanRd:F3}, std={stdRd:F3}");
+                Console.WriteLine($"  [GlottalEstimate] Range: [{validRd.Min():F3}, {validRd.Max():F3}]");
+
+                // 平滑化されたRd値をフレームごとに適用
+                for (int i = 0; i < nfrm; i++)
+                {
+                    if (float.IsNaN(rdSmoothed[i])) continue;
+                    var framePtr = Llsm.GetFrame(chunk, i);
+                    Llsm.SetFrameRd(framePtr, rdSmoothed[i]);
                 }
             }
             else
@@ -1770,9 +1875,8 @@ class Program
             Llsm.ChunkToLayer0(dstChunk);
             
             // ★品質改善：Chunk-level RPSを必須化（Rフラグ不要、位相連続性確保）
-            // layer1_based=1: Layer1パラメータ基準で位相同期（test-layer1-anasynth.c準拠）
-            Console.WriteLine($"[Synthesis] Chunk-level RPS (Layer1-based, mandatory for quality)...");
-            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
+            Console.WriteLine($"[Synthesis] Chunk-level RPS (Layer0, mandatory for quality)...");
+            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
             
             // 順方向位相伝播（Layer0）
             Console.WriteLine($"[Synthesis] Phase propagate (Layer0)...");
@@ -2199,8 +2303,8 @@ class Program
             
             if (useChunkRPS)
             {
-                Console.WriteLine($"[Elastic Synthesis] Chunk-level RPS (R flag enabled, Layer1-based)...");
-                NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
+                Console.WriteLine($"[Elastic Synthesis] Chunk-level RPS (R flag enabled, Layer0)...");
+                NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
             }
             
             Console.WriteLine($"[Elastic Synthesis] Phase propagate (Layer0)...");
