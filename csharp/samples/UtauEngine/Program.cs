@@ -417,6 +417,15 @@ class Program
             Console.WriteLine($"  [HNR] D{hnrEnhancement} - noise reduction strength {hnrEnhancement}%");
         }
         
+        // Xフラグ: 振幅補正を固定比率(targetF0/srcF0)に切替
+        // 省略 = フレームごとの実F0比率（デフォルト、ピッチベンド追従が正確）
+        // X = 固定比率（一部の音源で安定する場合がある）
+        bool useFixedAmplitudeRatio = flags.Contains('X', StringComparison.OrdinalIgnoreCase);
+        if (useFixedAmplitudeRatio)
+        {
+            Console.WriteLine($"  [AmplComp] X - fixed ratio mode (targetF0/srcF0)");
+        }
+        
         // 分析オプション最適化（高品質設定）
         int maxnhar, maxnhar_e;
         
@@ -437,7 +446,9 @@ class Program
                                     srcF0 < 200f ? 0.08f :   // 中低音: 8%
                                     srcF0 < 350f ? 0.05f :   // 中音: 5%
                                                    0.03f;    // 高音: 3%
-            maxnhar_e = Math.Clamp((int)(maxnhar * maxnhar_e_ratio), 8, 20);
+            // ★高音ザラつき対策: maxnhar_eの下限を12に引き上げ
+            // 高F0(500Hz)×8倍音=4kHzでは高域ノイズ包絡が粗い。12倍音=6kHzでカバー
+            maxnhar_e = Math.Clamp((int)(maxnhar * maxnhar_e_ratio), 12, 24);
             
             Console.WriteLine($"  [High-Res] Dynamic harmonics: maxnhar={maxnhar}, maxnhar_e={maxnhar_e} (F0={srcF0:F1}Hz)");
         }
@@ -445,7 +456,7 @@ class Program
         {
             // 標準モード: 固定値（子音品質向上のため8に引き上げ）
             maxnhar = 800;       // 最大倍音数（8kHzまでカバー、F0=100Hz時）
-            maxnhar_e = 8;       // エンベロープ最大倍音数（旧5→8、子音明瞭度向上）
+            maxnhar_e = 12;      // ★高音ザラつき対策: 8→12に引き上げ（高域ノイズ包絡精度向上）
         }
         
         unsafe
@@ -741,7 +752,7 @@ class Program
             {
                 // 標準: 均一な補間ベースのストレッチ
                 output = SynthesizeWithConsonantAndStretch(chunk, fs, srcF0, targetF0, 
-                                                            consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength, glottalClosure, useGlottalAutoEstimate);
+                                                            consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength, glottalClosure, useGlottalAutoEstimate, useFixedAmplitudeRatio);
             }
         }
         
@@ -1291,7 +1302,7 @@ class Program
                     Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
                     for (int j = 0; j < nspec; j++)
                     {
-                        vtmagn[j] = Math.Max(vtmagn[j] + amplitudeCompensation, -80.0f);
+                        vtmagn[j] = Math.Max(vtmagn[j] + amplitudeCompensation, -120.0f);
                     }
                     Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
                 }
@@ -1520,7 +1531,7 @@ class Program
     /// 子音部velocity + 伸縮部ストレッチして合成
     /// </summary>
     static float[] SynthesizeWithConsonantAndStretch(ChunkHandle srcChunk, int fs, float srcF0, float targetF0,
-                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0, int glottalClosure = 50, bool useGlottalAutoEstimate = false)
+                                                      int consonantFrames, float consonantStretch, float stretchRatio, List<int> pitchBend, int tempo = 120, int breathiness = 50, int genderFactor = 0, int formantFollow = 100, float actualThop = 0.005f, bool useOversampling = false, bool useChunkRPS = false, int modulation = 100, bool useModPlus = false, float overlapMs = 0, int unvoicedAttenuation = 0, int spectralTilt = 0, bool pitchShiftNoise = false, int growlStrength = 0, int glottalClosure = 50, bool useGlottalAutoEstimate = false, bool useFixedAmplitudeRatio = false)
     {
         float basePitchRatio = targetF0 / srcF0;
         
@@ -1757,13 +1768,21 @@ class Program
                     newF0 *= (float)Math.Pow(2, interpolatedPb[i] / 1200.0);
                 }
                 
-                // ★品質改善：フレームごとの実F0比率で振幅補正（平均比率ではなく）
-                // ビブラート・ピッチベンド時に各フレームの実際のシフト量を正確に補償
-                // ★ロバスト化: V/UV遷移直後など不安定なF0にはsrcF0にフォールバック
-                float safeOriginalF0 = (originalF0 >= 50.0f && originalF0 <= 1200.0f)
-                    ? originalF0 : srcF0;
-                float actualFrameRatio = Math.Clamp(newF0 / safeOriginalF0, 0.1f, 10.0f);
-                float amplitudeCompensation = -20.0f * MathF.Log10(actualFrameRatio);
+                // ★振幅補正（Xフラグで切替可能）
+                float amplitudeCompensation;
+                if (useFixedAmplitudeRatio)
+                {
+                    // Xフラグ: 固定比率モード — 全フレーム同一の補正量で安定
+                    amplitudeCompensation = -20.0f * MathF.Log10(pitchShiftRatio);
+                }
+                else
+                {
+                    // デフォルト: フレーム実比率モード — ピッチベンド追従が正確
+                    float safeOriginalF0 = (originalF0 >= 50.0f && originalF0 <= 1200.0f)
+                        ? originalF0 : srcF0;
+                    float actualFrameRatio = Math.Clamp(newF0 / safeOriginalF0, 0.1f, 10.0f);
+                    amplitudeCompensation = -20.0f * MathF.Log10(actualFrameRatio);
+                }
                 var vtmagnPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_VTMAGN);
                 if (vtmagnPtr != IntPtr.Zero)
                 {
@@ -1772,7 +1791,7 @@ class Program
                     Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
                     for (int j = 0; j < nspec; j++)
                     {
-                        vtmagn[j] = Math.Max(vtmagn[j] + amplitudeCompensation, -80.0f);
+                        vtmagn[j] = Math.Max(vtmagn[j] + amplitudeCompensation, -120.0f);
                     }
                     Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
                 }
@@ -1887,7 +1906,7 @@ class Program
                 
                 // VTMAGNフロアクランプ（極端な負値を防止）
                 for (int j = 0; j < nspec; j++)
-                    vtmagn[j] = Math.Max(vtmagn[j], -80.0f);
+                    vtmagn[j] = Math.Max(vtmagn[j], -120.0f);
                 Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
             }
         }
@@ -2285,7 +2304,7 @@ class Program
                         Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
                         for (int j = 0; j < nspec; j++)
                         {
-                            vtmagn[j] = Math.Max(vtmagn[j] + amplitudeCompensation, -80.0f);
+                            vtmagn[j] = Math.Max(vtmagn[j] + amplitudeCompensation, -120.0f);
                         }
                         Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
                     }
@@ -2361,7 +2380,7 @@ class Program
                 
                 // VTMAGNフロアクランプ
                 for (int j = 0; j < nspec; j++)
-                    vtmagn[j] = Math.Max(vtmagn[j], -80.0f);
+                    vtmagn[j] = Math.Max(vtmagn[j], -120.0f);
                 Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
             }
         }
@@ -2766,14 +2785,14 @@ class Program
                     {
                         // 範囲外の高周波成分: 利用可能な最長データから取得
                         // vtmagn1とvtmagn2を優先（補間の中心点）、無ければvtmagn2/3を使用
-                        float val = -80.0f;
+                        float val = -120.0f;
                         if (i < nspec1) val = vtmagn1[i];
                         else if (i < nspec2) val = vtmagn2[i];
                         else if (i < nspec3) val = vtmagn3[i];
                         else if (i < nspec0) val = vtmagn0[i];
                         vtmagn_interp[i] = val;
                     }
-                    vtmagn_interp[i] = Math.Max(-80.0f, vtmagn_interp[i]);
+                    vtmagn_interp[i] = Math.Max(-120.0f, vtmagn_interp[i]);
                 }
             }
         }
@@ -3263,7 +3282,7 @@ class Program
         {
             // 両方有声: 補間済み配列を使用
             for (int i = 0; i < vtmagn_interp.Length; i++)
-                vtmagn_interp[i] = Math.Max(-80.0f, vtmagn_interp[i]);
+                vtmagn_interp[i] = Math.Max(-120.0f, vtmagn_interp[i]);
             var vtmagnPtr = NativeLLSM.llsm_create_fparray(vtmagn_interp.Length);
             Marshal.Copy(vtmagn_interp, 0, vtmagnPtr, vtmagn_interp.Length);
             NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_VTMAGN,
@@ -3280,11 +3299,11 @@ class Program
                 float[] vtmagn = new float[nspec];
                 Marshal.Copy(vtmagnSrcPtr, vtmagn, 0, nspec);
                 for (int i = 0; i < nspec; i++)
-                    vtmagn[i] = Math.Max(-80.0f, vtmagn[i] + vtmagnFadeDb);
+                    vtmagn[i] = Math.Max(-120.0f, vtmagn[i] + vtmagnFadeDb);
                 Marshal.Copy(vtmagn, 0, vtmagnSrcPtr, nspec);
             }
         }
-        // 両方無声の場合: ベースフレームのVTMAGNをそのまま使用（-80dBクランプのみ）
+        // 両方無声の場合: ベースフレームのVTMAGNをそのまま使用（-120dBクランプのみ）
         else if (!voiced0 && !voiced1)
         {
             var vtmagnSrcPtr = NativeLLSM.llsm_container_get(frameInterpPtr, NativeLLSM.LLSM_FRAME_VTMAGN);
@@ -3294,7 +3313,7 @@ class Program
                 float[] vtmagn = new float[nspec];
                 Marshal.Copy(vtmagnSrcPtr, vtmagn, 0, nspec);
                 for (int i = 0; i < nspec; i++)
-                    vtmagn[i] = Math.Max(-80.0f, vtmagn[i]);
+                    vtmagn[i] = Math.Max(-120.0f, vtmagn[i]);
                 Marshal.Copy(vtmagn, 0, vtmagnSrcPtr, nspec);
             }
         }
@@ -3733,7 +3752,7 @@ class Program
                 for (int i = 0; i < vtmagnSize; i++)
                 {
                     magnitudes[i] -= voiceAttenuation;
-                    magnitudes[i] = Math.Max(-80f, magnitudes[i]);  // 下限-80dB
+                    magnitudes[i] = Math.Max(-120f, magnitudes[i]);  // 下限-120dB
                 }
                 
                 Marshal.Copy(magnitudes, 0, vtmagnPtr, vtmagnSize);
@@ -3877,7 +3896,7 @@ class Program
             
             // VTMAGNフロアクランプ
             for (int j = 0; j < nspec; j++)
-                vtmagn[j] = Math.Max(vtmagn[j], -80.0f);
+                vtmagn[j] = Math.Max(vtmagn[j], -120.0f);
             Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
         }
     }
@@ -4554,7 +4573,7 @@ class Program
             // 子音部固定で 2.0x ストレッチ（比較用）
             using var chunkFixed = Llsm.CopyChunk(masterChunk);
             var fixedStretch = SynthesizeWithConsonantAndStretch(chunkFixed, wavFs, avgF0, avgF0, 
-                                                                  consonantFrames, 1.0f, 2.0f, new List<int>(), 120, 50, 0, 100, 0.005f, false, false, 100, false, 0, 0, 0, false, 0);
+                                                                  consonantFrames, 1.0f, 2.0f, new List<int>(), 120, 50, 0, 100, 0.005f, false, false, 100, false, 0, 0, 0, false, 0, 50, false, false);
             Wav.WriteMono16("utau_stretch_consonant_fixed.wav", fixedStretch, wavFs);
             Console.WriteLine($"  Fixed consonant stretch: {fixedStretch.Length} samples");
             
@@ -5143,7 +5162,7 @@ class Program
                     Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
                     for (int j = 0; j < nspec; j++)
                     {
-                        vtmagn[j] = Math.Max(vtmagn[j] + amplitudeCompensation, -80.0f);
+                        vtmagn[j] = Math.Max(vtmagn[j] + amplitudeCompensation, -120.0f);
                     }
                     Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
                 }
@@ -5302,7 +5321,7 @@ class Program
                     Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
                     for (int j = 0; j < nspec; j++)
                     {
-                        vtmagn[j] = Math.Max(vtmagn[j] + amplComp, -80.0f);
+                        vtmagn[j] = Math.Max(vtmagn[j] + amplComp, -120.0f);
                     }
                     Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
                 }
