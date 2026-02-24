@@ -157,6 +157,27 @@ namespace LlsmBindings
             return y;
         }
 
+        /// <summary>
+        /// 合成出力から分解された波形（正弦波成分・ノイズ成分）を取得します。
+        /// llsm_synthesize は内部で y = y_sin + y_noise を計算しており、
+        /// 個別の成分を取り出すことで子音ブレンド等の精密な制御が可能になります。
+        /// </summary>
+        /// <returns>(combined, sinusoidal, noise) の3つの波形配列</returns>
+        public static (float[] y, float[] ySin, float[] yNoise) ReadOutputDecomposed(OutputHandle output)
+        {
+            var o = Marshal.PtrToStructure<NativeLLSM.llsm_output>(output.DangerousGetHandle());
+            var y = new float[o.ny];
+            var ySin = new float[o.ny];
+            var yNoise = new float[o.ny];
+            if (o.y != IntPtr.Zero)
+                Marshal.Copy(o.y, y, 0, o.ny);
+            if (o.y_sin != IntPtr.Zero)
+                Marshal.Copy(o.y_sin, ySin, 0, o.ny);
+            if (o.y_noise != IntPtr.Zero)
+                Marshal.Copy(o.y_noise, yNoise, 0, o.ny);
+            return (y, ySin, yNoise);
+        }
+
         // chunk helpers
         /// <summary>
         /// チャンクが保持する設定コンテナ (conf) を取得します（借用参照）。

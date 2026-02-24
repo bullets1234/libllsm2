@@ -17,8 +17,7 @@ class Program
 {
     const float Thop = 0.005f;     // 5ms (LLSM デフォルト、安定した設定)
     
-    // 補間方式切り替え: true=Monotonic Cubic（子音速度変更で高品質）, false=Catmull-Rom（従来）
-    const bool USE_MONOTONIC_CUBIC = true;
+    // (旧 USE_MONOTONIC_CUBIC フラグは秋間補間に統一したため廃止)
     
     /// <summary>
     /// ピッチマーク: F0情報から抽出されたピッチ周期の境界点
@@ -60,6 +59,12 @@ class Program
     
     // グロウルコールバック用のGC保護(デリゲートがガベージコレクトされないように)
     static NativeLLSM.llsm_fgfm _growlCallback = null;
+    
+    // Cフラグ: 分解出力（正弦波/ノイズ分離）のための共有バッファ
+    // 合成メソッド内でセットされ、Resample()のCフラグブレンドで参照される
+    static bool _needDecomposedOutput = false;
+    static float[]? _lastSynthSin = null;
+    static float[]? _lastSynthNoise = null;
     
     static void Main(string[] args)
     {
@@ -391,6 +396,17 @@ class Program
             Console.WriteLine($"  [GlottalEstimate] Auto-estimate Rd parameter from source (L flag)");
         }
         
+        // Cフラグ: 子音原音ブレンド（LLSM再合成で劣化する子音を原音PCMで置換）
+        // C0=オフ、C50=50%ブレンド（デフォルト）、C100=子音完全置換
+        int consonantBlendStrength = 0;  // デフォルトオフ
+        var cBlendMatch = System.Text.RegularExpressions.Regex.Match(flags, @"C(\d+)");
+        if (cBlendMatch.Success)
+        {
+            consonantBlendStrength = int.Parse(cBlendMatch.Groups[1].Value);
+            consonantBlendStrength = Math.Clamp(consonantBlendStrength, 1, 100);
+            Console.WriteLine($"  [ConsonantBlend] C{consonantBlendStrength} - original PCM blend {consonantBlendStrength}%");
+        }
+        
         // Dフラグ: HNR（倍音対雑音比）改善（デフォルト0 = off）
         int hnrEnhancement = 0;
         var dMatch = System.Text.RegularExpressions.Regex.Match(flags, @"D(\d+)");
@@ -615,7 +631,9 @@ class Program
         // velocity = 100: 標準速度（1.0x）
         // velocity < 100: 子音が長くなる（例：50 = 2.0x）
         // velocity > 100: 子音が短くなる（例：200 = 0.5x）
-        float consonantStretch = velocity > 0 ? 100.0f / velocity : 1.0f;
+        // UTAU仕様: 実効子音長 = fixed_ms × 2^((100 - velocity) / 100)
+        // velocity=100: 標準(1.0x), velocity=200: 約半分(0.5x), velocity=0: 約2倍(2.0x)
+        float consonantStretch = MathF.Pow(2.0f, (100.0f - velocity) / 100.0f);
         Console.WriteLine($"  [Velocity] velocity={velocity}, consonantStretch={consonantStretch:F3}x");
         
         // 子音部と伸縮部のフレーム数
@@ -693,6 +711,11 @@ class Program
         }
         
         // 合成（子音部velocity + 伸縮部）
+        // Cフラグ有効時: 分解出力（正弦波/ノイズ分離）を要求
+        _needDecomposedOutput = (consonantBlendStrength > 0);
+        _lastSynthSin = null;
+        _lastSynthNoise = null;
+        
         float[] output;
         if (Math.Abs(stretchRatio - 1.0f) < 0.01f && Math.Abs(consonantStretch - 1.0f) < 0.01f && pitchBend.Count == 0)
         {
@@ -721,6 +744,165 @@ class Program
                                                             consonantFrames, consonantStretch, stretchRatio, pitchBend, tempo, breathiness, genderFactor, formantFollow, actualThop, useOversampling, useChunkRPS, modulation, useModPlus, overlapMs, unvoicedAttenuation, spectralTilt, pitchShiftNoise, growlStrength, glottalClosure, useGlottalAutoEstimate);
             }
         }
+        
+        // ★Cフラグ: 子音原音ブレンド（LLSM再合成で劣化する子音を原音PCMで置換）
+        // LLSMの調和+ノイズモデルは母音には最適だが、子音（破裂音・摩擦音・トランジェント）は
+        // 分析→合成の過程で情報が失われやすい。原音PCMを子音部分に使うことで鮮明さを復元する。
+        if (consonantBlendStrength > 0 && consonantSamples > 0 && output.Length > 0)
+        {
+            // velocity適用後の子音長（サンプル数）
+            // 合成メソッドと一致させるため、consonantFrames ベースで計算
+            int nhopLocal = (int)(actualThop * fs);
+            int dstConsonantFrames_blend = (int)(consonantFrames * consonantStretch);
+            int dstConsonantSamples = dstConsonantFrames_blend * nhopLocal;
+            
+            if (dstConsonantSamples > 0 && dstConsonantSamples < output.Length)
+            {
+                float blendRatio = consonantBlendStrength / 100.0f;
+                
+                // 原音子音PCMを取得（元のconsonantSamplesベース）
+                int srcConsonantLen = Math.Min(consonantSamples, segment.Length);
+                float[] originalConsonant = new float[srcConsonantLen];
+                Array.Copy(segment, 0, originalConsonant, 0, srcConsonantLen);
+                
+                // velocity適用（子音の時間伸縮）: 線形補間リサンプル
+                float[] adjustedConsonant;
+                if (Math.Abs(consonantStretch - 1.0f) > 0.01f)
+                {
+                    adjustedConsonant = new float[dstConsonantSamples];
+                    for (int i = 0; i < dstConsonantSamples; i++)
+                    {
+                        float srcPos = (float)i / dstConsonantSamples * srcConsonantLen;
+                        int idx = (int)srcPos;
+                        float frac = srcPos - idx;
+                        if (idx + 1 < srcConsonantLen)
+                            adjustedConsonant[i] = originalConsonant[idx] * (1 - frac) + originalConsonant[idx + 1] * frac;
+                        else if (idx < srcConsonantLen)
+                            adjustedConsonant[i] = originalConsonant[idx];
+                    }
+                }
+                else
+                {
+                    adjustedConsonant = originalConsonant;
+                    dstConsonantSamples = srcConsonantLen;
+                }
+                
+                int blendEnd = Math.Min(dstConsonantSamples, output.Length);
+                
+                // クロスフェード長: 子音→母音境界で滑らかに遷移
+                // velocity に比例させる（速い子音には短いクロスフェード）
+                float crossfadeMs = Math.Max(5.0f, 15.0f * consonantStretch);
+                int crossfadeSamples = (int)(crossfadeMs / 1000.0f * fs);
+                crossfadeSamples = Math.Min(crossfadeSamples, blendEnd / 2);  // ブレンド領域の半分以下
+                int crossfadeStart = Math.Max(0, blendEnd - crossfadeSamples);
+                
+                // 分解出力が利用可能かチェック
+                bool hasDecomposed = (_lastSynthSin != null && _lastSynthNoise != null &&
+                                      _lastSynthSin.Length >= blendEnd && _lastSynthNoise.Length >= blendEnd);
+                
+                if (hasDecomposed)
+                {
+                    // ★分解出力モード: ノイズ成分のみ原音で置換
+                    // LLSMの正弦波成分（ピッチシフト済み）はそのまま残し、
+                    // ノイズ成分（摩擦音・息・破裂音など）だけを原音に差し替える
+                    // → ピッチ混入なしで子音のノイズ質感を改善
+                    // → 有声子音（な行等）でもノイズ部分だけを置換できる
+                    
+                    // RMSボリュームマッチング（ノイズ成分 vs 原音で計算）
+                    float origRms = 0, noiseRms = 0;
+                    for (int i = 0; i < blendEnd; i++)
+                    {
+                        float origSample = (i < adjustedConsonant.Length) ? adjustedConsonant[i] : 0;
+                        origRms += origSample * origSample;
+                        noiseRms += _lastSynthNoise[i] * _lastSynthNoise[i];
+                    }
+                    origRms = MathF.Sqrt(origRms / blendEnd);
+                    noiseRms = MathF.Sqrt(noiseRms / blendEnd);
+                    // ノイズ成分のRMSに合わせて原音をスケール
+                    float volumeMatch = (origRms > 0.001f) ? noiseRms / origRms : 1.0f;
+                    volumeMatch = Math.Clamp(volumeMatch, 0.1f, 5.0f);
+                    
+                    for (int i = 0; i < blendEnd; i++)
+                    {
+                        if (i >= adjustedConsonant.Length) break;
+                        
+                        // ブレンド強度計算（velocity追従: 出力サンプル→原音フレーム位置に変換）
+                        float srcSamplePos = (dstConsonantSamples > 0) 
+                            ? (float)i / dstConsonantSamples * srcConsonantLen 
+                            : i;
+                        int frameIdx = (int)(srcSamplePos / nhopLocal);
+                        frameIdx = Math.Max(0, Math.Min(frameIdx, f0.Length - 1));
+                        bool isUnvoiced = (frameIdx >= 0 && frameIdx < f0.Length && f0[frameIdx] <= 0);
+                        
+                        // 有声フレーム: output をそのまま維持（分解・再合成による浮動小数点誤差を回避）
+                        if (!isUnvoiced) continue;
+                        
+                        float localBlend = blendRatio;
+                        
+                        if (i >= crossfadeStart)
+                        {
+                            float t = (float)(i - crossfadeStart) / crossfadeSamples;
+                            float fade = 0.5f * (1.0f - MathF.Cos(MathF.PI * t));
+                            localBlend *= (1.0f - fade);
+                        }
+                        
+                        float origNoise = adjustedConsonant[i] * volumeMatch;
+                        
+                        // ノイズ成分のみ差し替え: output = y_sin + lerp(y_noise, originalNoise, blend)
+                        float blendedNoise = _lastSynthNoise[i] * (1.0f - localBlend) + origNoise * localBlend;
+                        output[i] = _lastSynthSin[i] + blendedNoise;
+                    }
+                    
+                    Console.WriteLine($"  [ConsonantBlend] Decomposed mode C{consonantBlendStrength}: noise-only replacement, {dstConsonantSamples} samples ({dstConsonantSamples / (float)fs * 1000:F1}ms), volMatch={volumeMatch:F2}");
+                }
+                else
+                {
+                    // フォールバック: 分解出力が利用不可の場合、従来のPCMブレンド
+                    float origRms = 0, llsmRms = 0;
+                    for (int i = 0; i < blendEnd; i++)
+                    {
+                        float origSample = (i < adjustedConsonant.Length) ? adjustedConsonant[i] : 0;
+                        origRms += origSample * origSample;
+                        llsmRms += output[i] * output[i];
+                    }
+                    origRms = MathF.Sqrt(origRms / blendEnd);
+                    llsmRms = MathF.Sqrt(llsmRms / blendEnd);
+                    float volumeMatch = (origRms > 0.001f) ? llsmRms / origRms : 1.0f;
+                    volumeMatch = Math.Clamp(volumeMatch, 0.3f, 3.0f);
+                    
+                    for (int i = 0; i < blendEnd; i++)
+                    {
+                        if (i >= adjustedConsonant.Length) break;
+                        
+                        float origSample = adjustedConsonant[i] * volumeMatch;
+                        float srcSamplePos = (dstConsonantSamples > 0) 
+                            ? (float)i / dstConsonantSamples * srcConsonantLen 
+                            : i;
+                        int frameIdx = (int)(srcSamplePos / nhopLocal);
+                        frameIdx = Math.Max(0, Math.Min(frameIdx, f0.Length - 1));
+                        bool isUnvoiced = (frameIdx >= 0 && frameIdx < f0.Length && f0[frameIdx] <= 0);
+                        
+                        float localBlend = isUnvoiced ? blendRatio : 0.0f;
+                        
+                        if (i >= crossfadeStart)
+                        {
+                            float t = (float)(i - crossfadeStart) / crossfadeSamples;
+                            float fade = 0.5f * (1.0f - MathF.Cos(MathF.PI * t));
+                            localBlend *= (1.0f - fade);
+                        }
+                        
+                        output[i] = output[i] * (1.0f - localBlend) + origSample * localBlend;
+                    }
+                    
+                    Console.WriteLine($"  [ConsonantBlend] Fallback mode C{consonantBlendStrength}: {dstConsonantSamples} samples ({dstConsonantSamples / (float)fs * 1000:F1}ms), volMatch={volumeMatch:F2}");
+                }
+            }
+        }
+        
+        // 分解出力バッファのクリーンアップ
+        _needDecomposedOutput = false;
+        _lastSynthSin = null;
+        _lastSynthNoise = null;
         
         // ボリューム適用
         if (volume != 100)
@@ -872,6 +1054,8 @@ class Program
         }
         
         // Layer1に変換（tolayer1を先に実行してからphasepropagate(-1)を呼ぶ：demo-stretch.c準拠）
+        // NFFT=8192: スペクトル包絡の周波数解像度を最大化（nspec=4097）
+        // 高解像度包絡により、tolayer0での倍音再構成が正確になる
         Llsm.ChunkToLayer1(srcChunk, 8192);
         
         // 逆位相伝播（編集前に位相依存性を除去）
@@ -953,6 +1137,10 @@ class Program
         Console.WriteLine($"[PitchMark] Converting to Layer0 for synthesis...");
         Llsm.ChunkToLayer0(dstChunk);
         
+        // Chunk-level RPS（位相連続性の確保、ザラつき防止）
+        Console.WriteLine($"[PitchMark] Chunk-level RPS (Layer0, mandatory for quality)...");
+        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+        
         // 順方向位相伝播
         Console.WriteLine($"[PitchMark] Applying forward phase propagation...");
         Llsm.ChunkPhasePropagate(dstChunk, 1);
@@ -962,7 +1150,18 @@ class Program
         var sopts = Llsm.CreateSynthesisOptions(fs);
         var outputHandle = Llsm.Synthesize(sopts, dstChunk);
         Console.WriteLine($"[PitchMark] Synthesis completed");
-        var output = Llsm.ReadOutput(outputHandle);
+        float[] output;
+        if (_needDecomposedOutput)
+        {
+            var (y, ySin, yNoise) = Llsm.ReadOutputDecomposed(outputHandle);
+            output = y;
+            _lastSynthSin = ySin;
+            _lastSynthNoise = yNoise;
+        }
+        else
+        {
+            output = Llsm.ReadOutput(outputHandle);
+        }
         
         // クリーンアップ
         outputHandle.Dispose();
@@ -1040,7 +1239,7 @@ class Program
             
             var srcFrame = Llsm.GetFrame(srcChunk, srcIdx);
             var frameCopy = Llsm.CopyFrame(srcFrame);
-            NativeLLSM.llsm_frame_phasesync_rps(frameCopy, 1);
+            // Per-frame RPS削除: chunk-level RPSで一括処理（二重適用防止）
             
             // フレーム参照を作成
             var frameRef = new ContainerRef(frameCopy);
@@ -1286,8 +1485,7 @@ class Program
             EstimateAndApplyGlottalParameters(srcChunk, srcNfrm, fs);
         }
         
-        // Layer1 に変換（NFFT=8192で高域まで正確に表現）
-        // 重要: tolayer1を先に実行してからphasepropagate(-1)を呼ぶ（demo-stretch.c準拠）
+        // Layer1 に変換（NFFT=8192: スペクトル包絡解像度最大化）
         Llsm.ChunkToLayer1(srcChunk, 8192);
         
         // 逆位相伝播（編集前に位相依存性を除去）
@@ -1915,7 +2113,17 @@ class Program
             Console.WriteLine($"[Synthesis] llsm_synthesize succeeded");
             Console.ResetColor();
             
-            oversampledOutput = Llsm.ReadOutput(output);
+            if (_needDecomposedOutput)
+            {
+                var (y, ySin, yNoise) = Llsm.ReadOutputDecomposed(output);
+                oversampledOutput = y;
+                _lastSynthSin = Downsample(ySin, oversampleRate);
+                _lastSynthNoise = Downsample(yNoise, oversampleRate);
+            }
+            else
+            {
+                oversampledOutput = Llsm.ReadOutput(output);
+            }
             
             // ダウンサンプリング
             Console.WriteLine($"[Synthesis] Downsampling from {synthesisFs}Hz to {fs}Hz...");
@@ -1943,6 +2151,13 @@ class Program
             Console.WriteLine($"[Synthesis] llsm_synthesize succeeded");
             Console.ResetColor();
             
+            if (_needDecomposedOutput)
+            {
+                var (y, ySin, yNoise) = Llsm.ReadOutputDecomposed(output);
+                _lastSynthSin = ySin;
+                _lastSynthNoise = yNoise;
+                return y;
+            }
             return Llsm.ReadOutput(output);
         }
     }
@@ -1967,8 +2182,7 @@ class Program
             EstimateAndApplyGlottalParameters(srcChunk, srcNfrm, fs);
         }
         
-        // Layer1 に変換（NFFT=8192で高域まで正確に表現）
-        // 重要: tolayer1を先に実行してからphasepropagate(-1)を呼ぶ（demo-stretch.c準拠）
+        // Layer1 に変換（NFFT=8192: スペクトル包絡解像度最大化）
         Llsm.ChunkToLayer1(srcChunk, 8192);
         
         // 逆位相伝播（編集前に位相依存性を除去）
@@ -2114,9 +2328,6 @@ class Program
             }
             
             var newFrameRef = new ContainerRef(newFramePtr);
-            
-            // Frame-level RPS適用
-            NativeLLSM.llsm_frame_phasesync_rps(newFramePtr, 1);
             
             // ピッチシフトとF0設定
             float newF0 = 0;
@@ -2301,11 +2512,9 @@ class Program
             Console.WriteLine($"[Elastic Synthesis] Converting {dstNfrm} frames to Layer0...");
             Llsm.ChunkToLayer0(dstChunk);
             
-            if (useChunkRPS)
-            {
-                Console.WriteLine($"[Elastic Synthesis] Chunk-level RPS (R flag enabled, Layer0)...");
-                NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
-            }
+            // Chunk-level RPS（位相連続性の確保、必須）
+            Console.WriteLine($"[Elastic Synthesis] Chunk-level RPS (Layer0, mandatory for quality)...");
+            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
             
             Console.WriteLine($"[Elastic Synthesis] Phase propagate (Layer0)...");
             Llsm.ChunkPhasePropagate(dstChunk, +1);
@@ -2339,6 +2548,12 @@ class Program
             Console.ResetColor();
             
             var oversampledOutput = Llsm.ReadOutput(output);
+            if (_needDecomposedOutput)
+            {
+                var (_, ySin, yNoise) = Llsm.ReadOutputDecomposed(output);
+                _lastSynthSin = Downsample(ySin, oversampleRate);
+                _lastSynthNoise = Downsample(yNoise, oversampleRate);
+            }
             Console.WriteLine($"[Elastic Synthesis] Downsampling from {synthesisFs}Hz to {fs}Hz...");
             return Downsample(oversampledOutput, oversampleRate);
         }
@@ -2362,6 +2577,13 @@ class Program
             Console.WriteLine($"[Elastic Synthesis] llsm_synthesize succeeded");
             Console.ResetColor();
             
+            if (_needDecomposedOutput)
+            {
+                var (y, ySin, yNoise) = Llsm.ReadOutputDecomposed(output);
+                _lastSynthSin = ySin;
+                _lastSynthNoise = yNoise;
+                return y;
+            }
             return Llsm.ReadOutput(output);
         }
     }
@@ -2543,9 +2765,7 @@ class Program
         
         if (allVoiced)
         {
-            f0_interp = USE_MONOTONIC_CUBIC
-                ? MonotonicCubicInterp(f0_0, f0_1, f0_2, f0_3, ratio)
-                : CubicInterp(f0_0, f0_1, f0_2, f0_3, ratio);
+            f0_interp = AkimaInterp(f0_0, f0_1, f0_2, f0_3, ratio);
             f0_interp = Math.Max(50, Math.Min(800, f0_interp));
         }
         else if (bothVoiced)
@@ -2575,7 +2795,7 @@ class Program
         float rd1 = rd1Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd1Ptr) : 1.0f;
         float rd2 = rd2Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd2Ptr) : 1.0f;
         float rd3 = rd3Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd3Ptr) : 1.0f;
-        float rd_interp = CubicInterp(rd0, rd1, rd2, rd3, ratio);
+        float rd_interp = AkimaInterp(rd0, rd1, rd2, rd3, ratio);
         rd_interp = Math.Max(0.1f, Math.Min(2.7f, rd_interp));
         
         // VTMAGNを取得・補間
@@ -2612,9 +2832,7 @@ class Program
                     // 共通範囲は補間、範囲外は外挿または最長データを使用
                     if (i < minspec)
                     {
-                        vtmagn_interp[i] = USE_MONOTONIC_CUBIC
-                            ? MonotonicCubicInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio)
-                            : CubicInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio);
+                        vtmagn_interp[i] = AkimaInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio);
                         if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
                         {
                             vtmagn_interp[i] = vtmagn1[i] * (1 - ratio) + vtmagn2[i] * ratio;
@@ -2879,13 +3097,47 @@ class Program
                 Marshal.GetFunctionPointerForDelegate(_copyNm));
         }
         
-        // PSDRES（残差ノイズスペクトル）の線形補間
+        // PSDRES（残差ノイズスペクトル）のキュービック補間（4フレーム使用）
         {
+            var psdres0Ptr_c = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
             var psdres1Ptr_c = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
             var psdres2Ptr_c = NativeLLSM.llsm_container_get(frame2.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
+            var psdres3Ptr_c = NativeLLSM.llsm_container_get(frame3.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
             
-            if (psdres1Ptr_c != IntPtr.Zero && psdres2Ptr_c != IntPtr.Zero)
+            // 4フレーム全てが利用可能な場合はキュービック補間
+            if (psdres0Ptr_c != IntPtr.Zero && psdres1Ptr_c != IntPtr.Zero && 
+                psdres2Ptr_c != IntPtr.Zero && psdres3Ptr_c != IntPtr.Zero)
             {
+                int len0_c = NativeLLSM.llsm_fparray_length(psdres0Ptr_c);
+                int len1_c = NativeLLSM.llsm_fparray_length(psdres1Ptr_c);
+                int len2_c = NativeLLSM.llsm_fparray_length(psdres2Ptr_c);
+                int len3_c = NativeLLSM.llsm_fparray_length(psdres3Ptr_c);
+                int psdresLen_c = Math.Min(Math.Min(len0_c, len1_c), Math.Min(len2_c, len3_c));
+                
+                var newPsdres_c = NativeLLSM.llsm_create_fparray(psdresLen_c);
+                unsafe
+                {
+                    float* src0_c = (float*)psdres0Ptr_c;
+                    float* src1_c = (float*)psdres1Ptr_c;
+                    float* src2_c = (float*)psdres2Ptr_c;
+                    float* src3_c = (float*)psdres3Ptr_c;
+                    float* dst_c = (float*)newPsdres_c;
+                    for (int k = 0; k < psdresLen_c; k++)
+                    {
+                        float v = AkimaInterp(src0_c[k], src1_c[k], src2_c[k], src3_c[k], ratio);
+                        // NaN/Inf安全チェック
+                        if (float.IsNaN(v) || float.IsInfinity(v))
+                            v = src1_c[k] * (1.0f - ratio) + src2_c[k] * ratio;
+                        dst_c[k] = v;
+                    }
+                }
+                NativeLLSM.llsm_container_attach_(newFrame, NativeLLSM.LLSM_FRAME_PSDRES,
+                    newPsdres_c, Marshal.GetFunctionPointerForDelegate(_deleteFpArray),
+                    Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+            }
+            else if (psdres1Ptr_c != IntPtr.Zero && psdres2Ptr_c != IntPtr.Zero)
+            {
+                // フォールバック: 2点線形補間
                 int len1_c = NativeLLSM.llsm_fparray_length(psdres1Ptr_c);
                 int len2_c = NativeLLSM.llsm_fparray_length(psdres2Ptr_c);
                 int psdresLen_c = Math.Min(len1_c, len2_c);
@@ -2945,315 +3197,181 @@ class Program
     }
     
     /// <summary>
-    /// 2つのLayer1フレームを線形補間して新しいフレームを生成
-    /// RD、VTMAGN、VSPHSEなどのLayer1パラメータを正しく補間
+    /// 2つのLayer1フレームを線形補間して新しいフレームを生成（demo-stretch.c準拠）
+    /// V/UV遷移を含む全ケースでNMとPSDRESを常に補間し、ノイズ特性の急変を防ぐ
     /// </summary>
     static IntPtr InterpolateFrame(ContainerRef frame0, ContainerRef frame1, float ratio)
     {
-        // F0を補間
+        // F0を取得
         float f0_0 = Llsm.GetFrameF0(frame0);
         float f0_1 = Llsm.GetFrameF0(frame1);
         
-        // 無声音（F0=0 または極端に低い）の処理
-        const float minVoicedF0 = 50.0f;  // 50Hz未満は無声音扱い
+        const float minVoicedF0 = 50.0f;
         bool voiced0 = f0_0 >= minVoicedF0;
         bool voiced1 = f0_1 >= minVoicedF0;
+        bool bothVoiced = voiced0 && voiced1;
         
-        // 両方とも無声音の場合
-        if (!voiced0 && !voiced1)
-        {
-            return Llsm.CopyFrame(frame0);
-        }
-        
-        // 有声音と無声音をまたぐ場合は、有声音側をコピー（フェード付き）
-        if (!voiced0 && voiced1)
-        {
-            var frame = Llsm.CopyFrame(frame1);
-            // 無声音から有声音へのフェードイン（ratioが小さいと減衰）
-            ApplyVoicedFade(frame, ratio);
-            return frame;
-        }
-        if (voiced0 && !voiced1)
-        {
-            var frame = Llsm.CopyFrame(frame0);
-            // 有声音から無声音へのフェードアウト（ratioが大きいと減衰）
-            ApplyVoicedFade(frame, 1.0f - ratio);
-            return frame;
-        }
-        
-        // 両方とも有声音の場合: Layer1パラメータを補間
-        
-        // F0を補間（最小値50Hzを保証）
-        float f0_interp = f0_0 * (1 - ratio) + f0_1 * ratio;
-        f0_interp = Math.Max(minVoicedF0, f0_interp);
-        
-        // RDを取得・補間
-        var rd0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_RD);
-        var rd1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_RD);
-        
-        float rd0 = rd0Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd0Ptr) : 1.0f;
-        float rd1 = rd1Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd1Ptr) : 1.0f;
-        float rd_interp = rd0 * (1 - ratio) + rd1 * ratio;
-        
-        // VTMAGN（声道スペクトル）を取得・補間
-        var vtmagn0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
-        var vtmagn1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
-        
+        // === Phase 1: F0, Rd, VTMAGN, VSPHSE の処理（V/UV状態に応じて） ===
+        // demo-stretch.c準拠: 有声フレームを優先、V/UV遷移時はVTMAGNをdBフェード
+        float f0_interp;
+        float rd_interp;
         float[] vtmagn_interp = null;
-        if (vtmagn0Ptr != IntPtr.Zero && vtmagn1Ptr != IntPtr.Zero)
-        {
-            int nspec0 = NativeLLSM.llsm_fparray_length(vtmagn0Ptr);
-            int nspec1 = NativeLLSM.llsm_fparray_length(vtmagn1Ptr);
-            int minspec = Math.Min(nspec0, nspec1);
-            int maxspec = Math.Max(nspec0, nspec1);
-            
-            if (maxspec > 0)
-            {
-                float[] vtmagn0 = new float[nspec0];
-                float[] vtmagn1 = new float[nspec1];
-                Marshal.Copy(vtmagn0Ptr, vtmagn0, 0, nspec0);
-                Marshal.Copy(vtmagn1Ptr, vtmagn1, 0, nspec1);
-                
-                vtmagn_interp = new float[maxspec];
-                for (int i = 0; i < maxspec; i++)
-                {
-                    if (i < minspec)
-                    {
-                        vtmagn_interp[i] = vtmagn0[i] * (1 - ratio) + vtmagn1[i] * ratio;
-                        // NaN/Inf チェック
-                        if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
-                        {
-                            vtmagn_interp[i] = Math.Max(vtmagn0[i], vtmagn1[i]);
-                        }
-                    }
-                    else
-                    {
-                        // 範囲外の高周波成分: 利用可能なデータから取得
-                        vtmagn_interp[i] = (i < nspec1) ? vtmagn1[i] : vtmagn0[i];
-                    }
-                    // -80dB以下にはしない（demo-stretch.cと同じ）
-                    vtmagn_interp[i] = Math.Max(-80.0f, vtmagn_interp[i]);
-                }
-            }
-        }
-        
-        // VSPHSE（声帯位相）を取得・円形補間
-        var vsphse0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_VSPHSE);
-        var vsphse1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_VSPHSE);
-        
         float[] vsphse_interp = null;
-        if (vsphse0Ptr != IntPtr.Zero && vsphse1Ptr != IntPtr.Zero)
-        {
-            int nhar0 = NativeLLSM.llsm_fparray_length(vsphse0Ptr);
-            int nhar1 = NativeLLSM.llsm_fparray_length(vsphse1Ptr);
-            int minnhar = Math.Min(nhar0, nhar1);
-            int maxnhar = Math.Max(nhar0, nhar1);
-            
-            if (maxnhar > 0)
-            {
-                float[] vsphse0 = new float[nhar0];
-                float[] vsphse1 = new float[nhar1];
-                Marshal.Copy(vsphse0Ptr, vsphse0, 0, nhar0);
-                Marshal.Copy(vsphse1Ptr, vsphse1, 0, nhar1);
-                
-                vsphse_interp = new float[maxnhar];
-                // 円形補間を使用（demo-stretch.cと同じ、位相の滑らかな遷移を保証）
-                for (int i = 0; i < minnhar; i++)
-                {
-                    vsphse_interp[i] = CircularInterpolatePhase(vsphse0[i], vsphse1[i], ratio);
-                }
-                // 範囲外の高次倍音: 利用可能なデータから取得
-                for (int i = minnhar; i < maxnhar; i++)
-                {
-                    if (i < nhar0 && i < nhar1)
-                    {
-                        vsphse_interp[i] = CircularInterpolatePhase(vsphse0[i], vsphse1[i], ratio);
-                    }
-                    else if (i < nhar1)
-                    {
-                        vsphse_interp[i] = vsphse1[i];
-                    }
-                    else if (i < nhar0)
-                    {
-                        vsphse_interp[i] = vsphse0[i];
-                    }
-                }
-            }
-        }
+        ContainerRef baseFrame;        // コピー元フレーム（PBPEFF等の非補間フィールド用）
+        float vtmagnFadeDb = 0;        // V/UV遷移時のfade量
         
-        // NMは線形補間でスムーズにクロスフェード（急激な切り替えを避ける）
-        // 注意: 現在はPSDとEDCのみ補間。demo-stretch.cではeenv（エンベロープ）も補間しているが、
-        // llsm_hmframeへのアクセスが複雑なため、将来的な改善課題
-        IntPtr nmInterpPtr = IntPtr.Zero;
-        var nm0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_NM);
-        var nm1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_NM);
-        
-        if (nm0Ptr != IntPtr.Zero && nm1Ptr != IntPtr.Zero)
+        if (bothVoiced)
         {
-            var nm0 = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nm0Ptr);
-            var nm1 = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nm1Ptr);
+            // 両方有声: 完全線形補間
+            baseFrame = ratio < 0.5f ? frame0 : frame1;
+            f0_interp = f0_0 * (1 - ratio) + f0_1 * ratio;
+            f0_interp = Math.Max(minVoicedF0, f0_interp);
             
-            if (nm0.npsd == nm1.npsd && nm0.nchannel == nm1.nchannel)
+            // Rd補間
+            var rd0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_RD);
+            var rd1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_RD);
+            float rd0 = rd0Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd0Ptr) : 1.0f;
+            float rd1 = rd1Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd1Ptr) : 1.0f;
+            rd_interp = rd0 * (1 - ratio) + rd1 * ratio;
+            
+            // VTMAGN線形補間
+            var vtmagn0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            var vtmagn1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            if (vtmagn0Ptr != IntPtr.Zero && vtmagn1Ptr != IntPtr.Zero)
             {
-                // nm0をベースにコピーしてから補間（ソースフレーム破壊を防止）
-                nmInterpPtr = NativeLLSM.llsm_copy_nmframe(nm0Ptr);
-                var nmInterp = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nmInterpPtr);
-                
-                // PSDを線形補間（demo-stretch.c準拠）
-                float[] psd0 = new float[nm0.npsd];
-                float[] psd1 = new float[nm1.npsd];
-                Marshal.Copy(nm0.psd, psd0, 0, nm0.npsd);
-                Marshal.Copy(nm1.psd, psd1, 0, nm1.npsd);
-                
-                float[] psd_interp = new float[nm0.npsd];
-                for (int p = 0; p < nm0.npsd; p++)
+                int nspec0 = NativeLLSM.llsm_fparray_length(vtmagn0Ptr);
+                int nspec1 = NativeLLSM.llsm_fparray_length(vtmagn1Ptr);
+                int minspec = Math.Min(nspec0, nspec1);
+                int maxspec = Math.Max(nspec0, nspec1);
+                if (maxspec > 0)
                 {
-                    psd_interp[p] = psd0[p] * (1 - ratio) + psd1[p] * ratio;
-                }
-                Marshal.Copy(psd_interp, 0, nmInterp.psd, nm0.npsd);
-                
-                // edcも線形補間（demo-stretch.c準拠）
-                if (nm0.edc != IntPtr.Zero && nm1.edc != IntPtr.Zero && nm0.nchannel > 0)
-                {
-                    float[] edc0 = new float[nm0.nchannel];
-                    float[] edc1 = new float[nm1.nchannel];
-                    Marshal.Copy(nm0.edc, edc0, 0, nm0.nchannel);
-                    Marshal.Copy(nm1.edc, edc1, 0, nm1.nchannel);
-                    
-                    float[] edc_interp = new float[nm0.nchannel];
-                    for (int c = 0; c < nm0.nchannel; c++)
+                    float[] vtmagn0 = new float[nspec0];
+                    float[] vtmagn1 = new float[nspec1];
+                    Marshal.Copy(vtmagn0Ptr, vtmagn0, 0, nspec0);
+                    Marshal.Copy(vtmagn1Ptr, vtmagn1, 0, nspec1);
+                    vtmagn_interp = new float[maxspec];
+                    for (int i = 0; i < maxspec; i++)
                     {
-                        edc_interp[c] = edc0[c] * (1 - ratio) + edc1[c] * ratio;
-                    }
-                    Marshal.Copy(edc_interp, 0, nmInterp.edc, nm0.nchannel);
-                }
-                
-                // eenv（ノイズエンベロープ）も補間（demo-stretch.c準拠）
-                // nmInterpのeenvに書き込み（ソースフレーム破壊を防止）
-                if (nm0.eenv != IntPtr.Zero && nm1.eenv != IntPtr.Zero && nm0.nchannel > 0)
-                {
-                    // eenvはllsm_hmframe**型（ポインタの配列）
-                    IntPtr[] eenv0Ptrs = new IntPtr[nm0.nchannel];
-                    IntPtr[] eenv1Ptrs = new IntPtr[nm1.nchannel];
-                    Marshal.Copy(nm0.eenv, eenv0Ptrs, 0, nm0.nchannel);
-                    Marshal.Copy(nm1.eenv, eenv1Ptrs, 0, nm1.nchannel);
-                    
-                    // nmInterp（コピー済み）のeenvポインタを取得
-                    IntPtr[] eenvInterpPtrs = new IntPtr[nmInterp.nchannel];
-                    Marshal.Copy(nmInterp.eenv, eenvInterpPtrs, 0, nmInterp.nchannel);
-                    
-                    // 各チャンネルのエンベロープを補間
-                    for (int ch = 0; ch < nm0.nchannel; ch++)
-                    {
-                        if (eenv0Ptrs[ch] != IntPtr.Zero && eenv1Ptrs[ch] != IntPtr.Zero)
+                        if (i < minspec)
                         {
-                            var eenv0 = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenv0Ptrs[ch]);
-                            var eenv1 = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenv1Ptrs[ch]);
-                            var eenvInterp = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenvInterpPtrs[ch]);
-                            
-                            int minnhar_e = Math.Min(eenv0.nhar, eenv1.nhar);
-                            int maxnhar_e = Math.Max(eenv0.nhar, eenv1.nhar);
-                            
-                            if (maxnhar_e > 0)
-                            {
-                                float[] ampl0_arr = new float[eenv0.nhar];
-                                float[] ampl1_arr = new float[eenv1.nhar];
-                                float[] phse0_arr = new float[eenv0.nhar];
-                                float[] phse1_arr = new float[eenv1.nhar];
-                                
-                                Marshal.Copy(eenv0.ampl, ampl0_arr, 0, eenv0.nhar);
-                                Marshal.Copy(eenv1.ampl, ampl1_arr, 0, eenv1.nhar);
-                                Marshal.Copy(eenv0.phse, phse0_arr, 0, eenv0.nhar);
-                                Marshal.Copy(eenv1.phse, phse1_arr, 0, eenv1.nhar);
-                                
-                                float[] ampl_interp_e = new float[maxnhar_e];
-                                float[] phse_interp_e = new float[maxnhar_e];
-                                
-                                // 振幅は線形補間、位相は円形補間
-                                for (int i = 0; i < minnhar_e; i++)
-                                {
-                                    ampl_interp_e[i] = ampl0_arr[i] * (1 - ratio) + ampl1_arr[i] * ratio;
-                                    phse_interp_e[i] = CircularInterpolatePhase(phse0_arr[i], phse1_arr[i], ratio);
-                                }
-                                // 長い方の余分な部分はそのままコピー（demo-stretch.c準拠）
-                                for (int i = minnhar_e; i < maxnhar_e; i++)
-                                {
-                                    ampl_interp_e[i] = (i < eenv0.nhar) ? ampl0_arr[i] : ampl1_arr[i];
-                                    phse_interp_e[i] = (i < eenv0.nhar) ? phse0_arr[i] : phse1_arr[i];
-                                }
-                                
-                                // eenvInterpのnharがmaxnhar_eと異なる場合、新しいhmframeを作成
-                                if (eenvInterp.nhar != maxnhar_e)
-                                {
-                                    var newEenv = NativeLLSM.llsm_create_hmframe(maxnhar_e);
-                                    var newEenvStruct = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(newEenv);
-                                    Marshal.Copy(ampl_interp_e, 0, newEenvStruct.ampl, maxnhar_e);
-                                    Marshal.Copy(phse_interp_e, 0, newEenvStruct.phse, maxnhar_e);
-                                    // 古いeenvを解放してnmInterp.eenv[ch]を差し替え
-                                    NativeLLSM.llsm_delete_hmframe(eenvInterpPtrs[ch]);
-                                    eenvInterpPtrs[ch] = newEenv;
-                                }
-                                else
-                                {
-                                    Marshal.Copy(ampl_interp_e, 0, eenvInterp.ampl, maxnhar_e);
-                                    Marshal.Copy(phse_interp_e, 0, eenvInterp.phse, maxnhar_e);
-                                }
-                            }
+                            vtmagn_interp[i] = vtmagn0[i] * (1 - ratio) + vtmagn1[i] * ratio;
+                            if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
+                                vtmagn_interp[i] = Math.Max(vtmagn0[i], vtmagn1[i]);
+                        }
+                        else
+                        {
+                            vtmagn_interp[i] = (i < nspec1) ? vtmagn1[i] : vtmagn0[i];
                         }
                     }
-                    // eenvポインタ配列をnmInterpに書き戻す
-                    Marshal.Copy(eenvInterpPtrs, 0, nmInterp.eenv, nmInterp.nchannel);
+                }
+            }
+            
+            // VSPHSE円形補間
+            var vsphse0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_VSPHSE);
+            var vsphse1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_VSPHSE);
+            if (vsphse0Ptr != IntPtr.Zero && vsphse1Ptr != IntPtr.Zero)
+            {
+                int nhar0 = NativeLLSM.llsm_fparray_length(vsphse0Ptr);
+                int nhar1 = NativeLLSM.llsm_fparray_length(vsphse1Ptr);
+                int minnhar = Math.Min(nhar0, nhar1);
+                int maxnhar = Math.Max(nhar0, nhar1);
+                if (maxnhar > 0)
+                {
+                    float[] vsphse0 = new float[nhar0];
+                    float[] vsphse1 = new float[nhar1];
+                    Marshal.Copy(vsphse0Ptr, vsphse0, 0, nhar0);
+                    Marshal.Copy(vsphse1Ptr, vsphse1, 0, nhar1);
+                    vsphse_interp = new float[maxnhar];
+                    for (int i = 0; i < minnhar; i++)
+                        vsphse_interp[i] = CircularInterpolatePhase(vsphse0[i], vsphse1[i], ratio);
+                    for (int i = minnhar; i < maxnhar; i++)
+                        vsphse_interp[i] = (i < nhar1) ? vsphse1[i] : vsphse0[i];
                 }
             }
         }
-        else if (nm0Ptr != IntPtr.Zero)
+        else if (!voiced0 && voiced1)
         {
-            nmInterpPtr = NativeLLSM.llsm_copy_nmframe(nm0Ptr);
+            // frame1（有声）にフェードイン（demo-stretch.c: voiced == src）
+            baseFrame = frame1;
+            f0_interp = f0_1;
+            var rd1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_RD);
+            rd_interp = rd1Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd1Ptr) : 1.0f;
+            // VTMAGN fade: ratio=0→-∞dB, ratio=1→0dB（demo-stretch.c: mag2db(max(EPS, ratio))）
+            vtmagnFadeDb = 20.0f * MathF.Log10(MathF.Max(1e-8f, ratio));
         }
-        else if (nm1Ptr != IntPtr.Zero)
+        else if (voiced0 && !voiced1)
         {
-            nmInterpPtr = NativeLLSM.llsm_copy_nmframe(nm1Ptr);
+            // frame0（有声）からフェードアウト（demo-stretch.c: voiced == dst）
+            baseFrame = frame0;
+            f0_interp = f0_0;
+            var rd0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_RD);
+            rd_interp = rd0Ptr != IntPtr.Zero ? Marshal.PtrToStructure<float>(rd0Ptr) : 1.0f;
+            // VTMAGN fade: ratio=0→0dB, ratio=1→-∞dB
+            vtmagnFadeDb = 20.0f * MathF.Log10(MathF.Max(1e-8f, 1.0f - ratio));
+        }
+        else
+        {
+            // 両方無声（demo-stretch.c: voiced == NULL）
+            baseFrame = ratio < 0.5f ? frame0 : frame1;
+            f0_interp = 0;
+            rd_interp = 1.0f;
         }
         
-        // ベースフレームをコピーしてから補間フィールドを上書き（demo-stretch.c準拠）
-        // これによりPBPEFF, PBPSYN等、明示的に補間しないフィールドも保持される
-        var baseFrame = ratio < 0.5 ? frame0 : frame1;
+        // === Phase 2: ベースフレームをコピーして出力フレーム構築 ===
         var frameInterpPtr = NativeLLSM.llsm_copy_container(baseFrame.Ptr);
         
-        // F0を補間値で上書き
+        // F0設定
         var f0Ptr = NativeLLSM.llsm_create_fp(f0_interp);
         NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_F0,
             f0Ptr, Marshal.GetFunctionPointerForDelegate(_deleteFp), IntPtr.Zero);
         
-        // RDを設定
+        // Rd設定
         var rdPtr = NativeLLSM.llsm_create_fp(rd_interp);
         NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_RD,
             rdPtr, Marshal.GetFunctionPointerForDelegate(_deleteFp), IntPtr.Zero);
         
-        // VTMAGNを設定
+        // VTMAGN設定（補間あり or フェード適用）
         if (vtmagn_interp != null)
         {
+            // 両方有声: 補間済み配列を使用
+            for (int i = 0; i < vtmagn_interp.Length; i++)
+                vtmagn_interp[i] = Math.Max(-80.0f, vtmagn_interp[i]);
             var vtmagnPtr = NativeLLSM.llsm_create_fparray(vtmagn_interp.Length);
             Marshal.Copy(vtmagn_interp, 0, vtmagnPtr, vtmagn_interp.Length);
             NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_VTMAGN,
                 vtmagnPtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
                 Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
         }
-        else
+        else if (vtmagnFadeDb != 0)
         {
-            // 補間失敗時: frame0またはframe1からコピー（2点補間）
-            var vtmagnSrc = ratio < 0.5 ? frame0 : frame1;
-            var vtmagnSrcPtr = NativeLLSM.llsm_container_get(vtmagnSrc.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            // V/UV遷移: ベースフレームのVTMAGNにdBフェード適用（demo-stretch.c準拠）
+            var vtmagnSrcPtr = NativeLLSM.llsm_container_get(frameInterpPtr, NativeLLSM.LLSM_FRAME_VTMAGN);
             if (vtmagnSrcPtr != IntPtr.Zero)
             {
-                var vtmagnPtr = NativeLLSM.llsm_copy_fparray(vtmagnSrcPtr);
-                NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_VTMAGN,
-                    vtmagnPtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
-                    Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+                int nspec = NativeLLSM.llsm_fparray_length(vtmagnSrcPtr);
+                float[] vtmagn = new float[nspec];
+                Marshal.Copy(vtmagnSrcPtr, vtmagn, 0, nspec);
+                for (int i = 0; i < nspec; i++)
+                    vtmagn[i] = Math.Max(-80.0f, vtmagn[i] + vtmagnFadeDb);
+                Marshal.Copy(vtmagn, 0, vtmagnSrcPtr, nspec);
+            }
+        }
+        // 両方無声の場合: ベースフレームのVTMAGNをそのまま使用（-80dBクランプのみ）
+        else if (!voiced0 && !voiced1)
+        {
+            var vtmagnSrcPtr = NativeLLSM.llsm_container_get(frameInterpPtr, NativeLLSM.LLSM_FRAME_VTMAGN);
+            if (vtmagnSrcPtr != IntPtr.Zero)
+            {
+                int nspec = NativeLLSM.llsm_fparray_length(vtmagnSrcPtr);
+                float[] vtmagn = new float[nspec];
+                Marshal.Copy(vtmagnSrcPtr, vtmagn, 0, nspec);
+                for (int i = 0; i < nspec; i++)
+                    vtmagn[i] = Math.Max(-80.0f, vtmagn[i]);
+                Marshal.Copy(vtmagn, 0, vtmagnSrcPtr, nspec);
             }
         }
         
-        // VSPHSEを設定
+        // VSPHSE設定（両方有声の場合のみ補間）
         if (vsphse_interp != null)
         {
             var vsphsePtr = NativeLLSM.llsm_create_fparray(vsphse_interp.Length);
@@ -3262,29 +3380,132 @@ class Program
                 vsphsePtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
                 Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
         }
-        else
+        
+        // === Phase 3: NM は常に補間（demo-stretch.c準拠: V/UV状態に関係なく） ===
+        // ノイズ特性は有声/無声に関係なく滑らかに遷移すべき
         {
-            // 補間失敗時: frame0またはframe1からコピー（2点補間）
-            var vsphseSrc = ratio < 0.5 ? frame0 : frame1;
-            var vsphseSrcPtr = NativeLLSM.llsm_container_get(vsphseSrc.Ptr, NativeLLSM.LLSM_FRAME_VSPHSE);
-            if (vsphseSrcPtr != IntPtr.Zero)
+            IntPtr nmInterpPtr = IntPtr.Zero;
+            var nm0Ptr = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_NM);
+            var nm1Ptr = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_NM);
+            
+            if (nm0Ptr != IntPtr.Zero && nm1Ptr != IntPtr.Zero)
             {
-                var vsphsePtr = NativeLLSM.llsm_copy_fparray(vsphseSrcPtr);
-                NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_VSPHSE,
-                    vsphsePtr, Marshal.GetFunctionPointerForDelegate(_deleteFpArray), 
-                    Marshal.GetFunctionPointerForDelegate(_copyFpArrayFunc));
+                var nm0 = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nm0Ptr);
+                var nm1 = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nm1Ptr);
+                
+                if (nm0.npsd == nm1.npsd && nm0.nchannel == nm1.nchannel)
+                {
+                    nmInterpPtr = NativeLLSM.llsm_copy_nmframe(nm0Ptr);
+                    var nmInterp = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nmInterpPtr);
+                    
+                    // PSD線形補間（dB域 → 対数パワー補間と等価）
+                    float[] psd0 = new float[nm0.npsd];
+                    float[] psd1 = new float[nm1.npsd];
+                    Marshal.Copy(nm0.psd, psd0, 0, nm0.npsd);
+                    Marshal.Copy(nm1.psd, psd1, 0, nm1.npsd);
+                    float[] psd_interp = new float[nm0.npsd];
+                    for (int p = 0; p < nm0.npsd; p++)
+                        psd_interp[p] = psd0[p] * (1 - ratio) + psd1[p] * ratio;
+                    Marshal.Copy(psd_interp, 0, nmInterp.psd, nm0.npsd);
+                    
+                    // EDC線形補間
+                    if (nm0.edc != IntPtr.Zero && nm1.edc != IntPtr.Zero && nm0.nchannel > 0)
+                    {
+                        float[] edc0 = new float[nm0.nchannel];
+                        float[] edc1 = new float[nm1.nchannel];
+                        Marshal.Copy(nm0.edc, edc0, 0, nm0.nchannel);
+                        Marshal.Copy(nm1.edc, edc1, 0, nm1.nchannel);
+                        float[] edc_interp = new float[nm0.nchannel];
+                        for (int c = 0; c < nm0.nchannel; c++)
+                            edc_interp[c] = edc0[c] * (1 - ratio) + edc1[c] * ratio;
+                        Marshal.Copy(edc_interp, 0, nmInterp.edc, nm0.nchannel);
+                    }
+                    
+                    // eenv（ノイズエンベロープ）補間
+                    if (nm0.eenv != IntPtr.Zero && nm1.eenv != IntPtr.Zero && nm0.nchannel > 0)
+                    {
+                        IntPtr[] eenv0Ptrs = new IntPtr[nm0.nchannel];
+                        IntPtr[] eenv1Ptrs = new IntPtr[nm1.nchannel];
+                        Marshal.Copy(nm0.eenv, eenv0Ptrs, 0, nm0.nchannel);
+                        Marshal.Copy(nm1.eenv, eenv1Ptrs, 0, nm1.nchannel);
+                        
+                        IntPtr[] eenvInterpPtrs = new IntPtr[nmInterp.nchannel];
+                        Marshal.Copy(nmInterp.eenv, eenvInterpPtrs, 0, nmInterp.nchannel);
+                        
+                        for (int ch = 0; ch < nm0.nchannel; ch++)
+                        {
+                            if (eenv0Ptrs[ch] != IntPtr.Zero && eenv1Ptrs[ch] != IntPtr.Zero)
+                            {
+                                var eenv0 = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenv0Ptrs[ch]);
+                                var eenv1 = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenv1Ptrs[ch]);
+                                var eenvInterp = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenvInterpPtrs[ch]);
+                                
+                                int minnhar_e = Math.Min(eenv0.nhar, eenv1.nhar);
+                                int maxnhar_e = Math.Max(eenv0.nhar, eenv1.nhar);
+                                
+                                if (maxnhar_e > 0)
+                                {
+                                    float[] ampl0 = new float[eenv0.nhar];
+                                    float[] ampl1 = new float[eenv1.nhar];
+                                    float[] phse0 = new float[eenv0.nhar];
+                                    float[] phse1 = new float[eenv1.nhar];
+                                    Marshal.Copy(eenv0.ampl, ampl0, 0, eenv0.nhar);
+                                    Marshal.Copy(eenv1.ampl, ampl1, 0, eenv1.nhar);
+                                    Marshal.Copy(eenv0.phse, phse0, 0, eenv0.nhar);
+                                    Marshal.Copy(eenv1.phse, phse1, 0, eenv1.nhar);
+                                    
+                                    float[] ampl_e = new float[maxnhar_e];
+                                    float[] phse_e = new float[maxnhar_e];
+                                    for (int i = 0; i < minnhar_e; i++)
+                                    {
+                                        ampl_e[i] = ampl0[i] * (1 - ratio) + ampl1[i] * ratio;
+                                        phse_e[i] = CircularInterpolatePhase(phse0[i], phse1[i], ratio);
+                                    }
+                                    for (int i = minnhar_e; i < maxnhar_e; i++)
+                                    {
+                                        ampl_e[i] = (i < eenv0.nhar) ? ampl0[i] : ampl1[i];
+                                        phse_e[i] = (i < eenv0.nhar) ? phse0[i] : phse1[i];
+                                    }
+                                    
+                                    if (eenvInterp.nhar != maxnhar_e)
+                                    {
+                                        var newEenv = NativeLLSM.llsm_create_hmframe(maxnhar_e);
+                                        var newStr = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(newEenv);
+                                        Marshal.Copy(ampl_e, 0, newStr.ampl, maxnhar_e);
+                                        Marshal.Copy(phse_e, 0, newStr.phse, maxnhar_e);
+                                        NativeLLSM.llsm_delete_hmframe(eenvInterpPtrs[ch]);
+                                        eenvInterpPtrs[ch] = newEenv;
+                                    }
+                                    else
+                                    {
+                                        Marshal.Copy(ampl_e, 0, eenvInterp.ampl, maxnhar_e);
+                                        Marshal.Copy(phse_e, 0, eenvInterp.phse, maxnhar_e);
+                                    }
+                                }
+                            }
+                        }
+                        Marshal.Copy(eenvInterpPtrs, 0, nmInterp.eenv, nmInterp.nchannel);
+                    }
+                }
+            }
+            else if (nm0Ptr != IntPtr.Zero)
+            {
+                nmInterpPtr = NativeLLSM.llsm_copy_nmframe(nm0Ptr);
+            }
+            else if (nm1Ptr != IntPtr.Zero)
+            {
+                nmInterpPtr = NativeLLSM.llsm_copy_nmframe(nm1Ptr);
+            }
+            
+            if (nmInterpPtr != IntPtr.Zero)
+            {
+                NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_NM,
+                    nmInterpPtr, Marshal.GetFunctionPointerForDelegate(_deleteNm), 
+                    Marshal.GetFunctionPointerForDelegate(_copyNm));
             }
         }
         
-        // NMを設定
-        if (nmInterpPtr != IntPtr.Zero)
-        {
-            NativeLLSM.llsm_container_attach_(frameInterpPtr, NativeLLSM.LLSM_FRAME_NM,
-                nmInterpPtr, Marshal.GetFunctionPointerForDelegate(_deleteNm), 
-                Marshal.GetFunctionPointerForDelegate(_copyNm));
-        }
-        
-        // PSDRES（残差ノイズスペクトル）の線形補間
+        // === Phase 4: PSDRES も常に補間 ===
         {
             var psdres0Ptr_l = NativeLLSM.llsm_container_get(frame0.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
             var psdres1Ptr_l = NativeLLSM.llsm_container_get(frame1.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
@@ -3407,57 +3628,50 @@ class Program
     }
     
     /// <summary>
-    /// Monotonic Cubic補間（Fritsch-Carlson法）
-    /// オーバーシュートを完全に防止し、子音速度変更時の品質劣化を解決
+    /// 秋間補間（Akima Spline）
+    /// Catmull-Romのオーバーシュートを防ぎつつ、Monotonic Cubicより局所変化に敏感。
+    /// スペクトル包絡のフォルマント形状を自然に保持し、平坦部では直線的に振る舞う。
+    /// 参考: H. Akima, "A new method of interpolation and smooth curve fitting
+    ///       based on local procedures", JACM 17(4), 1970.
     /// </summary>
-    static float MonotonicCubicInterp(float p0, float p1, float p2, float p3, float t)
+    static float AkimaInterp(float p0, float p1, float p2, float p3, float t)
     {
-        // 傾き（接線）を計算
-        float m0 = (p1 - p0);
-        float m1 = (p2 - p1);
-        float m2 = (p3 - p2);
+        // 隣接点間の差分（等間隔前提: h=1）
+        float d0 = p1 - p0;  // 区間[0,1]の傾き
+        float d1 = p2 - p1;  // 区間[1,2]の傾き（補間対象）
+        float d2 = p3 - p2;  // 区間[2,3]の傾き
         
-        // 中央2点の傾きを計算（Fritsch-Carlson法）
-        float dk = (p2 - p1);
+        // 境界外の差分を外挿（Akimaの原論文方式）
+        float dm1 = 2.0f * d0 - d1;  // 区間[-1,0]の仮想傾き
+        float d3  = 2.0f * d2 - d1;  // 区間[3,4]の仮想傾き
         
-        // p1での接線
-        float d1;
-        if (m0 * m1 <= 0)
-            d1 = 0;  // 極値点では傾き0
+        // p1での接線（秋間の重み付き平均）
+        float w1_L = MathF.Abs(d2 - d1);   // |m_{i+1} - m_i|
+        float w1_R = MathF.Abs(d0 - dm1);  // |m_{i-1} - m_{i-2}|
+        float s1;
+        if (w1_L + w1_R > 1e-10f)
+            s1 = (w1_L * d0 + w1_R * d1) / (w1_L + w1_R);
         else
-            d1 = (m0 + m1) * 0.5f;
+            s1 = (d0 + d1) * 0.5f;  // 等傾斜時は算術平均
         
         // p2での接線
-        float d2;
-        if (m1 * m2 <= 0)
-            d2 = 0;
+        float w2_L = MathF.Abs(d3 - d2);   // |m_{i+1} - m_i|
+        float w2_R = MathF.Abs(d1 - d0);   // |m_{i-1} - m_{i-2}|
+        float s2;
+        if (w2_L + w2_R > 1e-10f)
+            s2 = (w2_L * d1 + w2_R * d2) / (w2_L + w2_R);
         else
-            d2 = (m1 + m2) * 0.5f;
+            s2 = (d1 + d2) * 0.5f;
         
-        // 単調性保証：傾きが大きすぎる場合は制限
-        if (Math.Abs(dk) > 1e-6f)
-        {
-            float alpha = d1 / dk;
-            float beta = d2 / dk;
-            float tau = 3.0f / MathF.Sqrt(alpha * alpha + beta * beta);
-            
-            if (tau < 1.0f)
-            {
-                d1 *= tau;
-                d2 *= tau;
-            }
-        }
-        
-        // Hermite補間
+        // Hermite基底関数で補間
         float t2 = t * t;
         float t3 = t2 * t;
-        
         float h00 = 2f * t3 - 3f * t2 + 1f;
         float h10 = t3 - 2f * t2 + t;
         float h01 = -2f * t3 + 3f * t2;
         float h11 = t3 - t2;
         
-        return h00 * p1 + h10 * d1 + h01 * p2 + h11 * d2;
+        return h00 * p1 + h10 * s1 + h01 * p2 + h11 * s2;
     }
     
     /// <summary>
@@ -5038,8 +5252,8 @@ class Program
     {
         Console.WriteLine($"  Pitch shift: targetF0={targetF0:F1}Hz (using frame-by-frame F0 ratios, modulation={modulation}{(useModPlus ? " [M+]" : "")})");
         
-        // Layer1 に変換（NFFT=4096で低音域の倍音解像度向上）
-        Llsm.ChunkToLayer1(srcChunk, 4096);
+        // Layer1 に変換（NFFT=8192: スペクトル包絡解像度最大化）
+        Llsm.ChunkToLayer1(srcChunk, 8192);
         
         // 適応的フォルマント処理（Fフラグ）をsrcChunkに適用（Layer1状態、逆位相伝播前）
         // 注意：この処理は現在無効化されています（VTMAGNアクセスに問題があるため）
@@ -5105,11 +5319,21 @@ class Program
         // Layer0 に変換（HM削除済みフレームはLayer1パラメータから再生成される）
         Llsm.ChunkToLayer0(srcChunk);
         
+        // Chunk-level RPS（位相連続性の確保、ザラつき防止）
+        NativeLLSM.llsm_chunk_phasesync_rps(srcChunk.DangerousGetHandle(), 0);
+        
         // 順方向位相伝播
         Llsm.ChunkPhasePropagate(srcChunk, +1);
         
         using var sopt = Llsm.CreateSynthesisOptions(fs);
         using var output = Llsm.Synthesize(sopt, srcChunk);
+        if (_needDecomposedOutput)
+        {
+            var (y, ySin, yNoise) = Llsm.ReadOutputDecomposed(output);
+            _lastSynthSin = ySin;
+            _lastSynthNoise = yNoise;
+            return y;
+        }
         return Llsm.ReadOutput(output);
     }
     
@@ -5118,8 +5342,8 @@ class Program
     /// </summary>
     static float[] SynthesizeWithStretch(ChunkHandle srcChunk, int fs, float stretchRatio)
     {
-        // Layer1 に変換（NFFT=4096で低音域の倍音解像度向上）
-        Llsm.ChunkToLayer1(srcChunk, 4096);
+        // Layer1 に変換（NFFT=8192: スペクトル包絡解像度最大化）
+        Llsm.ChunkToLayer1(srcChunk, 8192);
         
         // 逆位相伝播
         Llsm.ChunkPhasePropagate(srcChunk, -1);
@@ -5151,6 +5375,9 @@ class Program
         // Layer0 に変換
         Llsm.ChunkToLayer0(dstChunk);
         
+        // Chunk-level RPS（位相連続性の確保）
+        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+        
         // 順方向位相伝播
         Llsm.ChunkPhasePropagate(dstChunk, +1);
         
@@ -5174,8 +5401,8 @@ class Program
     {
         float basePitchRatio = targetF0 / avgSrcF0;
         
-        // Layer1 に変換（NFFT=4096で低音域の倍音解像度向上）
-        Llsm.ChunkToLayer1(srcChunk, 4096);
+        // Layer1 に変換（NFFT=8192: スペクトル包絡解像度最大化）
+        Llsm.ChunkToLayer1(srcChunk, 8192);
         
         // 逆位相伝播
         Llsm.ChunkPhasePropagate(srcChunk, -1);
@@ -5245,6 +5472,9 @@ class Program
         
         // Layer0 に変換（HM削除済みフレームはLayer1パラメータから再生成される）
         Llsm.ChunkToLayer0(dstChunk);
+        
+        // Chunk-level RPS（位相連続性の確保）
+        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
         
         // 順方向位相伝播
         Llsm.ChunkPhasePropagate(dstChunk, +1);
