@@ -1553,6 +1553,13 @@ class Program
         Llsm.ChunkPhasePropagate(srcChunk, -1);
         int stretchableFrames = srcNfrm - consonantFrames;
         
+        // ★末尾アーティファクト対策: ソース末尾の不安定フレームを除外
+        // 音源の最終数フレームはF0推定が不安定（発声の切れ目、無音遷移）で、
+        // ストレッチで引き伸ばされると「ブブッ」というノイズになる。
+        // 伸縮部のマッピング範囲を末尾3フレーム手前で打ち切る。
+        int tailMargin = Math.Min(3, stretchableFrames / 4);  // 最大3フレーム、全体の25%以下
+        int effectiveStretchableFrames = Math.Max(1, stretchableFrames - tailMargin);
+        
         // 子音部はvelocityでストレッチ、伸縮部は lengthReq でストレッチ
         int dstConsonantFrames = (int)(consonantFrames * consonantStretch);
         int dstStretchedFrames = (int)(stretchableFrames * stretchRatio);
@@ -1644,9 +1651,9 @@ class Program
             }
             else
             {
-                // 伸縮部: ストレッチ
+                // 伸縮部: ストレッチ（末尾マージン分を除外）
                 float stretchedPos = (float)(i - dstConsonantFrames) / dstStretchedFrames;
-                srcPosFloat = consonantFrames + stretchedPos * stretchableFrames;
+                srcPosFloat = consonantFrames + stretchedPos * effectiveStretchableFrames;
             }
             
             // フレーム補間のためのインデックス計算
