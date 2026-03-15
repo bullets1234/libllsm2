@@ -1742,6 +1742,74 @@ class Program
     }
     
     /// <summary>
+    /// Q1: V/UV境界付近の有声フレームでeenv（ノイズエンベロープ）振幅を漸減フェード
+    /// llsm_synthesize_noise_envelopeで有声(eenv.nhar>0)→無声(nhar=0)の急変が起きる際の
+    /// ポップノイズを防止。OLAで部分的に緩和されるが、eenv側でも事前に減衰させることで改善。
+    /// </summary>
+    static void FadeEenvAtVuvBoundaries(ChunkHandle chunk, float[] dstF0, int dstNfrm)
+    {
+        const int fadeRadius = 2;
+        
+        // 各フレームのV/UV境界からの距離を計算
+        int[] distToBoundary = new int[dstNfrm];
+        Array.Fill(distToBoundary, fadeRadius + 1);
+        
+        for (int i = 1; i < dstNfrm; i++)
+        {
+            bool voicedPrev = dstF0[i - 1] > 0;
+            bool voicedCurr = dstF0[i] > 0;
+            if (voicedPrev != voicedCurr)
+            {
+                // i-1とiの間が境界
+                for (int k = 0; k <= fadeRadius; k++)
+                {
+                    if (i - 1 - k >= 0)
+                        distToBoundary[i - 1 - k] = Math.Min(distToBoundary[i - 1 - k], k);
+                    if (i + k < dstNfrm)
+                        distToBoundary[i + k] = Math.Min(distToBoundary[i + k], k);
+                }
+            }
+        }
+        
+        int fadedCount = 0;
+        for (int i = 0; i < dstNfrm; i++)
+        {
+            if (dstF0[i] <= 0) continue; // 無声フレーム: C合成でnhar=0なのでフェード不要
+            if (distToBoundary[i] >= fadeRadius) continue;
+            
+            // fadeScale: dist=0 → 1/3, dist=1 → 2/3 (fadeRadius=2)
+            float fadeScale = (float)(distToBoundary[i] + 1) / (fadeRadius + 1);
+            
+            var frame = Llsm.GetFrame(chunk, i);
+            var nmPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_NM);
+            if (nmPtr == IntPtr.Zero) continue;
+            
+            var nm = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nmPtr);
+            if (nm.eenv == IntPtr.Zero || nm.nchannel <= 0) continue;
+            
+            IntPtr[] eenvPtrs = new IntPtr[nm.nchannel];
+            Marshal.Copy(nm.eenv, eenvPtrs, 0, nm.nchannel);
+            
+            for (int ch = 0; ch < nm.nchannel; ch++)
+            {
+                if (eenvPtrs[ch] == IntPtr.Zero) continue;
+                var eenv = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenvPtrs[ch]);
+                if (eenv.nhar <= 0) continue;
+                
+                float[] ampl = new float[eenv.nhar];
+                Marshal.Copy(eenv.ampl, ampl, 0, eenv.nhar);
+                for (int h = 0; h < eenv.nhar; h++)
+                    ampl[h] *= fadeScale;
+                Marshal.Copy(ampl, 0, eenv.ampl, eenv.nhar);
+            }
+            fadedCount++;
+        }
+        
+        if (fadedCount > 0)
+            Console.WriteLine($"[Noise Model] Faded eenv on {fadedCount} V/UV boundary frames");
+    }
+    
+    /// <summary>
     /// 声門パラメータ自動推定：原音からRdパラメータを推定し、全フレームに適用
     /// Lフラグで有効化
     /// </summary>
@@ -1972,19 +2040,17 @@ class Program
         
         for (int i = 0; i < dstNfrm; i++)
         {
-            // ストレッチ位置を計算
+            // Q3: ストレッチ位置をdouble精度で計算（長いノートでの累積誤差を防止）
             float srcPosFloat;
             if (i < dstConsonantFrames)
             {
                 // 子音部: velocity でストレッチ
-                float consonantPos = (float)i / dstConsonantFrames;
-                srcPosFloat = consonantPos * consonantFrames;
+                srcPosFloat = (float)((double)i / dstConsonantFrames * consonantFrames);
             }
             else
             {
                 // 伸縮部: ストレッチ（末尾マージン分を除外）
-                float stretchedPos = (float)(i - dstConsonantFrames) / dstStretchedFrames;
-                srcPosFloat = consonantFrames + stretchedPos * effectiveStretchableFrames;
+                srcPosFloat = (float)((double)consonantFrames + (double)(i - dstConsonantFrames) / dstStretchedFrames * effectiveStretchableFrames);
             }
             
             // フレーム補間のためのインデックス計算
@@ -2189,6 +2255,9 @@ class Program
         // ★適応カルマンフィルタによるF0スパイク除去（一時的に無効化）
         // ビブラートや自然な抑揚は追従し、推定エラーのみ自動除去。
         // ApplyAdaptiveKalmanF0(dstF0, dstNfrm, actualThop, dstChunk);
+        
+        // Q1: V/UV境界でのノイズエンベロープ(eenv)振幅をフェードし、ポップノイズを防止
+        FadeEenvAtVuvBoundaries(dstChunk, dstF0, dstNfrm);
         
         // Tフラグ: スペクトル傾斜調整（Layer1状態で実行）
         // フォルマント保存型：チルト適用後にフォルマントピークのレベルを復元
@@ -3460,10 +3529,29 @@ class Program
                     // 共通範囲は補間、範囲外は外挿または最長データを使用
                     if (i < minspec)
                     {
-                        vtmagn_interp[i] = AkimaInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio);
-                        if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
+                        float linearVal = vtmagn1[i] * (1 - ratio) + vtmagn2[i] * ratio;
+                        // Q2: 周波数依存のAkima/線形ブレンド
+                        // 低域(norm<0.18≈4kHz@44.1k): Akimaでフォルマント遷移を滑らかに
+                        // 中域(0.18-0.36≈4-8kHz): 漸次ブレンド
+                        // 高域(norm>0.36≈8kHz+): 線形補間で高周波リンギング抑制
+                        float normFreq = (float)i / minspec;
+                        if (normFreq < 0.18f)
                         {
-                            vtmagn_interp[i] = vtmagn1[i] * (1 - ratio) + vtmagn2[i] * ratio;
+                            vtmagn_interp[i] = AkimaInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio);
+                            if (float.IsNaN(vtmagn_interp[i]) || float.IsInfinity(vtmagn_interp[i]))
+                                vtmagn_interp[i] = linearVal;
+                        }
+                        else if (normFreq < 0.36f)
+                        {
+                            float akimaVal = AkimaInterp(vtmagn0[i], vtmagn1[i], vtmagn2[i], vtmagn3[i], ratio);
+                            if (float.IsNaN(akimaVal) || float.IsInfinity(akimaVal))
+                                akimaVal = linearVal;
+                            float blend = (normFreq - 0.18f) / 0.18f;
+                            vtmagn_interp[i] = akimaVal * (1.0f - blend) + linearVal * blend;
+                        }
+                        else
+                        {
+                            vtmagn_interp[i] = linearVal;
                         }
                     }
                     else
