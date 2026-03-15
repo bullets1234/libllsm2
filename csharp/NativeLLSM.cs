@@ -97,7 +97,7 @@ namespace LlsmBindings
         public static extern void llsm_chunk_phasepropagate(IntPtr chunk, int sign);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void llsm_chunk_phasesync_rps(IntPtr chunk, IntPtr f0, int nfrm);
+        public static extern void llsm_chunk_phasesync_rps(IntPtr chunk, int layer1_based);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_frame_phasesync_rps(IntPtr frame, int layer1_based);
@@ -119,6 +119,9 @@ namespace LlsmBindings
         public static extern void llsm_delete_fp(IntPtr p);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_copy_fp(IntPtr p);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_delete_fparray(IntPtr p);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -130,6 +133,10 @@ namespace LlsmBindings
         // デストラクタ/コピー関数ポインタを伴う attach 変種（所有権移譲/ディープコピー制御）
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_container_attach_(IntPtr dst, int index, IntPtr ptr, IntPtr dtor, IntPtr copyctor);
+
+        // 簡易版: attach without delete/copy function pointers
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_container_attach(IntPtr dst, int index, IntPtr ptr, IntPtr dtor, IntPtr copyctor);
 
         // 出力構造体のミラー（メモリレイアウト固定）
         [StructLayout(LayoutKind.Sequential)]
@@ -169,7 +176,30 @@ namespace LlsmBindings
             public int npsd;       // size of psd
             public int nchannel;   // number of channels
         }
-        
+
+        // gfm (Glottal Flow Model) 構造体のミラー
+        [StructLayout(LayoutKind.Sequential)]
+        public struct llsm_gfm
+        {
+            public float Fa;  // return phase frequency (Hz)
+            public float Rk;  // decay duration relative to rising duration
+            public float Rg;  // rising duration relative to period length
+            public float T0;  // period length (seconds)
+            public float Ee;  // decay slope (normalized to 1)
+        }
+
+        // Pulse-by-Pulse synthesis effect コールバックデリゲート
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate void llsm_fgfm(ref llsm_gfm gfm, ref float delta_t, IntPtr info, IntPtr src_frame);
+
+        // pbpeffect 構造体のミラー
+        [StructLayout(LayoutKind.Sequential)]
+        public struct llsm_pbpeffect
+        {
+            public IntPtr modifier;  // llsm_fgfm function pointer
+            public IntPtr info;      // user data
+        }
+
         // aoptions 構造体のミラー
         [StructLayout(LayoutKind.Sequential)]
         public unsafe struct llsm_aoptions
@@ -184,6 +214,17 @@ namespace LlsmBindings
             public int f0_refine;
             public int hm_method;
             public float rel_winsize;
+        }
+
+        // soptions 構造体のミラー
+        [StructLayout(LayoutKind.Sequential)]
+        public unsafe struct llsm_soptions
+        {
+            public float fs;            // output sampling rate (Hz)
+            public int use_iczt;        // automatically switch to ICZT
+            public int use_l1;          // directly use L1 parameters for synthesis
+            public float iczt_param_a;  // slope parameter
+            public float iczt_param_b;  // offset parameter
         }
 
         // Frame/Model creation
@@ -208,6 +249,16 @@ namespace LlsmBindings
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_copy_nmframe(IntPtr src);
 
+        // Pulse-by-Pulse effect functions
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_create_pbpeffect(IntPtr modifier, IntPtr info);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_delete_pbpeffect(IntPtr dst);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_copy_pbpeffect(IntPtr src);
+
         // Container creation
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_create_container(int nmember);
@@ -218,9 +269,29 @@ namespace LlsmBindings
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_delete_int(IntPtr p);
-        
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_copy_int(IntPtr src);
+
         // デリータ関数ポインタのデリゲート型
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         public delegate void DeleteFunc(IntPtr ptr);
+
+        // コピー関数ポインタのデリゲート型
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate IntPtr CopyFunc(IntPtr ptr);
+
+        // dsputils.c functions for glottal analysis
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_create_cached_glottal_model(float[] param, int nparam, int nhar);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_delete_cached_glottal_model(IntPtr model);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern float llsm_spectral_glottal_fitting(float[] ampl, int nhar, IntPtr model);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_lipfilter(float radius, float f0, int nhar, float[] dst_ampl, float[] dst_phse, int inverse);
     }
 }

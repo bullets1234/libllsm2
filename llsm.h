@@ -22,6 +22,10 @@
 #ifndef LLSM_H
 #define LLSM_H
 
+#ifndef FP_TYPE
+typedef float FP_TYPE;
+#endif
+
 #define LLSM_VERSION_STRING   "2.1.0"
 #define LLSM_VERSION_MAJOR    2
 #define LLSM_VERSION_MINOR    1

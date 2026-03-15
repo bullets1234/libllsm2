@@ -58,3 +58,7 @@ EXPORTS
 	llsm_coder_encode
 	llsm_coder_decode_layer1
 	llsm_coder_decode_layer0
+	llsm_create_cached_glottal_model
+	llsm_delete_cached_glottal_model
+	llsm_spectral_glottal_fitting
+	llsm_lipfilter

@@ -15,6 +15,12 @@ namespace LlsmBindings
         private static readonly IntPtr _pDeleteFp;
         private static readonly IntPtr _pDeleteFpArray;
         private static readonly IntPtr _pCopyFpArray;
+        private static readonly IntPtr _pDeleteInt;
+        private static readonly IntPtr _pCopyInt;
+
+        // 外部からattachに使えるよう公開
+        public static IntPtr DeleteFpArrayPtr => _pDeleteFpArray;
+        public static IntPtr CopyFpArrayPtr => _pCopyFpArray;
 
         static Llsm()
         {
@@ -23,6 +29,8 @@ namespace LlsmBindings
             _pDeleteFp = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_fp));
             _pDeleteFpArray = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_fparray));
             _pCopyFpArray = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_copy_fparray));
+            _pDeleteInt = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_int));
+            _pCopyInt = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_copy_int));
         }
 
         /// <summary>
@@ -157,6 +165,27 @@ namespace LlsmBindings
             return y;
         }
 
+        /// <summary>
+        /// 合成出力から分解された波形（正弦波成分・ノイズ成分）を取得します。
+        /// llsm_synthesize は内部で y = y_sin + y_noise を計算しており、
+        /// 個別の成分を取り出すことで子音ブレンド等の精密な制御が可能になります。
+        /// </summary>
+        /// <returns>(combined, sinusoidal, noise) の3つの波形配列</returns>
+        public static (float[] y, float[] ySin, float[] yNoise) ReadOutputDecomposed(OutputHandle output)
+        {
+            var o = Marshal.PtrToStructure<NativeLLSM.llsm_output>(output.DangerousGetHandle());
+            var y = new float[o.ny];
+            var ySin = new float[o.ny];
+            var yNoise = new float[o.ny];
+            if (o.y != IntPtr.Zero)
+                Marshal.Copy(o.y, y, 0, o.ny);
+            if (o.y_sin != IntPtr.Zero)
+                Marshal.Copy(o.y_sin, ySin, 0, o.ny);
+            if (o.y_noise != IntPtr.Zero)
+                Marshal.Copy(o.y_noise, yNoise, 0, o.ny);
+            return (y, ySin, yNoise);
+        }
+
         // chunk helpers
         /// <summary>
         /// チャンクが保持する設定コンテナ (conf) を取得します（借用参照）。
@@ -259,6 +288,24 @@ namespace LlsmBindings
             var p = NativeLLSM.llsm_create_fp(newThop);
             // ホップ長は LLSM_CONF_THOP (index=1)
             NativeLLSM.llsm_container_attach_(conf.Ptr, NativeLLSM.LLSM_CONF_THOP, p, _pDeleteFp, IntPtr.Zero);
+        }
+
+        /// <summary>
+        /// conf の int 値を新しい値に差し替えます。
+        /// </summary>
+        public static void SetConfInt(ContainerRef conf, int index, int value)
+        {
+            var p = NativeLLSM.llsm_create_int(value);
+            NativeLLSM.llsm_container_attach_(conf.Ptr, index, p, _pDeleteInt, _pCopyInt);
+        }
+
+        /// <summary>
+        /// conf の float 値を新しい値に差し替えます。
+        /// </summary>
+        public static void SetConfFloat(ContainerRef conf, int index, float value)
+        {
+            var p = NativeLLSM.llsm_create_fp(value);
+            NativeLLSM.llsm_container_attach_(conf.Ptr, index, p, _pDeleteFp, IntPtr.Zero);
         }
 
         /// <summary>
@@ -403,6 +450,41 @@ namespace LlsmBindings
             var p = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_F0);
             if (p == IntPtr.Zero) return 0f;
             return Marshal.PtrToStructure<float>(p);
+        }
+
+        /// <summary>
+        /// フレームからハーモニクスモデル（HM）を取得
+        /// </summary>
+        public static IntPtr GetFrameHM(ContainerRef frame)
+        {
+            return NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_HM);
+        }
+
+        /// <summary>
+        /// ハーモニクスモデルからハーモニクス数を取得
+        /// </summary>
+        public static int GetHMNHar(IntPtr hmPtr)
+        {
+            if (hmPtr == IntPtr.Zero) return 0;
+            // llsm_hmframe構造体: {FP_TYPE* ampl, FP_TYPE* phse, int nhar}
+            // nharは2つのポインタの後（IntPtr.Size * 2バイト後）
+            return Marshal.ReadInt32(hmPtr + IntPtr.Size * 2);
+        }
+
+        /// <summary>
+        /// ハーモニクスモデルから振幅配列を取得
+        /// </summary>
+        public static float[] GetHMAmpl(IntPtr hmPtr, int nhar)
+        {
+            if (hmPtr == IntPtr.Zero || nhar <= 0) return new float[0];
+            // llsm_hmframe構造体: {FP_TYPE* ampl, FP_TYPE* phse, int nhar}
+            // amplは最初のメンバー（オフセット0）
+            IntPtr amplPtr = Marshal.ReadIntPtr(hmPtr);
+            if (amplPtr == IntPtr.Zero) return new float[0];
+            
+            float[] ampl = new float[nhar];
+            Marshal.Copy(amplPtr, ampl, 0, nhar);
+            return ampl;
         }
 
         /// <summary>

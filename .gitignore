@@ -23,6 +23,8 @@ bld/
 
 # Build artifacts
 *.exe
+*.onnx
+*.onnx.data
 *.dll
 *.pdb
 *.ilk
@@ -75,6 +77,12 @@ ipch/
 # Build folders
 build/
 
+# Exclude all files and folders under any publish directory
+**/publish/**
+
+# Exclude hifigan_temp/hifi-gan specifically
+**/hifigan_temp/hifi-gan/
+
 # .NET Core
 project.lock.json
 project.fragment.lock.json
@@ -89,6 +97,9 @@ artifacts/
 *.nuget.targets
 *.nuget.dgspec.json
 project.assets.json
+
+#exclusion folders
+[Tt]est/
 
 # Exceptions - include certain files if needed
 !libllsm2.def
