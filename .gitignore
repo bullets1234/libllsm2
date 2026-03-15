@@ -77,6 +77,12 @@ ipch/
 # Build folders
 build/
 
+# Exclude all files and folders under any publish directory
+**/publish/**
+
+# Exclude hifigan_temp/hifi-gan specifically
+**/hifigan_temp/hifi-gan/
+
 # .NET Core
 project.lock.json
 project.fragment.lock.json
