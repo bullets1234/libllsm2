@@ -50,6 +50,7 @@ class Program
     delegate IntPtr CopyFpArrayDelegate(IntPtr ptr);
     static readonly CopyFpArrayDelegate _copyFpArrayFunc = NativeLLSM.llsm_copy_fparray;
     static readonly CopyFpArrayDelegate _copyNm = NativeLLSM.llsm_copy_nmframe;
+    static readonly CopyFpArrayDelegate _copyHm = NativeLLSM.llsm_copy_hmframe;
     
     // PBP (Pulse-by-Pulse) 関連デリゲート
     static readonly DeleteFpDelegate _deletePbpEffect = NativeLLSM.llsm_delete_pbpeffect;
@@ -417,11 +418,6 @@ class Program
         // 分析オプション設定で使用するため、ここで先に解析
         bool useHighResolution = flags.Contains("H", StringComparison.OrdinalIgnoreCase);
         
-        // Qフラグ: Quality F0 refinement（F0精密化）
-        // 指定なし=標準F0、指定あり=高調波解析ベースのF0精密化
-        // ビブラート・ポルタメントの滑らかさ向上、子音→母音遷移の自然さ向上
-        bool useF0Refine = flags.Contains("Q", StringComparison.OrdinalIgnoreCase);
-        
         // Wフラグ: Adaptive Window Size（適応的窓サイズ）
         // 指定なし=固定4.0周期、指定あり=F0に応じて動的調整（低音→3.0、高音→5.0）
         // 低音での子音明瞭度向上、高音での倍音豊かさ向上
@@ -564,17 +560,7 @@ class Program
             aoptPtr->maxnhar = maxnhar;
             aoptPtr->maxnhar_e = maxnhar_e;
             aoptPtr->hm_method = 1;       // LLSM_AOPTION_HMCZT（CZT法、高品質）
-            
-            // Qフラグ: F0リファインメント有効化
-            if (useF0Refine)
-            {
-                aoptPtr->f0_refine = 1;   // 高調波解析ベースのF0精密化
-                Console.WriteLine($"  [Quality] F0 refinement enabled (Q flag)");
-            }
-            else
-            {
-                aoptPtr->f0_refine = 0;   // 標準（デフォルト）
-            }
+            aoptPtr->f0_refine = 1;       // F0リファインメント有効（Cライブラリデフォルト）
             
             // Wフラグ: 適応的窓サイズ調整
             if (useAdaptiveWindow)
@@ -3204,6 +3190,35 @@ class Program
         {
             var frame = Llsm.GetFrame(chunk, i);
             float f0 = Llsm.GetFrameF0(frame);
+            
+            // HM（調波モデル）倍音数トリム: 元のナイキスト以下に制限
+            // 2x分析時 nhar=floor(88200/(2*f0)) だが、合成は44100Hzなので
+            // floor(44100/(2*f0))を超える倍音はエイリアシングを起こす
+            var hmPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_HM);
+            if (hmPtr != IntPtr.Zero && f0 > 0)
+            {
+                int analysisNhar = Llsm.GetHMNHar(hmPtr);
+                int originalNhar = (int)(originalFnyq / f0);  // floor(fnyq_orig / f0)
+                if (originalNhar < analysisNhar)
+                {
+                    // 新しいHMフレームを作成して倍音をトリム
+                    var newHm = NativeLLSM.llsm_create_hmframe(originalNhar);
+                    var newHmStruct = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(newHm);
+                    var oldHmStruct = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(hmPtr);
+                    
+                    // ampl, phseの先頭originalNhar個だけコピー
+                    float[] ampl = new float[originalNhar];
+                    float[] phse = new float[originalNhar];
+                    Marshal.Copy(oldHmStruct.ampl, ampl, 0, originalNhar);
+                    Marshal.Copy(oldHmStruct.phse, phse, 0, originalNhar);
+                    Marshal.Copy(ampl, 0, newHmStruct.ampl, originalNhar);
+                    Marshal.Copy(phse, 0, newHmStruct.phse, originalNhar);
+                    
+                    NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_HM,
+                        newHm, Marshal.GetFunctionPointerForDelegate(_deleteHm),
+                        Marshal.GetFunctionPointerForDelegate(_copyHm));
+                }
+            }
             
             // VTMAGN トリム（下半分のみ保持 = 元のナイキスト以下）
             var vtmagnPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
