@@ -542,7 +542,8 @@ class Program
                                                    0.03f;    // 高音: 3%
             // ★高音ザラつき対策: maxnhar_eの下限を12に引き上げ
             // 高F0(500Hz)×8倍音=4kHzでは高域ノイズ包絡が粗い。12倍音=6kHzでカバー
-            maxnhar_e = Math.Clamp((int)(maxnhar * maxnhar_e_ratio), 12, 24);
+            // ★高解像度化: 上限24→32（ノイズ時間構造の解像度向上）
+            maxnhar_e = Math.Clamp((int)(maxnhar * maxnhar_e_ratio), 12, 32);
             
             Console.WriteLine($"  [High-Res] Dynamic harmonics: maxnhar={maxnhar}, maxnhar_e={maxnhar_e} (F0={srcF0:F1}Hz)");
         }
@@ -550,7 +551,7 @@ class Program
         {
             // 標準モード: 固定値（子音品質向上のため8に引き上げ）
             maxnhar = 800;       // 最大倍音数（8kHzまでカバー、F0=100Hz時）
-            maxnhar_e = 12;      // ★高音ザラつき対策: 8→12に引き上げ（高域ノイズ包絡精度向上）
+            maxnhar_e = 16;      // ★高解像度化: 12→16（ノイズ時間構造解像度向上）
         }
         
         unsafe
@@ -1297,9 +1298,9 @@ class Program
         Console.WriteLine($"[PitchMark] Converting to Layer0 for synthesis...");
         Llsm.ChunkToLayer0(dstChunk);
         
-        // Chunk-level RPS（位相連続性の確保）
-        Console.WriteLine($"[PitchMark] Chunk-level RPS (Layer0, mandatory for quality)...");
-        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+        // Chunk-level RPS（layer1_based=1: VSPHSE[0]基準で声門パルス形状を保持）
+        Console.WriteLine($"[PitchMark] Chunk-level RPS (Layer0, layer1_based=1)...");
+        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
         
         // 順方向位相伝播
         Console.WriteLine($"[PitchMark] Applying forward phase propagation...");
@@ -2393,9 +2394,9 @@ class Program
             Console.WriteLine($"[Synthesis] Converting {dstNfrm} frames to Layer0...");
             Llsm.ChunkToLayer0(dstChunk);
             
-            // Chunk-level RPS（位相連続性の確保）
-            Console.WriteLine($"[Synthesis] Chunk-level RPS (Layer0, mandatory for quality)...");
-            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+            // Chunk-level RPS（layer1_based=1: VSPHSE[0]基準で声門パルス形状を保持）
+            Console.WriteLine($"[Synthesis] Chunk-level RPS (Layer0, layer1_based=1)...");
+            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
             
             // 順方向位相伝播（Layer0）
             Console.WriteLine($"[Synthesis] Phase propagate (Layer0)...");
@@ -2860,9 +2861,9 @@ class Program
             Console.WriteLine($"[Elastic Synthesis] Converting {dstNfrm} frames to Layer0...");
             Llsm.ChunkToLayer0(dstChunk);
             
-            // Chunk-level RPS（位相連続性の確保）
-            Console.WriteLine($"[Elastic Synthesis] Chunk-level RPS (Layer0, mandatory for quality)...");
-            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+            // Chunk-level RPS（layer1_based=1: VSPHSE[0]基準で声門パルス形状を保持）
+            Console.WriteLine($"[Elastic Synthesis] Chunk-level RPS (Layer0, layer1_based=1)...");
+            NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
             
             Console.WriteLine($"[Elastic Synthesis] Phase propagate (Layer0)...");
             Llsm.ChunkPhasePropagate(dstChunk, +1);
@@ -6565,8 +6566,8 @@ class Program
         // Layer0 に変換（HM削除済みフレームはLayer1パラメータから再生成される）
         Llsm.ChunkToLayer0(srcChunk);
         
-        // Chunk-level RPS（位相連続性の確保）
-        NativeLLSM.llsm_chunk_phasesync_rps(srcChunk.DangerousGetHandle(), 0);
+        // Chunk-level RPS（layer1_based=1: VSPHSE[0]基準で声門パルス形状を保持）
+        NativeLLSM.llsm_chunk_phasesync_rps(srcChunk.DangerousGetHandle(), 1);
         
         // 順方向位相伝播
         Llsm.ChunkPhasePropagate(srcChunk, +1);
@@ -6622,8 +6623,8 @@ class Program
         // Layer0 に変換
         Llsm.ChunkToLayer0(dstChunk);
         
-        // Chunk-level RPS（位相連続性の確保）
-        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+        // Chunk-level RPS（layer1_based=1: VSPHSE[0]基準で声門パルス形状を保持）
+        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
         
         // 順方向位相伝播
         Llsm.ChunkPhasePropagate(dstChunk, +1);
@@ -6648,8 +6649,8 @@ class Program
     {
         float basePitchRatio = targetF0 / avgSrcF0;
         
-        // Layer1 に変換（NFFT=16384: 2xオーバーサンプリング分析対応）
-        Llsm.ChunkToLayer1(srcChunk, 16384);
+        // Layer1 に変換（NFFT=32768: 4xオーバーサンプリング分析、合成側 nspec=8193）
+        Llsm.ChunkToLayer1(srcChunk, 32768);
         DownsampleChunkSpectrum(srcChunk, fs);
         
         // 逆位相伝播
@@ -6679,10 +6680,12 @@ class Program
             float pitchRatio = basePitchRatio;
             if (pitchBend.Count > 0)
             {
-                // ピッチベンドの補間インデックスを計算
+                // ピッチベンドの補間インデックスを計算（線形補間でクリック回避）
                 float pbIdxF = (float)i / dstNfrm * pitchBend.Count;
-                int pbIdx = Math.Min((int)pbIdxF, pitchBend.Count - 1);
-                int cents = pitchBend[pbIdx];
+                int pbIdx0 = Math.Max(0, Math.Min((int)pbIdxF, pitchBend.Count - 1));
+                int pbIdx1 = Math.Min(pbIdx0 + 1, pitchBend.Count - 1);
+                float pbFrac = pbIdxF - pbIdx0;
+                float cents = pitchBend[pbIdx0] * (1.0f - pbFrac) + pitchBend[pbIdx1] * pbFrac;
                 // セント→比率: 2^(cents/1200)
                 pitchRatio *= (float)Math.Pow(2, cents / 1200.0);
             }
@@ -6711,6 +6714,24 @@ class Program
                     Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
                 }
                 
+                // ★Issue1対策: F0変更後にVSPHSEを新F0でLF modelから正確に再計算
+                // VSPHSE[k] は LF モデルの位相応答 @ f0_new*(k+1)
+                if (Math.Abs(pitchRatio - 1.0f) > 0.001f)
+                {
+                    var vsphsePtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_VSPHSE);
+                    var rdPtrVs = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_RD);
+                    if (vsphsePtr != IntPtr.Zero && rdPtrVs != IntPtr.Zero)
+                    {
+                        int nharVs = NativeLLSM.llsm_fparray_length(vsphsePtr);
+                        float rd = Marshal.PtrToStructure<float>(rdPtrVs);
+                        float newF0 = f0 * pitchRatio;
+                        if (nharVs > 0 && rd > 0 && newF0 > 0)
+                        {
+                            NativeLLSM.llsm_compute_vsphse_from_rd(rd, newF0, nharVs, vsphsePtr);
+                        }
+                    }
+                }
+                
                 // Fix #9: HMを削除（Layer1パラメータからtolayer0で再生成させる）
                 NativeLLSM.llsm_container_attach_(newFramePtr, NativeLLSM.LLSM_FRAME_HM,
                     IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
@@ -6722,8 +6743,8 @@ class Program
         // Layer0 に変換（HM削除済みフレームはLayer1パラメータから再生成される）
         Llsm.ChunkToLayer0(dstChunk);
         
-        // Chunk-level RPS（位相連続性の確保）
-        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 0);
+        // Chunk-level RPS（layer1_based=1: VSPHSE[0]基準で声門パルス形状を保持）
+        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
         
         // 順方向位相伝播
         Llsm.ChunkPhasePropagate(dstChunk, +1);

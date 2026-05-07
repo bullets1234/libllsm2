@@ -51,6 +51,7 @@ EXPORTS
 	llsm_chunk_phasesync_rps
 	llsm_chunk_phasepropagate
 	llsm_chunk_getf0
+	llsm_compute_vsphse_from_rd
 	llsm_analyze
 	llsm_synthesize
 	llsm_create_coder

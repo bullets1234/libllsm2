@@ -42,6 +42,17 @@ lfmodel llsm_gfm_to_lfmodel(llsm_gfm src) {
   return ret;
 }
 
+void llsm_compute_vsphse_from_rd(FP_TYPE rd, FP_TYPE f0, int nhar,
+  FP_TYPE* dst_vsphse) {
+  if(nhar <= 0 || f0 <= 0 || dst_vsphse == NULL) return;
+  lfmodel gfm = lfmodel_from_rd(rd, 1.0 / f0, 1.0);
+  FP_TYPE* harfreq = calloc(nhar, sizeof(FP_TYPE));
+  for(int i = 0; i < nhar; i ++) harfreq[i] = f0 * (i + 1.0);
+  FP_TYPE* magn = lfmodel_spectrum(gfm, harfreq, nhar, dst_vsphse);
+  free(magn);
+  free(harfreq);
+}
+
 FP_TYPE* llsm_synthesize_harmonic_frame_auto(llsm_soptions* options,
   FP_TYPE* ampl, FP_TYPE* phse, int nhar, FP_TYPE f0, int nx) {
   FP_TYPE* ret = NULL;

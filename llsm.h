@@ -336,6 +336,12 @@ void llsm_chunk_phasepropagate(llsm_chunk* dst, int sign);
 /** @brief Get F0 and number of frames from a parameter chunk. */
 FP_TYPE* llsm_chunk_getf0(llsm_chunk* src, int* dst_nfrm);
 
+/** @brief Compute the LF-model phase response at harmonic frequencies
+ *    f0*(1..nhar) for a given Rd and F0, writing nhar floats into
+ *    dst_vsphse. Useful for recomputing VSPHSE after changing F0. */
+void llsm_compute_vsphse_from_rd(FP_TYPE rd, FP_TYPE f0, int nhar,
+  FP_TYPE* dst_vsphse);
+
 /** @brief Perform layer 0 analysis on a speech signal. */
 llsm_chunk* llsm_analyze(llsm_aoptions* options, FP_TYPE* x, int nx,
   FP_TYPE fs, FP_TYPE* f0, int nfrm, FP_TYPE** x_ap);

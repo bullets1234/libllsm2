@@ -102,6 +102,9 @@ namespace LlsmBindings
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_frame_phasesync_rps(IntPtr frame, int layer1_based);
 
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_compute_vsphse_from_rd(float rd, float f0, int nhar, IntPtr dst_vsphse);
+
         // コンテナ操作（get/attach/new/delete）
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_container_get(IntPtr src, int index);
