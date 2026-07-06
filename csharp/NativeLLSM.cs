@@ -234,6 +234,10 @@ namespace LlsmBindings
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_create_frame(int nhar, int nchannel, int nhar_e, int npsd);
 
+        // ノイズ帯域チャンネル構成の差し替え（chanfreq: nchannel-1個の境界周波数Hz、内容はコピーされる）
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_aoptions_set_chanfreq(IntPtr dst, float[] chanfreq, int nchannel);
+
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_create_hmframe(int nhar);
 

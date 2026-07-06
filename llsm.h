@@ -279,6 +279,10 @@ typedef struct {
 llsm_aoptions* llsm_create_aoptions();
 /** @brief Delete and free analysis options. */
 void llsm_delete_aoptions(llsm_aoptions* dst);
+/** @brief Replace the noise channel layout. chanfreq holds the nchannel - 1
+ *    boundary frequencies (Hz) in ascending order; the contents are copied. */
+void llsm_aoptions_set_chanfreq(llsm_aoptions* dst, FP_TYPE* chanfreq,
+  int nchannel);
 /** @brief Create a model configuration from analysis options. */
 llsm_container* llsm_aoptions_toconf(llsm_aoptions* src, FP_TYPE fnyq);
 

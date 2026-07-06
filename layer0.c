@@ -48,6 +48,15 @@ void llsm_delete_aoptions(llsm_aoptions* dst) {
   free(dst);
 }
 
+void llsm_aoptions_set_chanfreq(llsm_aoptions* dst, FP_TYPE* chanfreq,
+  int nchannel) {
+  if(dst == NULL || nchannel < 2) return;
+  free(dst -> chanfreq);
+  dst -> nchannel = nchannel;
+  dst -> chanfreq = calloc(nchannel - 1, sizeof(FP_TYPE));
+  memcpy(dst -> chanfreq, chanfreq, sizeof(FP_TYPE) * (nchannel - 1));
+}
+
 llsm_container* llsm_aoptions_toconf(llsm_aoptions* src, FP_TYPE fnyq) {
   llsm_container* ret = llsm_create_container(10);
   llsm_container_attach(ret, LLSM_CONF_NFRM,

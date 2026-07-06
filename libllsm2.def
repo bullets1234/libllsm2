@@ -40,6 +40,7 @@ EXPORTS
 	llsm_delete_output
 	llsm_create_aoptions
 	llsm_delete_aoptions
+	llsm_aoptions_set_chanfreq
 	llsm_aoptions_toconf
 	llsm_create_soptions
 	llsm_delete_soptions

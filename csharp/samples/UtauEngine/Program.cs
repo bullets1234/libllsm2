@@ -16,6 +16,10 @@ namespace UtauEngine
 class Program
 {
     const float Thop = 0.005f;     // 5ms（LLSM安定設定、PBはフレーム間補間で精度確保）
+    // VTMAGN（声道振幅包絡）のフロアクランプ統一値。
+    // 振幅補正・スペクトルチルト・breathiness 全パスでこの値を使い、
+    // 経路ごとのクランプ不統一（旧: breathinessのみ-120dB）を排除する。
+    const float VtmagnFloorDb = -80.0f;
     
     // (旧 USE_MONOTONIC_CUBIC フラグは秋間補間に統一したため廃止)
     
@@ -269,9 +273,13 @@ class Program
         // Pフラグ: ピッチ検出バイパス（.frqを無視してPYIN/LLSM自動推定を強制）
         bool bypassFrq = flags.Contains("P", StringComparison.OrdinalIgnoreCase);
         
+        // 注: Thop 2.5ms化（Qフラグ）を試行したが、5msの方が音質良好だったため撤去。
+        // （窓長はF0依存のため時間分解能は上がらず、フレーム間補間の揺らぎだけが増える）
+        float thopSec = Thop;
+        
         // F0 を取得（.frq があれば使用、なければ PYIN で初期推定）
         // Pフラグが有効な場合は.frqを無視してPYIN/LLSM自動推定を使用
-        int nhop = (int)(Thop * fs);
+        int nhop = (int)(thopSec * fs);
         float[] f0;
         float srcF0;
         
@@ -288,13 +296,160 @@ class Program
                 // frq のフレームインデックスを計算
                 float frqIdx = frqStartFrame + (float)i * nhop / frqData.SamplesPerFrame;
                 int idx = (int)frqIdx;
+                float frac = frqIdx - idx;
+                int idx1 = Math.Min(idx + 1, frqData.F0Values.Length - 1);
                 if (idx >= 0 && idx < frqData.F0Values.Length)
                 {
-                    f0[i] = (float)frqData.F0Values[idx];
+                    float v0 = (float)frqData.F0Values[idx];
+                    float v1 = (float)frqData.F0Values[idx1];
+                    // V/UV境界保護付き線形補間
+                    f0[i] = (v0 > 0 && v1 > 0) ? v0 * (1f - frac) + v1 * frac : v0;
                 }
             }
             srcF0 = (float)frqData.AverageF0;  // 仮の値、後で LLSM から取得（Eフラグがなければ）
             Console.WriteLine($"  [Pitch] Initial F0 from FRQ: {srcF0:F1}Hz");
+            
+            // ★Zフラグ: 純FRQモード。PYINによるV/UVマスク・FRQ安定化を完全に無効化。
+            // Whisper音源等ではPYINが有声区間を無声と誤判定し、FRQのF0を
+            // 潰してしまうため、切替手段として必須。
+            // ※当初はUフラグだったが、既存のU(\d+)（無声音減衰）と衝突するためZに変更。
+            bool pureFrq = flags.Contains("Z", StringComparison.OrdinalIgnoreCase);
+            if (pureFrq)
+            {
+                Console.WriteLine("  [Pitch] Z flag: pure FRQ mode (PYIN V/UV mask disabled)");
+            }
+            else
+            {
+            // ★V/UVマスク: ピッチ値はFRQ、有声/無声判定はPYINのハイブリッド
+            // FRQは無声子音区間にも有声F0値を埋めるため、子音バーストが
+            // 有声（倍音+ピッチ同期ノイズ変調）として誤モデル化され、
+            // 合成時に毎周期のクリック音（チッ）になる。
+            // PYINのV/UV判定で「FRQ有声 かつ PYIN無声」のフレームを無声化する。
+            // ※ピッチ値は常にFRQ由来。PYINは有声/無声の判定にのみ使用。
+            var f0Vuv = Pyin.Analyze(segment, fs, nhop, 60, 800);
+            int nMask = Math.Min(f0.Length, f0Vuv.Length);
+            
+            // PYIN無声判定に±10ms相当の膨張（dilation）をかけたマスクを作成。
+            // 子音境界の半端な有声フレームが残ると、そこが新たな
+            // クリック源になるため、無声判定を広げて確実に潰す。
+            // （フレーム数はthopに応じて換算: 5ms→2, 2.5ms→4）
+            int dilate = Math.Max(1, (int)MathF.Round(0.010f / thopSec));
+            bool[] unvoicedMask = new bool[nMask];
+            for (int i = 0; i < nMask; i++)
+            {
+                if (f0Vuv[i] > 0) continue;
+                for (int k = Math.Max(0, i - dilate); k <= Math.Min(nMask - 1, i + dilate); k++)
+                    unvoicedMask[k] = true;
+            }
+            
+            // ★自動フォールバック: FRQ有声フレームの大半(>70%)をPYINが無声と
+            // 判定した場合、PYIN側の誤推定（Whisper音源等）とみなしマスクを中止。
+            int frqVoiced = 0, wouldMask = 0;
+            for (int i = 0; i < nMask; i++)
+            {
+                if (f0[i] > 0)
+                {
+                    frqVoiced++;
+                    if (unvoicedMask[i]) wouldMask++;
+                }
+            }
+            if (frqVoiced > 0 && (float)wouldMask / frqVoiced > 0.70f)
+            {
+                Console.WriteLine($"  [Pitch] PYIN V/UV mask skipped: would unvoice {wouldMask}/{frqVoiced} frames (likely PYIN misdetection; use Z flag to force pure FRQ)");
+            }
+            else
+            {
+            int maskedCount = 0;
+            for (int i = 0; i < nMask; i++)
+            {
+                if (f0[i] > 0 && unvoicedMask[i])
+                {
+                    f0[i] = 0;
+                    maskedCount++;
+                }
+            }
+            // PYINがカバーしない末尾フレーム（解析長の差分）も無声化
+            for (int i = nMask; i < f0.Length; i++)
+            {
+                if (f0[i] > 0) { f0[i] = 0; maskedCount++; }
+            }
+            
+            // 孤立した極短有声区間（≤20ms相当）を除去。
+            // マスク適用後に残る断片は子音内の誤判定残骸でクリック源になる。
+            int minRunFrames = Math.Max(2, (int)MathF.Round(0.020f / thopSec));
+            int runStart = -1;
+            for (int i = 0; i <= f0.Length; i++)
+            {
+                bool voiced = i < f0.Length && f0[i] > 0;
+                if (voiced && runStart < 0) runStart = i;
+                else if (!voiced && runStart >= 0)
+                {
+                    if (i - runStart <= minRunFrames)
+                    {
+                        for (int j = runStart; j < i; j++) f0[j] = 0;
+                        maskedCount += i - runStart;
+                    }
+                    runStart = -1;
+                }
+            }
+            
+            // ★FRQピッチ値の安定化（有声区間内）
+            // FRQの子音近傍フレームは外れ値・急変を含みやすく、その値で
+            // 倍音解析窓が組まれると誤フィット→クリック音になる。
+            // (1) 有声区間ごとの5タップメディアンフィルタで平滑化
+            // (2) 区間中央値から大きく外れる（>20%）フレームは無声化
+            int stabilized = 0;
+            runStart = -1;
+            for (int i = 0; i <= f0.Length; i++)
+            {
+                bool voiced = i < f0.Length && f0[i] > 0;
+                if (voiced && runStart < 0) runStart = i;
+                else if (!voiced && runStart >= 0)
+                {
+                    int runLen = i - runStart;
+                    
+                    // (1) 5タップメディアン（区間内、端は窓を縮小）
+                    float[] med = new float[runLen];
+                    var medBuf = new List<float>(5);
+                    for (int j = 0; j < runLen; j++)
+                    {
+                        medBuf.Clear();
+                        for (int k = Math.Max(0, j - 2); k <= Math.Min(runLen - 1, j + 2); k++)
+                            medBuf.Add(f0[runStart + k]);
+                        medBuf.Sort();
+                        med[j] = medBuf[medBuf.Count / 2];
+                    }
+                    
+                    // 区間全体の中央値
+                    float[] sorted = new float[runLen];
+                    for (int j = 0; j < runLen; j++) sorted[j] = f0[runStart + j];
+                    Array.Sort(sorted);
+                    float runMedian = sorted[runLen / 2];
+                    
+                    for (int j = 0; j < runLen; j++)
+                    {
+                        float orig = f0[runStart + j];
+                        // (2) 区間中央値から20%超の外れ値 → 無声化（境界の破綻フレーム）
+                        if (MathF.Abs(orig - runMedian) / runMedian > 0.20f)
+                        {
+                            f0[runStart + j] = 0;
+                            stabilized++;
+                        }
+                        // (1) メディアンから3%超ずれている場合のみ置換（自然なビブラートは保持）
+                        else if (MathF.Abs(orig - med[j]) / med[j] > 0.03f)
+                        {
+                            f0[runStart + j] = med[j];
+                            stabilized++;
+                        }
+                    }
+                    runStart = -1;
+                }
+            }
+            
+            if (maskedCount > 0 || stabilized > 0)
+                Console.WriteLine($"  [Pitch] V/UV mask from PYIN: unvoiced {maskedCount} frames, stabilized {stabilized} FRQ outliers");
+            } // 自動フォールバック else
+            } // pureFrq else
         }
         else
         {
@@ -549,15 +704,31 @@ class Program
         }
         else
         {
-            // 標準モード: 固定値（子音品質向上のため8に引き上げ）
+            // 標準モード: 固定値
             maxnhar = 800;       // 最大倍音数（8kHzまでカバー、F0=100Hz時）
-            maxnhar_e = 16;      // ★高解像度化: 12→16（ノイズ時間構造解像度向上）
+            maxnhar_e = 24;      // ノイズ時間構造解像度（息の変調を精密に捉える）
+                                 // 以前24でクリック音が出たのは V/UVマスク不備と1kHz境界の
+                                 // Chebyshevフィルタ不安定が真因。両方解決済みのため24に再引き上げ。
+                                 // eenvクランプ（ClampEenvModulationDepth）が過変調の保険。
         }
+        
+        // ★ノイズ帯域チャンネル増設: 4ch(境界2k/4k/8k) → 5ch(境界2k/4k/8k/12k)
+        // 息感の本体である高域ノイズ（8kHz以上）がデフォルトでは1本の時間包絡で
+        // 表現されており質感喪失の主要因だった。高域のみ分割を追加する。
+        // 注: 1kHz境界は使わない。2xオーバーサンプリング解析（88.2kHz）では
+        // 正規化遮断0.011となり、Chebyshev係数テーブル（filter-coef.h）の最下端
+        // （極半径≈0.98の4次IIR）を踏み、単精度filtfiltが子音過渡で数値的に
+        // 不安定化してクリック音（チッ）の原因になる。
+        float[] noiseChanFreq = { 2000f, 4000f, 8000f, 12000f };
+        NativeLLSM.llsm_aoptions_set_chanfreq(
+            aopt.DangerousGetHandle(), noiseChanFreq, noiseChanFreq.Length + 1);
+        Console.WriteLine($"  [Noise] {noiseChanFreq.Length + 1} channels (boundaries: 2k/4k/8k/12k Hz)");
         
         unsafe
         {
             var aoptPtr = (NativeLLSM.llsm_aoptions*)aopt.DangerousGetHandle().ToPointer();
-            aoptPtr->npsd = 256;          // PSDサイズ（LLSMデフォルト: 256、ノイズ解像度向上）
+            aoptPtr->thop = thopSec;      // f0配列のフレーム間隔(nhop)と必ず一致させること
+            aoptPtr->npsd = 512;          // PSDサイズ（512に向上、ノイズ周波数解像度向上）
             aoptPtr->maxnhar = maxnhar;
             aoptPtr->maxnhar_e = maxnhar_e;
             aoptPtr->hm_method = 1;       // LLSM_AOPTION_HMCZT（CZT法、高品質）
@@ -604,6 +775,13 @@ class Program
         Console.WriteLine($"  [OversampledAnalysis] {fs}Hz -> {analysisFs}Hz ({segment.Length} -> {upsampledSegment.Length} samples)");
         
         using var chunk = Llsm.Analyze(aopt, upsampledSegment, analysisFs, f0, f0.Length);
+        
+        // ★eenv（ノイズ包絡）変調深度クランプ
+        // 子音部が有声誤判定されると（特にFRQのF0使用時）、過渡バーストが
+        // ピッチ同期スパイク列として倍音フィットされ、合成時に毎周期の
+        // クリック音（チッ）として再生される。包絡の非負性（Σampl ≤ edc）を
+        // 強制することで過渡フィットのみ抑制し、自然な息の変調は保持する。
+        ClampEenvModulationDepth(chunk, f0, f0.Length);
         
         // LLSM解析で実際に使用されたThopを取得
         var conf = Llsm.GetConf(chunk);
@@ -1418,7 +1596,7 @@ class Program
                     frameCopy = InterpolateFrame(f1ref, f2ref, frac, i);
                 }
                 
-                AttachRandomNearbyPsdres(frameCopy, srcChunk, idx1, srcNfrm, i);
+                // AttachRandomNearbyPsdres(frameCopy, srcChunk, idx1, srcNfrm, i);  // 周期ノイズ原因のため無効化
             }
             
             int srcIdx = (int)Math.Round(srcPosFloat);
@@ -1478,7 +1656,7 @@ class Program
             // パラメータフラグを適用（B/g）
             if (breathiness != 50)
             {
-                ApplyBreathiness(frameRef, breathiness);
+                ApplyBreathiness(frameRef, breathiness, i);
             }
             
             if (genderFactor != 0)
@@ -1720,6 +1898,63 @@ class Program
         {
             Console.WriteLine($"[Noise Model] Constrained NM PSD on {constrainedCount} V/UV boundary frames");
         }
+    }
+    
+    /// <summary>
+    /// eenv（ノイズ包絡）の変調深度を物理的に妥当な範囲にクランプする。
+    /// 包絡は本来非負（RMSエネルギー）なので Σ|ampl| ≤ edc が成立すべき。
+    /// これを大きく超えるフレームは子音過渡の誤フィット（合成時にクリック音化）であり、
+    /// 振幅を一律スケールして抑制する。自然な息の変調（深度100%以下）は影響を受けない。
+    /// </summary>
+    static void ClampEenvModulationDepth(ChunkHandle chunk, float[] f0, int nfrm)
+    {
+        int clampedCount = 0;
+        for (int i = 0; i < nfrm; i++)
+        {
+            if (f0[i] <= 0) continue; // 無声フレームはeenv未使用
+            
+            var frame = Llsm.GetFrame(chunk, i);
+            var nmPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_NM);
+            if (nmPtr == IntPtr.Zero) continue;
+            
+            var nm = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nmPtr);
+            if (nm.eenv == IntPtr.Zero || nm.edc == IntPtr.Zero || nm.nchannel <= 0) continue;
+            
+            IntPtr[] eenvPtrs = new IntPtr[nm.nchannel];
+            Marshal.Copy(nm.eenv, eenvPtrs, 0, nm.nchannel);
+            float[] edc = new float[nm.nchannel];
+            Marshal.Copy(nm.edc, edc, 0, nm.nchannel);
+            
+            bool frameClamped = false;
+            for (int ch = 0; ch < nm.nchannel; ch++)
+            {
+                if (eenvPtrs[ch] == IntPtr.Zero) continue;
+                var eenv = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenvPtrs[ch]);
+                if (eenv.nhar <= 0 || eenv.ampl == IntPtr.Zero) continue;
+                
+                float[] ampl = new float[eenv.nhar];
+                Marshal.Copy(eenv.ampl, ampl, 0, eenv.nhar);
+                
+                float sum = 0;
+                for (int h = 0; h < eenv.nhar; h++)
+                    sum += MathF.Abs(ampl[h]);
+                
+                // 許容上限: edc（変調深度100%）。edcが非正なら変調は全て誤フィット
+                float limit = Math.Max(edc[ch], 0f);
+                if (sum > limit && sum > 0)
+                {
+                    float scale = limit / sum;
+                    for (int h = 0; h < eenv.nhar; h++)
+                        ampl[h] *= scale;
+                    Marshal.Copy(ampl, 0, eenv.ampl, eenv.nhar);
+                    frameClamped = true;
+                }
+            }
+            if (frameClamped) clampedCount++;
+        }
+        
+        if (clampedCount > 0)
+            Console.WriteLine($"  [Noise Model] Clamped eenv modulation depth on {clampedCount}/{nfrm} frames");
     }
     
     /// <summary>
@@ -2029,7 +2264,12 @@ class Program
             }
             else
             {
-                // 伸縮部: ストレッチ（末尾マージン分を除外）
+                // 伸縮部: 出力フレームを安定ソース範囲（末尾マージン除外）へ
+                // 「均一展開」する。各出力フレームは隣接ソースを滑らかに補間するため、
+                // フレームの固定（フリーズ）や過剰反復が起きず、
+                //   - フリーズ由来のフレームレート性バズ（200Hz固定トーン）
+                //   - 反復由来のマシンガンノイズ
+                // のいずれも回避できる。末尾の不安定フレームは範囲から除外して保護する。
                 srcPosFloat = (float)((double)consonantFrames + (double)(i - dstConsonantFrames) / dstStretchedFrames * effectiveStretchableFrames);
             }
             
@@ -2048,9 +2288,12 @@ class Program
             // ★トランジェント補間判定：元フレームのトランジェント状態を確認
             // トランジェント = スペクトル変化が大きい（子音アタック、破裂音など）
             // 定常状態 = スペクトルが安定（母音、子音内VC母音部分など）
+            // ※保護は子音部限定。伸縮部で適用すると、相対閾値（平均+2σ）の
+            // 誤検出フレームが最近傍コピー＝フリーズ反復され、フレームレート
+            // （200Hz）の段差変調＝ガラガラ声の原因になる（音源依存で発生）。
             bool isSrcTransient1 = (srcIdx1 < isTransient.Length && isTransient[srcIdx1]);
             bool isSrcTransient2 = (srcIdx2 < isTransient.Length && isTransient[srcIdx2]);
-            bool isTransientRegion = isSrcTransient1 || isSrcTransient2;
+            bool isTransientRegion = (isSrcTransient1 || isSrcTransient2) && isConsonant;
             
             // フレーム補間（トランジェント保護 + Chunk-level RPS）
             IntPtr newFramePtr;
@@ -2060,7 +2303,7 @@ class Program
                 var srcFrame = Llsm.GetFrame(srcChunk, srcIdx1);
                 var frameCopy = Llsm.CopyFrame(srcFrame);
                 newFramePtr = frameCopy;
-                AttachRandomNearbyPsdres(newFramePtr, srcChunk, srcIdx1, srcNfrm, i);
+                // AttachRandomNearbyPsdres(newFramePtr, srcChunk, srcIdx1, srcNfrm, i);  // 周期ノイズ原因のため無効化
             }
             else if (ratio > 0.99f)
             {
@@ -2068,7 +2311,7 @@ class Program
                 var srcFrame = Llsm.GetFrame(srcChunk, srcIdx2);
                 var frameCopy = Llsm.CopyFrame(srcFrame);
                 newFramePtr = frameCopy;
-                AttachRandomNearbyPsdres(newFramePtr, srcChunk, srcIdx2, srcNfrm, i);
+                // AttachRandomNearbyPsdres(newFramePtr, srcChunk, srcIdx2, srcNfrm, i);  // 周期ノイズ原因のため無効化
             }
             else
             {
@@ -2083,7 +2326,7 @@ class Program
                     int nearestIdx = (ratio < 0.5f) ? srcIdx1 : srcIdx2;
                     var nearestFrame = Llsm.GetFrame(srcChunk, nearestIdx);
                     newFramePtr = Llsm.CopyFrame(nearestFrame);
-                    AttachRandomNearbyPsdres(newFramePtr, srcChunk, nearestIdx, srcNfrm, i);
+                    // AttachRandomNearbyPsdres(newFramePtr, srcChunk, nearestIdx, srcNfrm, i);  // 周期ノイズ原因のため無効化
                 }
                 else
                 {
@@ -2113,7 +2356,7 @@ class Program
                         newFramePtr = InterpolateFrame(srcFrame1, srcFrame2, ratio, i);
                     }
                     
-                    AttachRandomNearbyPsdres(newFramePtr, srcChunk, srcIdx1, srcNfrm, i);
+                    // AttachRandomNearbyPsdres(newFramePtr, srcChunk, srcIdx1, srcNfrm, i);  // 周期ノイズ原因のため無効化
                 }
             }
             
@@ -2130,7 +2373,7 @@ class Program
             // 息成分（breathiness）を適用
             if (breathiness != 50)
             {
-                ApplyBreathiness(newFrameRef, breathiness);
+                ApplyBreathiness(newFrameRef, breathiness, i);
             }
             
             if (originalF0 > 0)
@@ -2616,7 +2859,8 @@ class Program
                                             !isTransient[nearestSrc];
             
             // トランジェント判定: 現在または隣接フレームがトランジェントなら保護
-            bool isTransientRegion = isTransient[srcIdx0] || isTransient[srcIdx1];
+            // ※子音部限定。伸縮部での最近傍コピーはフリーズ反復＝ガラガラ声の原因。
+            bool isTransientRegion = (isTransient[srcIdx0] || isTransient[srcIdx1]) && isConsonant;
             
             IntPtr newFramePtr;
             
@@ -2655,7 +2899,7 @@ class Program
                     newFramePtr = InterpolateFrame(frame0Ref, frame1Ref, ratio, i);
                 }
                 
-                AttachRandomNearbyPsdres(newFramePtr, srcChunk, srcIdx0, srcNfrm, i);
+                // AttachRandomNearbyPsdres(newFramePtr, srcChunk, srcIdx0, srcNfrm, i);  // 周期ノイズ原因のため無効化
             }
             
             var newFrameRef = new ContainerRef(newFramePtr);
@@ -5062,8 +5306,9 @@ class Program
     /// 息成分（breathiness）をフレームのノイズモデル（NM）に適用
     /// UTAU仕様: 0=息なし（クリアな声）、50=標準、100=ささやき（息成分2倍）
     /// dB単位でスケーリングして自然な変化を実現
+    /// outFrameIdx >= 0 のとき「生感」変動を付加する
     /// </summary>
-    static void ApplyBreathiness(ContainerRef frame, int breathiness)
+    static void ApplyBreathiness(ContainerRef frame, int breathiness, int outFrameIdx = -1)
     {
         if (breathiness == 50) return;  // 標準値（デフォルト）ならスキップ
         
@@ -5081,25 +5326,6 @@ class Program
             voiceAttenuation = ratio * 6.0f;
         }
         
-        var vtmagnPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
-        if (vtmagnPtr != IntPtr.Zero)
-        {
-            int vtmagnSize = NativeLLSM.llsm_fparray_length(vtmagnPtr);
-            if (vtmagnSize > 0)
-            {
-                float[] magnitudes = new float[vtmagnSize];
-                Marshal.Copy(vtmagnPtr, magnitudes, 0, vtmagnSize);
-                
-                for (int i = 0; i < vtmagnSize; i++)
-                {
-                    magnitudes[i] -= voiceAttenuation;
-                    magnitudes[i] = Math.Max(-120f, magnitudes[i]);  // 下限-120dB
-                }
-                
-                Marshal.Copy(magnitudes, 0, vtmagnPtr, vtmagnSize);
-            }
-        }
-        
         // 2. ノイズ成分（NM）を増幅
         // B100で+12dB、B0で-6dB
         float noiseGain = ratio * 12.0f;  // B100で+12dB
@@ -5108,12 +5334,74 @@ class Program
             noiseGain = ratio * 6.0f;
         }
         
+        // ★性能: NM構造体を先に取得し、フォルマント結合に必要な npsd を確定する。
+        // これにより VTMAGN処理時点で偏差配列を直接計算でき、
+        // 減衰前形状の大きなクローン（フレーム毎の vtShapeOrig）を廃止できる。
         var nmPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_NM);
-        if (nmPtr != IntPtr.Zero)
+        bool hasNm = nmPtr != IntPtr.Zero;
+        NativeLLSM.llsm_nmframe nm = default;
+        int npsd = 0;
+        if (hasNm)
         {
-            var nm = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nmPtr);
-            
+            nm = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nmPtr);
+            if (nm.psd != IntPtr.Zero) npsd = nm.npsd;
+        }
+        
+        // 1. 声成分（VTMAGN）を減衰
+        // ★B: ノイズのフォルマント結合用の偏差を、減衰前の magnitudes から直接計算する
+        //     （クローン不要 = フレーム毎のGC負荷を削減）。
+        var vtmagnPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+        float[] formantDeviation = null;
+        if (vtmagnPtr != IntPtr.Zero)
+        {
+            int vtmagnSize = NativeLLSM.llsm_fparray_length(vtmagnPtr);
+            if (vtmagnSize > 0)
+            {
+                float[] magnitudes = new float[vtmagnSize];
+                Marshal.Copy(vtmagnPtr, magnitudes, 0, vtmagnSize);
+                
+                // ★B: 減衰をかける前のフォルマント形状（平均からの偏差）を
+                // PSDの周波数軸にリサンプルして転写用に保持。息が母音の音色を帯び、
+                // 「息が営る」自然さを生む。
+                if (ratio > 0 && npsd > 1 && vtmagnSize > 1)
+                {
+                    formantDeviation = new float[npsd];
+                    // 声道包絡の平均レベル（クランプ域を除外）
+                    float vtMean = 0f;
+                    int vtCount = 0;
+                    for (int j = 0; j < vtmagnSize; j++)
+                    {
+                        if (magnitudes[j] > VtmagnFloorDb + 1f) { vtMean += magnitudes[j]; vtCount++; }
+                    }
+                    vtMean = vtCount > 0 ? vtMean / vtCount : 0f;
+                    
+                    for (int i = 0; i < npsd; i++)
+                    {
+                        // PSDビン i を VTMAGN軸にマッピング（両者とも 0〜Nyquist 線形）
+                        float fpos = (float)i / (npsd - 1) * (vtmagnSize - 1);
+                        int vi = (int)fpos;
+                        float vfrac = fpos - vi;
+                        int vi2 = Math.Min(vi + 1, vtmagnSize - 1);
+                        float vtVal = magnitudes[vi] * (1f - vfrac) + magnitudes[vi2] * vfrac;
+                        // 平均からの偏差（フォルマント山=正、谷=負）
+                        formantDeviation[i] = Math.Clamp(vtVal - vtMean, -18f, 18f);
+                    }
+                }
+                
+                for (int i = 0; i < vtmagnSize; i++)
+                {
+                    magnitudes[i] -= voiceAttenuation;
+                    magnitudes[i] = Math.Max(VtmagnFloorDb, magnitudes[i]);  // フロア統一
+                }
+                
+                Marshal.Copy(magnitudes, 0, vtmagnPtr, vtmagnSize);
+            }
+        }
+        
+        if (hasNm)
+        {
             // PSD（パワースペクトル密度）を増幅
+            // 高域重み付き: 実際の息成分は中高域（2kHz〜）に集中している
             if (nm.psd != IntPtr.Zero && nm.npsd > 0)
             {
                 float[] psd = new float[nm.npsd];
@@ -5121,8 +5409,36 @@ class Program
                 
                 for (int i = 0; i < nm.npsd; i++)
                 {
-                    psd[i] += noiseGain;
+                    // 低域(0)→1.0x、高域(1)→1.5x の周波数重み
+                    float freqRatio = (float)i / (nm.npsd - 1);
+                    float freqWeight = 1.0f + freqRatio * 0.5f;
+                    psd[i] += noiseGain * freqWeight;
+                    
+                    // ★B: フォルマント形状を息成分に転写
+                    // 結合強度は ratio に比例（B100で最大25%）。低域より中高域で強く出す
+                    // （息のフォルマントは主に第2・第3フォルマント以上で知覚される）
+                    if (formantDeviation != null)
+                    {
+                        float couplingWeight = 0.15f + freqRatio * 0.20f;  // 0.15x(DC)〜0.35x(Nyquist)
+                        psd[i] += formantDeviation[i] * couplingWeight * ratio;
+                    }
+                    
+                    // ★C: エアバンド・シェルフ（高域0.75以上に空気感を付加）
+                    // 実声の息に含まれる 8〜16kHz 帯の「抜け」を再現
+                    if (ratio > 0 && freqRatio > 0.75f)
+                    {
+                        float airShelf = (freqRatio - 0.75f) / 0.25f * 4.0f * ratio;  // 0〜4dB×ratio
+                        psd[i] += airShelf;
+                    }
+                    
                     psd[i] = Math.Max(-120f, psd[i]);  // 下限-120dB
+                }
+                
+                // ★生感: breathiness > 50 かつフレームインデックスが与えられている場合
+                // 実声の息特有の時間・周波数変動を追加して有機的な質感を付与
+                if (outFrameIdx >= 0 && ratio > 0)
+                {
+                    ApplyOrganicBreathTexture(psd, nm.npsd, outFrameIdx, ratio);
                 }
                 
                 Marshal.Copy(psd, 0, nm.psd, nm.npsd);
@@ -5142,6 +5458,112 @@ class Program
                 
                 Marshal.Copy(edc, 0, nm.edc, nm.nchannel);
             }
+            
+            // ★A: eenv（ノイズ時間包絡）サイクルジッター
+            // 実声の気息ノイズはサイクルごとに振幅が不規則に揺れる。
+            // eenvの調波振幅にチャンネル・フレーム毎のジッターを与えて
+            // 「ザラつき・揺らぎ」= 生感を付加する。
+            if (outFrameIdx >= 0 && ratio > 0 && nm.eenv != IntPtr.Zero && nm.nchannel > 0)
+            {
+                IntPtr[] eenvPtrs = new IntPtr[nm.nchannel];
+                Marshal.Copy(nm.eenv, eenvPtrs, 0, nm.nchannel);
+                
+                // ジッター幅: B100で±15%、B75で±7.5%
+                float jitterDepth = 0.15f * ratio;
+                
+                for (int ch = 0; ch < nm.nchannel; ch++)
+                {
+                    if (eenvPtrs[ch] == IntPtr.Zero) continue;
+                    var eenv = Marshal.PtrToStructure<NativeLLSM.llsm_hmframe>(eenvPtrs[ch]);
+                    if (eenv.nhar <= 0 || eenv.ampl == IntPtr.Zero) continue;
+                    
+                    float[] ampl = new float[eenv.nhar];
+                    Marshal.Copy(eenv.ampl, ampl, 0, eenv.nhar);
+                    
+                    // チャンネル毎に独立したジッター（帯域間非同期）
+                    // フレームとチャンネルでハッシュし、サイクル毎の揺れを生成
+                    float chJitter = HashNoise(outFrameIdx, 5000 + ch) * 2f;  // -1〜1
+                    float scale = 1f + chJitter * jitterDepth;
+                    scale = Math.Clamp(scale, 0.5f, 1.6f);
+                    
+                    for (int h = 0; h < eenv.nhar; h++)
+                        ampl[h] *= scale;
+                    
+                    Marshal.Copy(ampl, 0, eenv.ampl, eenv.nhar);
+                }
+            }
+        }
+    }
+    
+    /// <summary>
+    /// 息成分に「生感」を付与するNM PSD変調。
+    /// 実声の息には以下の特徴があり、それを模擬する：
+    ///   1. 全体振幅の低周波ゆらぎ（~1〜3Hz相当）
+    ///   2. 周波数帯域ごとに独立した速い変動（乱流の帯域依存性）
+    ///   3. 中高域への確率的なエネルギー集中バースト（声帯境界付近の乱流）
+    /// すべて決定論的ハッシュノイズを使用するため毎回同じ出力になる。
+    /// </summary>
+    static void ApplyOrganicBreathTexture(float[] psd, int npsd, int outFrameIdx, float strength)
+    {
+        // ─── 1. 全体振幅の低周波揺らぎ（10フレーム=50msのノット間隔 → ~1Hz周期）
+        const int slowKnotInterval = 10;
+        int slowKnot0 = outFrameIdx / slowKnotInterval;
+        float slowT = (float)(outFrameIdx % slowKnotInterval) / slowKnotInterval;
+        float slowBlend = (1f - MathF.Cos(slowT * MathF.PI)) * 0.5f;
+        float globalAm = (HashNoise(slowKnot0, 7777) * (1f - slowBlend)
+                        + HashNoise(slowKnot0 + 1, 7777) * slowBlend) * 2.5f * strength;
+        // globalAm: ±2.5dB × strength の揺らぎ
+        
+        // ─── 2. 4帯域独立変動（4フレーム=20msのノット間隔 → ~5Hz周期）
+        // 各帯域が独立したシードを持つため、帯域間は非同期に変動する
+        const int fastKnotInterval = 4;
+        int fastKnot0 = outFrameIdx / fastKnotInterval;
+        float fastT = (float)(outFrameIdx % fastKnotInterval) / fastKnotInterval;
+        float fastBlend = (1f - MathF.Cos(fastT * MathF.PI)) * 0.5f;
+        
+        const int nBands = 4;
+        float[] bandGain = new float[nBands];
+        for (int b = 0; b < nBands; b++)
+        {
+            float n0 = HashNoise(fastKnot0,     8000 + b);
+            float n1 = HashNoise(fastKnot0 + 1, 8000 + b);
+            bandGain[b] = (n0 * (1f - fastBlend) + n1 * fastBlend) * 1.8f * strength;
+            // bandGain: ±1.8dB × strength の帯域別変動
+        }
+        
+        // ─── 3. 中高域への確率的バースト（約15フレーム=75msに1周期）
+        // 声帯境界付近の乱流が確率的に中高域のエネルギーを増加させる現象を模擬
+        float burstGain = 0f;
+        const int burstPeriod = 15;
+        int burstKnot = outFrameIdx / burstPeriod;
+        float burstT = (float)(outFrameIdx % burstPeriod) / burstPeriod;
+        float burstEnvelope = MathF.Sin(burstT * MathF.PI);  // 0→ピーク→0 の包絡
+        float burstBase = HashNoise(burstKnot, 9999) + 0.5f;  // 0〜1
+        if (burstBase > 0.6f)  // 約40%の周期でバースト発生
+        {
+            burstGain = burstEnvelope * ((burstBase - 0.6f) / 0.4f) * 3.5f * strength;
+            // 0〜3.5dB × strength のバースト
+        }
+        
+        // ─── 各ビンへ合成適用
+        for (int p = 0; p < npsd; p++)
+        {
+            float freqRatio = (float)p / (npsd - 1);  // 0(DC)〜1(Nyquist)
+            int band = Math.Min((int)(freqRatio * nBands), nBands - 1);
+            
+            // 高域ほど変動が大きい（乱流の周波数依存性: 高域は低域より変動しやすい）
+            float highWeight = 0.4f + freqRatio * 1.2f;  // 0.4x(DC)〜1.6x(Nyquist)
+            
+            float totalMod = (globalAm + bandGain[band]) * highWeight;
+            
+            // バーストは中高域（周波数比0.25以上）にのみ適用
+            if (freqRatio > 0.25f)
+            {
+                totalMod += burstGain * Math.Min(1f, (freqRatio - 0.25f) * 4f);
+            }
+            
+            psd[p] += totalMod;
+            psd[p] = Math.Max(-120f, psd[p]);
         }
     }
     
@@ -6302,9 +6724,13 @@ class Program
                 {
                     float frqIdx = frqStartFrame + (float)i * nhop / frqData.SamplesPerFrame;
                     int idx = (int)frqIdx;
+                    float frac = frqIdx - idx;
+                    int idx1 = Math.Min(idx + 1, frqData.F0Values.Length - 1);
                     if (idx >= 0 && idx < frqData.F0Values.Length)
                     {
-                        frqF0[i] = (float)frqData.F0Values[idx];
+                        float v0 = (float)frqData.F0Values[idx];
+                        float v1 = (float)frqData.F0Values[idx1];
+                        frqF0[i] = (v0 > 0 && v1 > 0) ? v0 * (1f - frac) + v1 * frac : v0;
                     }
                 }
                 
@@ -6831,10 +7257,13 @@ public static class Wav
         short blockAlign = (short)(numChannels * bitsPerSample / 8);
 
         var pcm = new short[samples.Length];
+        var rng = new Random(42);  // TPDFディザリング用（再現性确保のため固定シード）
         for (int i = 0; i < samples.Length; i++)
         {
             float s = MathF.Max(-1f, MathF.Min(1f, samples[i]));
-            pcm[i] = (short)MathF.Round(s * 32767f);
+            // TPDF（三角波形確率密度関数）ディザリング: 2つの一様乱数の和 → 第2モーメントノイズシェーピングでネガティブフィードバックエラーを除去
+            float tpdf = (float)(rng.NextDouble() - rng.NextDouble()) / 32768f;
+            pcm[i] = (short)MathF.Round(s * 32767f + tpdf);
         }
         int dataSize = pcm.Length * sizeof(short);
 
