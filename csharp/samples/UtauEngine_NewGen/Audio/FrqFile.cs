@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 
 namespace UtauEngineNg.Audio
 {
@@ -49,11 +50,24 @@ namespace UtauEngineNg.Audio
             using var fs = File.OpenRead(path);
             using var br = new BinaryReader(fs);
 
-            string header = new string(br.ReadChars(8));   // "FREQ0003"
+            string header = Encoding.ASCII.GetString(br.ReadBytes(8)); // "FREQ0003"
+            if (!header.StartsWith("FREQ", StringComparison.Ordinal))
+                throw new InvalidDataException($"Not a FRQ file: header='{header}'");
+
             int samplesPerFrame = br.ReadInt32();
             double averageF0 = br.ReadDouble();
             br.ReadBytes(16);                              // 予約領域
             int frameCount = br.ReadInt32();
+
+            if (samplesPerFrame <= 0)
+                throw new InvalidDataException($"Invalid FRQ: samplesPerFrame={samplesPerFrame}");
+            if (frameCount < 0)
+                throw new InvalidDataException($"Invalid FRQ: frameCount={frameCount}");
+
+            // 末尾が欠けた破損ファイルは読める分だけに切り詰める
+            long remaining = fs.Length - fs.Position;
+            int readable = (int)Math.Min(frameCount, remaining / 16);
+            frameCount = readable;
 
             var f0 = new double[frameCount];
             var ampl = new double[frameCount];

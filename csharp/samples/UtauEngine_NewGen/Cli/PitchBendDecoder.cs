@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 
 namespace UtauEngineNg.Cli
 {
@@ -15,10 +16,10 @@ namespace UtauEngineNg.Cli
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
         /// <summary>引数配列の startIndex 以降からテンポとピッチベンド列を取り出す。</summary>
-        public static (int tempo, List<int> pitchBend) ParseWithTempo(string[] args, int startIndex)
+        public static (float tempo, List<int> pitchBend) ParseWithTempo(string[] args, int startIndex)
         {
             var result = new List<int>();
-            int tempo = 120;
+            float tempo = 120f;
 
             for (int i = startIndex; i < args.Length; i++)
             {
@@ -27,7 +28,11 @@ namespace UtauEngineNg.Cli
 
                 if (arg.StartsWith("!", StringComparison.Ordinal))
                 {
-                    if (int.TryParse(arg.Substring(1), out int t)) tempo = t;
+                    // "!120.5" のような小数テンポも受理する（int パースだと黙って
+                    // 既定 120 になり PB グリッド全体のタイミングが狂う）
+                    if (float.TryParse(arg.Substring(1), NumberStyles.Float, CultureInfo.InvariantCulture, out float t)
+                        && float.IsFinite(t) && t > 0)
+                        tempo = t;
                     continue;
                 }
 

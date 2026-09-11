@@ -37,9 +37,12 @@ namespace UtauEngineNg.Pitch
                 }
                 else if (i == 1)
                 {
-                    float mMinus1 = 2f * m[0] - m[1];
-                    float w1 = MathF.Abs(m[1] - m[0]);
-                    float w2 = MathF.Abs(m[0] - mMinus1);
+                    // Akima 標準式: w1=|m[i+1]-m[i]|, w2=|m[i-1]-m[i-2]|。
+                    // ゴースト点 m[-1]=2m0-m1 により w2=|m1-m0|。旧実装は w1 にも
+                    // |m1-m0| を使っており常に単純平均へ退化（アタック部のオーバー
+                    // シュート抑制が無効化）していた。
+                    float w1 = n >= 4 ? MathF.Abs(m[2] - m[1]) : MathF.Abs(m[1] - m[0]);
+                    float w2 = MathF.Abs(m[1] - m[0]);
                     s[i] = (w1 + w2 > 1e-10f) ? (w1 * m[0] + w2 * m[1]) / (w1 + w2) : (m[0] + m[1]) * 0.5f;
                 }
                 else if (i >= n - 2)
@@ -50,9 +53,12 @@ namespace UtauEngineNg.Pitch
                     }
                     else
                     {
+                        // この分岐に来るのは i>=2（i==1 は上で処理済み）。
+                        // ゴースト点由来の w1=|m[n-2]-m[n-3]| に対し、w2 は正規の
+                        // |m[i-1]-m[i-2]|（旧実装は |m[i]-m[i-1]| で w1 と同値になり退化）。
                         float mPlus1 = 2f * m[n - 2] - m[n - 3];
                         float w1 = MathF.Abs(mPlus1 - m[i]);
-                        float w2 = MathF.Abs(m[i] - m[i - 1]);
+                        float w2 = MathF.Abs(m[i - 1] - m[i - 2]);
                         s[i] = (w1 + w2 > 1e-10f) ? (w1 * m[i - 1] + w2 * m[i]) / (w1 + w2) : (m[i - 1] + m[i]) * 0.5f;
                     }
                 }
@@ -75,7 +81,9 @@ namespace UtauEngineNg.Pitch
                 float t0 = utauT[index];
                 float t1 = utauT[index + 1];
                 float h = t1 - t0;
-                float u = (t - t0) / h;
+                // 最終ノットを超えた分は Hermite 外挿せず端値をホールド（u>1 の三次
+                // 外挿は末尾数フレームでオーバーシュートする）
+                float u = Math.Clamp((t - t0) / h, 0f, 1f);
                 float u2 = u * u;
                 float u3 = u2 * u;
 

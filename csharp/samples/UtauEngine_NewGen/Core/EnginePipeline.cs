@@ -32,12 +32,20 @@ namespace UtauEngineNg.Core
             using var _ = _diag.Profiler.Measure("total");
 
             log.Info(Stage, $"Input={Path.GetFileName(args.InputWav)} Pitch={args.PitchName}({args.TargetF0:F1}Hz) Vel={args.Velocity} Flags='{args.Flags}'");
+            if (args.ParsedFlags.DiagDisable != 0)
+                log.Info(Stage, $"N{args.ParsedFlags.DiagDisable}: diag disable -" +
+                    (args.ParsedFlags.DisableVsphseExtension ? " vsphse-ext" : "") +
+                    (args.ParsedFlags.DisableVsphseSmoother ? " smoother" : "") +
+                    (args.ParsedFlags.DisableResidualCorrection ? " residual" : "") +
+                    (args.ParsedFlags.DisableEenvClamp ? " eenv-clamp" : ""));
 
             // 1. WAV 読み込み
             var (samples, fs) = WavIo.ReadMono(args.InputWav);
             log.Debug(Stage, $"WAV {samples.Length} samples @ {fs}Hz ({samples.Length / (float)fs * 1000:F1}ms)");
 
-            // 2. FRQ 読み込み（"foo.wav.frq" → "foo_wav.frq" の順に探索）
+            // 2. 周波数表の読み込み
+            //    ニューラル表 (*.frq.l2r) があれば優先。なければ従来の .frq。
+            L2rF0Data? neuralF0 = TryLoadL2rTable(args.InputWav, samples, log);
             FrqData? frqData = TryLoadFrq(args.InputWav, log);
 
             // 3. 区間切り出し（offset / cutoff / consonant）
@@ -52,21 +60,25 @@ namespace UtauEngineNg.Core
             Array.Copy(samples, seg.StartSample, segment, 0, seg.TotalLength);
             log.Debug(Stage, $"Segment {seg.TotalLength} samples ({seg.TotalLength / (float)fs * 1000:F1}ms), consonant {seg.ConsonantSamples} samples");
 
-            int nhop = (int)(ThopSeconds * fs);
+            int nhop = Math.Max(1, (int)MathF.Round(ThopSeconds * fs));
+            // 実サンプルホップと完全に一致した thop を下流へ渡す。5ms ちょうどを渡すと
+            // 44.1kHz では nhop=220(4.9887ms) との差が累積し、約 2.2 秒で F0 系列と
+            // 解析フレームが 1 フレーム分ドリフトする。
+            float thopSec = nhop / (float)fs;
 
             // 4. F0 推定
             F0Result f0Result;
             using (_diag.Profiler.Measure("f0_estimate"))
                 f0Result = new F0Provider(_diag).Estimate(
-                    segment, fs, nhop, ThopSeconds, frqData, seg.OffsetSamples, seg.TotalLength, args.TargetF0, args.ParsedFlags);
+                    segment, fs, nhop, thopSec, frqData, seg.OffsetSamples, seg.TotalLength, args.TargetF0, args.ParsedFlags, neuralF0);
             float[] f0 = f0Result.F0;
-            _diag.Dump.DumpF0("f0_final", f0, ThopSeconds);
+            _diag.Dump.DumpF0("f0_final", f0, thopSec);
 
             // 5. LLSM 解析（2x オーバーサンプリング）
             AnalysisResult analysis;
             using (_diag.Profiler.Measure("analyze"))
-                analysis = new Analyzer(_diag).Analyze(segment, fs, f0, ThopSeconds, f0Result.SrcF0, args.ParsedFlags);
-            var chunk = analysis.Chunk;
+                analysis = new Analyzer(_diag).Analyze(segment, fs, f0, thopSec, f0Result.SrcF0, args.ParsedFlags);
+            using var chunk = analysis.Chunk; // 解析チャンクは Run 完了時に確定的に解放
             int nfrm = analysis.NumFrames;
             float actualThop = analysis.ThopSeconds;
 
@@ -94,10 +106,14 @@ namespace UtauEngineNg.Core
             // 8. HNR 改善（D フラグ、Layer0/HM が存在する解析直後の状態で）
             new HnrEffect(args.ParsedFlags.HnrEnhancement, log).Apply(chunk, nfrm, fs);
 
+            // 8.5 高域ハイブリッド励振（Y フラグ・試験実装、HM が存在する Layer1 変換前に）
+            new HybridExcitationEffect(args.ParsedFlags.HybridExcitation, log).Apply(chunk, nfrm, fs);
+
             // 9. 合成
             var sp = SynthesisParams.FromFlags(
                 args.ParsedFlags, srcF0, args.TargetF0, new System.Collections.Generic.List<int>(args.PitchBend),
-                args.Tempo, consonantFrames, consonantStretch, stretchRatio, actualThop, overlapMs, args.Modulation);
+                args.Tempo, consonantFrames, consonantStretch, stretchRatio, actualThop, overlapMs, args.Modulation,
+                f0Result.Micro);
 
             SynthesisResult synth;
             using (_diag.Profiler.Measure("synthesize"))
@@ -109,7 +125,7 @@ namespace UtauEngineNg.Core
                 output, segment, f0, fs, seg.ConsonantSamples, consonantFrames, consonantStretch, actualThop,
                 args.ParsedFlags.ConsonantBlend, synth.Sinusoid, synth.Noise, log);
 
-            // 11. 後処理（ボリューム・正規化）
+            // 11. 後処理（基準レベル正規化・ボリューム・ピークリミット）
             PostProcessor.Apply(output, args.Volume, log);
 
             // 12. 書き出し
@@ -128,6 +144,45 @@ namespace UtauEngineNg.Core
             var frq = FrqFile.TryRead(path);
             if (frq != null) log.Debug(Stage, $"FRQ loaded: {Path.GetFileName(path)} ({frq.F0Values.Length} frames, avg {frq.AverageF0:F1}Hz)");
             return frq;
+        }
+
+        /// <summary>
+        /// ニューラル周波数表 (*.frq.l2r) を読む。原音と一致しない古い表を掴まないよう
+        /// サンプル数とハッシュを検証し、不一致なら黙って FRQ / PYIN へフォールバックする。
+        /// L2R_NOL2R=1 で強制無効化（代替手段との A/B 用）。
+        /// </summary>
+        private static L2rF0Data? TryLoadL2rTable(string inputWav, float[] samples, ILogger log)
+        {
+            if (Environment.GetEnvironmentVariable("L2R_NOL2R") == "1") return null;
+
+            string path = L2rF0File.PathFor(inputWav);
+            if (!File.Exists(path))
+            {
+                string alt = inputWav + L2rF0File.Extension;
+                if (!File.Exists(alt)) return null;
+                path = alt;
+            }
+
+            var table = L2rF0File.TryRead(path);
+            if (table == null || !table.HasData)
+            {
+                log.Warn(Stage, $"L2R table unreadable, ignoring: {Path.GetFileName(path)}");
+                return null;
+            }
+            if (table.SourceSamples != samples.Length)
+            {
+                log.Warn(Stage, $"L2R table stale (samples {table.SourceSamples} != {samples.Length}), ignoring");
+                return null;
+            }
+            if (table.SourceHash != L2rF0File.ComputeHash(samples))
+            {
+                log.Warn(Stage, "L2R table stale (hash mismatch), ignoring");
+                return null;
+            }
+
+            log.Debug(Stage, $"L2R table loaded: {Path.GetFileName(path)} " +
+                             $"({table.FrameCount} frames @ {table.HopSeconds * 1000:F1}ms, model={table.Model})");
+            return table;
         }
 
         private static float ComputeStretchRatio(float lengthReq, int consonantFrames, int stretchableFrames, float actualThop, float consonantStretch)

@@ -185,9 +185,10 @@ namespace UtauEngineNg.Llsm
             for (int i = 0; i < dstNfrm; i++)
             {
                 if (dstF0[i] <= 0) continue;
-                if (distToBoundary[i] >= fadeRadius) continue;
+                if (distToBoundary[i] > fadeRadius) continue;
 
-                float fadeScale = Math.Max(0.5f, (float)(distToBoundary[i] + 1) / (fadeRadius + 1));
+                // 境界(dist=0)で 50%、radius の外で 100% へ漸増する実ランプ
+                float fadeScale = 0.5f + 0.5f * distToBoundary[i] / (fadeRadius + 1f);
                 var nm = FrameAccess.TryGetNm(LlsmBindings.Llsm.GetFrame(chunk, i));
                 if (nm is not { HasEenv: true } nmv) continue;
 

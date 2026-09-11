@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace UtauEngineNg.Cli
@@ -61,6 +62,23 @@ namespace UtauEngineNg.Cli
         public int ConsonantBlend { get; }
         /// <summary>D: HNR 改善強度（1-100、0=オフ）。</summary>
         public int HnrEnhancement { get; }
+        /// <summary>J: マイクロプロソディ深度（原音由来ジッター/シマーの転写量、0-100、未指定=0=オフ）。</summary>
+        public int Jitter { get; }
+        /// <summary>Y: 高域ハイブリッド励振（試験）。高域倍音をピッチ同期ノイズへ再配分（1-100、0=オフ）。</summary>
+        public int HybridExcitation { get; }
+        /// <summary>Q: 動的声質カーブ（試験）。音高・ノート内位置に Rd/明るさ/息を連動（1-100、0=オフ）。</summary>
+        public int VoiceQuality { get; }
+
+        /// <summary>
+        /// N: 診断用の機能無効化ビットマスク（アーティファクト切り分け用）。
+        /// N1=VSPHSE高域拡張off, N2=位相スムーザoff, N4=残差包絡補正off, N8=eenvクランプoff。
+        /// 合算可（例 N3 = 拡張+スムーザoff）。環境変数トグル（L2R_VSEXT等）と OR で効く。
+        /// </summary>
+        public int DiagDisable { get; }
+        public bool DisableVsphseExtension => (DiagDisable & 1) != 0;
+        public bool DisableVsphseSmoother => (DiagDisable & 2) != 0;
+        public bool DisableResidualCorrection => (DiagDisable & 4) != 0;
+        public bool DisableEenvClamp => (DiagDisable & 8) != 0;
 
         public FlagSet(string? flags)
         {
@@ -80,35 +98,50 @@ namespace UtauEngineNg.Cli
             FixedAmplitudeRatio = HasChar('X');
             F0Boundary = Has("V");
             ModulationPlus = Raw.Contains("M+", StringComparison.Ordinal)
-                          || Raw.Contains("M1", StringComparison.OrdinalIgnoreCase);
+                          || Raw.Contains("M1", StringComparison.Ordinal);
 
-            Breathiness = Num(@"B(\d+)", ignoreCase: true, def: 50, lo: 0, hi: 100);
-            GenderFactor = Num(@"g([+-]?\d+)", ignoreCase: false, def: 0, lo: -100, hi: 100);
-            FormantFollow = Num(@"F(\d+)", ignoreCase: true, def: 100, lo: 0, hi: 100);
-            UnvoicedAttenuation = OptNum(@"U(\d+)", ignoreCase: true, lo: 6, hi: 20);
-            SpectralTilt = Num(@"T([+-]?\d+)", ignoreCase: true, def: 0, lo: -12, hi: 12);
-            GrowlStrength = OptNum(@"G(\d+)", ignoreCase: false, lo: 1, hi: 100);
-            GlottalClosure = Num(@"K(\d+)", ignoreCase: true, def: 50, lo: 0, hi: 100);
-            ConsonantBlend = OptNum(@"C(\d+)", ignoreCase: false, lo: 1, hi: 100);
-            HnrEnhancement = OptNum(@"D(\d+)", ignoreCase: false, lo: 1, hi: 100);
+            Breathiness = Num(@"B(\d+)", def: 50, lo: 0, hi: 100);
+            GenderFactor = Num(@"g([+-]?\d+)", def: 0, lo: -100, hi: 100);
+            FormantFollow = Num(@"F(\d+)", def: 100, lo: 0, hi: 100);
+            UnvoicedAttenuation = OptNum(@"U(\d+)", lo: 6, hi: 20);
+            SpectralTilt = Num(@"T([+-]?\d+)", def: 0, lo: -12, hi: 12);
+            GrowlStrength = OptNum(@"G(\d+)", lo: 1, hi: 100);
+            GlottalClosure = Num(@"K(\d+)", def: 50, lo: 0, hi: 100);
+            ConsonantBlend = OptNum(@"C(\d+)", lo: 1, hi: 100);
+            HnrEnhancement = OptNum(@"D(\d+)", lo: 1, hi: 100);
+            Jitter = Num(@"J(\d+)", def: 0, lo: 0, hi: 100);
+            HybridExcitation = OptNum(@"Y(\d+)", lo: 1, hi: 100);
+            VoiceQuality = OptNum(@"Q(\d+)", lo: 1, hi: 100);
+            DiagDisable = Num(@"N(\d+)", def: 0, lo: 0, hi: 15);
         }
 
-        private bool Has(string token) => Raw.Contains(token, StringComparison.OrdinalIgnoreCase);
-        private bool HasChar(char c) => Raw.Contains(c, StringComparison.OrdinalIgnoreCase);
+        // UTAU フラグは大文字小文字が意味を持つ（e=弾性ストレッチ / E=FRQ直用 など）ため
+        // 常に厳密一致で照合する。ignore-case だと対のフラグが相互に誤発動し、
+        // 他エンジン向けフラグ（Mt-50 等）の数値も誤って拾ってしまう。
+        // さらに bool フラグは「直後に数字が続かない」場合のみ真とする — 他エンジンの
+        // 数値付きフラグ（tn_fnds/moresampler の P86 等）を bool として誤発動させない。
+        private bool Has(string token) =>
+            Regex.IsMatch(Raw, Regex.Escape(token) + @"(?!\d)");
+        private bool HasChar(char c) => Has(c.ToString());
 
-        private int Num(string pattern, bool ignoreCase, int def, int lo, int hi)
+        private int Num(string pattern, int def, int lo, int hi)
         {
-            var m = Regex.Match(Raw, pattern, ignoreCase ? RegexOptions.IgnoreCase : RegexOptions.None);
+            var m = Regex.Match(Raw, pattern);
             if (!m.Success) return def;
-            return Math.Clamp(int.Parse(m.Groups[1].Value), lo, hi);
+            // 桁あふれでも例外にせずクランプ／既定値へ（B99999999999 等の混入対策）
+            return long.TryParse(m.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v)
+                ? (int)Math.Clamp(v, lo, hi)
+                : def;
         }
 
         /// <summary>マッチしないとき 0（オフ）を返す数値フラグ。</summary>
-        private int OptNum(string pattern, bool ignoreCase, int lo, int hi)
+        private int OptNum(string pattern, int lo, int hi)
         {
-            var m = Regex.Match(Raw, pattern, ignoreCase ? RegexOptions.IgnoreCase : RegexOptions.None);
+            var m = Regex.Match(Raw, pattern);
             if (!m.Success) return 0;
-            return Math.Clamp(int.Parse(m.Groups[1].Value), lo, hi);
+            return long.TryParse(m.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v)
+                ? (int)Math.Clamp(v, lo, hi)
+                : 0;
         }
     }
 }

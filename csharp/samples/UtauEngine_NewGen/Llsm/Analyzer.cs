@@ -79,12 +79,19 @@ namespace UtauEngineNg.Llsm
                 chunk = LlsmBindings.Llsm.Analyze(aopt, upsampled, analysisFs, f0, f0.Length);
 
             // eenv 変調深度クランプ（子音過渡の誤フィット抑制）
-            // L2R_EENVCLAMP=0 で無効化可能（切り分け用）
-            if (Environment.GetEnvironmentVariable("L2R_EENVCLAMP") != "0")
+            // N8 フラグ / L2R_EENVCLAMP=0 で無効化可能（切り分け用）
+            if (Environment.GetEnvironmentVariable("L2R_EENVCLAMP") != "0" && !flags.DisableEenvClamp)
             {
                 var nmProc = new NoiseModelProcessor(log);
                 nmProc.ClampEenvModulationDepth(chunk, f0, f0.Length);
             }
+
+            // 倍音振幅の原音直接再推定補正（実験的・既定OFF）: 等倍・同時刻比較の実測で
+            // llsm_analyze のHM振幅は原音と±1dB以内で一致することが確定したため不要。
+            // 過去に疑われた高域帯域欠損は時間圧縮比較と測定スクリプトのdB平均による
+            // アーティファクトだった。L2R_HARMFIX=1 の明示指定時のみ有効。
+            if (Environment.GetEnvironmentVariable("L2R_HARMFIX") == "1")
+                HarmonicRefinementCorrector.Apply(chunk, f0.Length, upsampled, analysisFs, thopSec, log);
 
             // 帯域エネルギー較正（実験的・既定OFF）: NM PSDブーストは帯域エネルギー数値こそ
             // 原音に近づくが、倍音をノイズで置き換えるため聴感はホワイトノイズ化する（実声で確認）。

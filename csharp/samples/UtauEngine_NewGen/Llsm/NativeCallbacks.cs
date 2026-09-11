@@ -7,66 +7,91 @@ namespace UtauEngineNg.Llsm
     /// <summary>
     /// LLSM コンテナへオブジェクトをアタッチする際に必要な、ネイティブ
     /// デストラクタ／コピーコンストラクタの関数ポインタを一元管理する。
-    /// デリゲートは GC されないよう static フィールドで保持する。
-    /// （UtauEngine に散在していた _deleteFp 等の関数ポインタ取得を集約＝改善）
+    /// ネイティブ DLL のエクスポートを直接参照する（マネージドデリゲートの
+    /// 逆サンクだと GC ファイナライザスレッド／プロセス終了時の
+    /// llsm_delete_chunk がマネージドコードへ再入し、ランタイム破棄中の
+    /// クラッシュ源になる）。
     /// </summary>
     public static class NativeCallbacks
     {
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void DeleteDelegate(IntPtr p);
+        private const string Kernel32 = "kernel32.dll";
 
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate IntPtr CopyDelegate(IntPtr p);
+        [DllImport(Kernel32, SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr LoadLibraryW(string lpLibFileName);
 
-        // GC 防止のためインスタンスを保持
-        private static readonly DeleteDelegate s_deleteFp = NativeLLSM.llsm_delete_fp;
-        private static readonly DeleteDelegate s_deleteFpArray = NativeLLSM.llsm_delete_fparray;
-        private static readonly DeleteDelegate s_deleteNm = NativeLLSM.llsm_delete_nmframe;
-        private static readonly CopyDelegate s_copyFpArray = NativeLLSM.llsm_copy_fparray;
-        private static readonly CopyDelegate s_copyNm = NativeLLSM.llsm_copy_nmframe;
-        private static readonly DeleteDelegate s_deleteInt = NativeLLSM.llsm_delete_int;
-        private static readonly CopyDelegate s_copyInt = NativeLLSM.llsm_copy_int;
-        private static readonly DeleteDelegate s_deletePbpEffect = NativeLLSM.llsm_delete_pbpeffect;
-        private static readonly CopyDelegate s_copyPbpEffect = NativeLLSM.llsm_copy_pbpeffect;
-        private static readonly DeleteDelegate s_deleteHm = NativeLLSM.llsm_delete_hmframe;
-        private static readonly CopyDelegate s_copyHm = NativeLLSM.llsm_copy_hmframe;
+        [DllImport(Kernel32, SetLastError = true)]
+        private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+        private static readonly IntPtr s_hLib;
+
+        static NativeCallbacks()
+        {
+            // 既に P/Invoke でロード済みの同一モジュール（参照カウント +1）
+            s_hLib = LoadLibraryW("libllsm2.dll");
+            if (s_hLib == IntPtr.Zero)
+                throw new DllNotFoundException("libllsm2.dll not loadable for callback exports");
+
+            IntPtr Get(string name)
+            {
+                var p = GetProcAddress(s_hLib, name);
+                if (p == IntPtr.Zero)
+                    throw new EntryPointNotFoundException($"libllsm2.dll: {name} not exported");
+                return p;
+            }
+
+            DeleteFp = Get("llsm_delete_fp");
+            CopyFp = Get("llsm_copy_fp");
+            DeleteFpArray = Get("llsm_delete_fparray");
+            CopyFpArray = Get("llsm_copy_fparray");
+            DeleteNm = Get("llsm_delete_nmframe");
+            CopyNm = Get("llsm_copy_nmframe");
+            DeleteInt = Get("llsm_delete_int");
+            CopyInt = Get("llsm_copy_int");
+            DeletePbpEffect = Get("llsm_delete_pbpeffect");
+            CopyPbpEffect = Get("llsm_copy_pbpeffect");
+            DeleteHm = Get("llsm_delete_hmframe");
+            CopyHm = Get("llsm_copy_hmframe");
+        }
 
         /// <summary>FP（単一 float）削除関数ポインタ。</summary>
-        public static IntPtr DeleteFp { get; } = Marshal.GetFunctionPointerForDelegate(s_deleteFp);
+        public static IntPtr DeleteFp { get; }
+        /// <summary>FP（単一 float）コピー関数ポインタ。</summary>
+        public static IntPtr CopyFp { get; }
         /// <summary>FP 配列 削除関数ポインタ。</summary>
-        public static IntPtr DeleteFpArray { get; } = Marshal.GetFunctionPointerForDelegate(s_deleteFpArray);
-        /// <summary>NM フレーム 削除関数ポインタ。</summary>
-        public static IntPtr DeleteNm { get; } = Marshal.GetFunctionPointerForDelegate(s_deleteNm);
+        public static IntPtr DeleteFpArray { get; }
         /// <summary>FP 配列 コピー関数ポインタ。</summary>
-        public static IntPtr CopyFpArray { get; } = Marshal.GetFunctionPointerForDelegate(s_copyFpArray);
+        public static IntPtr CopyFpArray { get; }
+        /// <summary>NM フレーム 削除関数ポインタ。</summary>
+        public static IntPtr DeleteNm { get; }
         /// <summary>NM フレーム コピー関数ポインタ。</summary>
-        public static IntPtr CopyNm { get; } = Marshal.GetFunctionPointerForDelegate(s_copyNm);
+        public static IntPtr CopyNm { get; }
         /// <summary>int 削除関数ポインタ。</summary>
-        public static IntPtr DeleteInt { get; } = Marshal.GetFunctionPointerForDelegate(s_deleteInt);
+        public static IntPtr DeleteInt { get; }
         /// <summary>int コピー関数ポインタ。</summary>
-        public static IntPtr CopyInt { get; } = Marshal.GetFunctionPointerForDelegate(s_copyInt);
+        public static IntPtr CopyInt { get; }
         /// <summary>PBP エフェクト 削除関数ポインタ。</summary>
-        public static IntPtr DeletePbpEffect { get; } = Marshal.GetFunctionPointerForDelegate(s_deletePbpEffect);
+        public static IntPtr DeletePbpEffect { get; }
         /// <summary>PBP エフェクト コピー関数ポインタ。</summary>
-        public static IntPtr CopyPbpEffect { get; } = Marshal.GetFunctionPointerForDelegate(s_copyPbpEffect);
-
+        public static IntPtr CopyPbpEffect { get; }
         /// <summary>HM フレーム 削除関数ポインタ。</summary>
-        public static IntPtr DeleteHm { get; } = Marshal.GetFunctionPointerForDelegate(s_deleteHm);
+        public static IntPtr DeleteHm { get; }
         /// <summary>HM フレーム コピー関数ポインタ。</summary>
-        public static IntPtr CopyHm { get; } = Marshal.GetFunctionPointerForDelegate(s_copyHm);
+        public static IntPtr CopyHm { get; }
 
         /// <summary>コンテナへ F0（単一 float）をアタッチする。</summary>
         public static void AttachF0(IntPtr container, float f0)
         {
             var p = NativeLLSM.llsm_create_fp(f0);
-            NativeLLSM.llsm_container_attach_(container, NativeLLSM.LLSM_FRAME_F0, p, DeleteFp, IntPtr.Zero);
+            // copyctor 必須: NULL だと llsm_copy_container がポインタをエイリアスし、
+            // コピー元の解放でコピー側が dangling になる（libllsm2 の契約違反）
+            NativeLLSM.llsm_container_attach_(container, NativeLLSM.LLSM_FRAME_F0, p, DeleteFp, CopyFp);
         }
 
         /// <summary>コンテナへ Rd（単一 float）をアタッチする。</summary>
         public static void AttachRd(IntPtr container, float rd)
         {
             var p = NativeLLSM.llsm_create_fp(rd);
-            NativeLLSM.llsm_container_attach_(container, NativeLLSM.LLSM_FRAME_RD, p, DeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(container, NativeLLSM.LLSM_FRAME_RD, p, DeleteFp, CopyFp);
         }
 
         /// <summary>コンテナへ float 配列を生成してアタッチする（VTMAGN/VSPHSE 等）。</summary>

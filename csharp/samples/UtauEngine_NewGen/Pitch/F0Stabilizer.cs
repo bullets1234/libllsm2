@@ -20,12 +20,13 @@ namespace UtauEngineNg.Pitch
         /// FRQ ピッチ + PYIN 有声/無声判定のハイブリッドマスク。
         /// ピッチ値は FRQ を維持しつつ、PYIN が無声と判定した区間を無声化し、
         /// 子音バーストのクリック化を防ぐ。Whisper 音源等で誤マスクが多い場合は自動スキップ。
+        /// <paramref name="f0Vuv"/> は事前計算した PYIN トラック
+        /// （マイクロプロソディ抽出と共用するため呼び出し側で解析する）。
         /// </summary>
         /// <returns>マスク・安定化を適用したか（false=自動フォールバックでスキップ）。</returns>
         public static bool ApplyPyinVuvMask(
-            float[] f0, float[] segment, int fs, int nhop, float thopSec, ILogger log)
+            float[] f0, float[] f0Vuv, float thopSec, ILogger log)
         {
-            var f0Vuv = Pyin.Analyze(segment, fs, nhop, 60, 800);
             int nMask = Math.Min(f0.Length, f0Vuv.Length);
 
             // 無声判定に ±10ms 相当の膨張をかける
@@ -136,7 +137,11 @@ namespace UtauEngineNg.Pitch
                         float orig = f0[runStart + j];
                         if (MathF.Abs(orig - runMedian) / runMedian > 0.20f)
                         {
-                            f0[runStart + j] = 0;
+                            // 無声化すると母音中に 1 フレームのノイズ穴（V/UV フリッカー→
+                            // クリック）が生じるため、局所メディアンで補間する。
+                            // 局所メディアン自体も外れている場合は区間中央値へフォールバック。
+                            f0[runStart + j] = MathF.Abs(med[j] - runMedian) / runMedian > 0.20f
+                                ? runMedian : med[j];
                             stabilized++;
                         }
                         else if (MathF.Abs(orig - med[j]) / med[j] > 0.03f)

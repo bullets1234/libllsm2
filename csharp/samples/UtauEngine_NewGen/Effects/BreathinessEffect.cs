@@ -87,7 +87,7 @@ namespace UtauEngineNg.Effects
 
                 for (int i = 0; i < nm.npsd; i++)
                 {
-                    float freqRatio = (float)i / (nm.npsd - 1);
+                    float freqRatio = (float)i / Math.Max(1, nm.npsd - 1); // npsd==1 の 0/0 防止
                     float freqWeight = 1.0f + freqRatio * 0.5f;
                     psd[i] += noiseGain * freqWeight;
 
@@ -181,7 +181,7 @@ namespace UtauEngineNg.Effects
 
             for (int p = 0; p < npsd; p++)
             {
-                float freqRatio = (float)p / (npsd - 1);
+                float freqRatio = (float)p / Math.Max(1, npsd - 1);
                 int band = Math.Min((int)(freqRatio * nBands), nBands - 1);
                 float highWeight = 0.4f + freqRatio * 1.2f;
                 float totalMod = (globalAm + bandGain[band]) * highWeight;

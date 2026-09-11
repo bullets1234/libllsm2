@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>l2rfrq</AssemblyName>
+    <RootNamespace>L2rFrqGen</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <PublishDir>publish\</PublishDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DirectML 版は CPU EP も同梱する。GPU はコマンドラインの gpu 指定時のみ有効化。 -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.19.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- WAV 入出力と表フォーマットはエンジンと 1 ソースを共有する（定義の二重管理を避ける） -->
+    <Compile Include="..\UtauEngine_NewGen\Audio\WavIo.cs" Link="Shared\WavIo.cs" />
+    <Compile Include="..\UtauEngine_NewGen\Audio\L2rF0File.cs" Link="Shared\L2rF0File.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- .onnx のみ。変換元の .pt (181MB) は実行に不要なのでコピーしない。 -->
+    <None Include="models\*.onnx" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- 音源フォルダをドラッグ＆ドロップで処理するためのランチャ -->
+    <None Include="l2rfrq-drop.bat" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

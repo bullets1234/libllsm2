@@ -23,7 +23,7 @@ namespace UtauEngineNg.Synthesis
         {
             if (blendStrength <= 0 || consonantSamples <= 0 || output.Length == 0) return;
 
-            int nhop = (int)(thopSeconds * fs);
+            int nhop = Math.Max(1, (int)MathF.Round(thopSeconds * fs));
             int dstConsonantFrames = (int)(consonantFrames * consonantStretch);
             int dstConsonantSamples = dstConsonantFrames * nhop;
             if (dstConsonantSamples <= 0 || dstConsonantSamples >= output.Length) return;
@@ -94,7 +94,8 @@ namespace UtauEngineNg.Synthesis
             for (int i = 0; i < blendEnd; i++)
             {
                 if (i >= adjustedConsonant.Length) break;
-                if (!IsUnvoiced(i, dstConsonantSamples, srcConsonantLen, nhop, f0)) continue;
+                float w = UnvoicedWeight(i, dstConsonantSamples, srcConsonantLen, nhop, f0);
+                if (w <= 0) continue;
 
                 float localBlend = blendRatio;
                 if (i >= crossfadeStart && crossfadeSamples > 0)
@@ -104,7 +105,9 @@ namespace UtauEngineNg.Synthesis
                 }
                 float origNoise = adjustedConsonant[i] * volumeMatch;
                 float blendedNoise = synthNoise[i] * (1.0f - localBlend) + origNoise * localBlend;
-                output[i] = synthSin[i] + blendedNoise;
+                // V/UV 遷移はフレーム間線形の無声度 w で置換量をランプさせ、階段状の
+                // 切り替え（クリック源）を防ぐ
+                output[i] = output[i] * (1.0f - w) + (synthSin[i] + blendedNoise) * w;
             }
         }
 
@@ -128,7 +131,8 @@ namespace UtauEngineNg.Synthesis
             {
                 if (i >= adjustedConsonant.Length) break;
                 float origSample = adjustedConsonant[i] * volumeMatch;
-                float localBlend = IsUnvoiced(i, dstConsonantSamples, srcConsonantLen, nhop, f0) ? blendRatio : 0.0f;
+                // V/UV 遷移をランプ化（無声度 w ∈ [0,1] を係数に乗算）
+                float localBlend = blendRatio * UnvoicedWeight(i, dstConsonantSamples, srcConsonantLen, nhop, f0);
                 if (i >= crossfadeStart && crossfadeSamples > 0)
                 {
                     float t = (float)(i - crossfadeStart) / crossfadeSamples;
@@ -138,11 +142,20 @@ namespace UtauEngineNg.Synthesis
             }
         }
 
-        private static bool IsUnvoiced(int i, int dstConsonantSamples, int srcConsonantLen, int nhop, float[] f0)
+        /// <summary>
+        /// サンプル位置の無声度 [0,1]。隣接フレームの V/UV を線形補間して返し、
+        /// 有声↔無声の切り替えを 1 フレーム（約 5ms）かけたランプにする。
+        /// </summary>
+        private static float UnvoicedWeight(int i, int dstConsonantSamples, int srcConsonantLen, int nhop, float[] f0)
         {
             float srcSamplePos = dstConsonantSamples > 0 ? (float)i / dstConsonantSamples * srcConsonantLen : i;
-            int frameIdx = Math.Clamp((int)(srcSamplePos / nhop), 0, f0.Length - 1);
-            return f0[frameIdx] <= 0;
+            float framePos = srcSamplePos / nhop;
+            int k0 = Math.Clamp((int)framePos, 0, f0.Length - 1);
+            int k1 = Math.Min(k0 + 1, f0.Length - 1);
+            float frac = Math.Clamp(framePos - k0, 0f, 1f);
+            float w0 = f0[k0] <= 0 ? 1f : 0f;
+            float w1 = f0[k1] <= 0 ? 1f : 0f;
+            return w0 + (w1 - w0) * frac;
         }
     }
 }

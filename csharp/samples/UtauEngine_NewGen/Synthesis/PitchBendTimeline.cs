@@ -14,17 +14,22 @@ namespace UtauEngineNg.Synthesis
         /// アンラップ済みピッチベンド（cents）を出力フレーム数 <paramref name="dstNfrm"/> に補間する。
         /// UTAU のピッチ時間軸（96 分音符単位 = 60/96/bpm 秒）を用いる。
         /// </summary>
-        public static float[] Interpolate(IReadOnlyList<int> unwrappedPb, int dstNfrm, int tempo, float thopSeconds)
+        public static float[] Interpolate(IReadOnlyList<int> unwrappedPb, int dstNfrm, float tempo, float thopSeconds)
         {
-            if (unwrappedPb.Count == 0) return Array.Empty<float>();
+            if (unwrappedPb.Count == 0 || dstNfrm <= 0) return Array.Empty<float>();
+            if (!float.IsFinite(tempo) || tempo <= 0) tempo = 120f;
 
             float outputDurationMs = dstNfrm * thopSeconds * 1000f;
             float utauPbIntervalMs = 60.0f / 96.0f / tempo * 1000f;
             int utauPbLength = (int)(outputDurationMs / utauPbIntervalMs) + 1;
 
+            // PB 列が出力より短い場合は最終値をホールドする。0 でパディングすると
+            // アンラップ済み値（±2048 超があり得る）から 1 PB 間隔で数十半音の
+            // ジャンプが注入され、ピッチスパイクになる。
+            float lastPb = unwrappedPb[^1];
             float[] paddedPb = new float[utauPbLength];
             for (int j = 0; j < utauPbLength; j++)
-                paddedPb[j] = j < unwrappedPb.Count ? unwrappedPb[j] : 0f;
+                paddedPb[j] = j < unwrappedPb.Count ? unwrappedPb[j] : lastPb;
 
             float[] utauT = new float[utauPbLength];
             double intervalD = utauPbIntervalMs;

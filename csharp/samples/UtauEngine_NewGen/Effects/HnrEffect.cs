@@ -31,6 +31,15 @@ namespace UtauEngineNg.Effects
             float maxReductionDb = 6.0f * (_strength / 100.0f);
             int processedFrames = 0;
 
+            // PSD 軸は 0..conf FNYQ の線形軸（layer0.c: linspace(0, fs/2, npsd)）。
+            // このエフェクトは 2x 解析チャンクに適用されるため fnyq は conf から取る。
+            var conf = LlsmBindings.Llsm.GetConf(chunk);
+            float fnyq = LlsmBindings.Llsm.GetConfFloat(conf, NativeLLSM.LLSM_CONF_FNYQ);
+            if (fnyq <= 0) fnyq = fs / 2.0f;
+            // layer0.c:412 の PSD 規約 10·log10(psd·44100/fs) に対応する物理スケール
+            //（BandEnergyCalibrator と同一の較正値）
+            const double PsdPhysScale = 2.0 / 44100.0;
+
             for (int i = 0; i < nfrm; i++)
             {
                 var frame = LlsmBindings.Llsm.GetFrame(chunk, i);
@@ -45,20 +54,26 @@ namespace UtauEngineNg.Effects
                 var nm = Marshal.PtrToStructure<NativeLLSM.llsm_nmframe>(nmPtr);
                 if (nm.npsd <= 0) continue;
 
+                // 倍音総パワー: Σa²/2（正弦波の実効パワー）
                 float[] ampl = new float[hm.nhar];
                 Marshal.Copy(hm.ampl, ampl, 0, hm.nhar);
                 double harmonicPower = 0;
-                for (int h = 0; h < hm.nhar; h++) harmonicPower += ampl[h] * ampl[h];
+                for (int h = 0; h < hm.nhar; h++) harmonicPower += (double)ampl[h] * ampl[h] / 2.0;
                 if (harmonicPower <= 1e-20) continue;
-                double harmonicPowerDb = 10.0 * Math.Log10(harmonicPower);
 
                 float[] psd = new float[nm.npsd];
                 Marshal.Copy(nm.psd, psd, 0, nm.npsd);
-                double noiseMeanDb = 0;
-                for (int j = 0; j < nm.npsd; j++) noiseMeanDb += psd[j];
-                noiseMeanDb /= nm.npsd;
 
-                double snrDb = harmonicPowerDb - noiseMeanDb;
+                // ノイズ総パワー: PSD（dBパワー密度）を線形領域で周波数積分する。
+                // 旧実装は「倍音の総パワーdB」と「PSD の dB 平均（≒幾何平均密度）」を
+                // 直接引き算しており 10〜30dB の系統誤差で adaptiveFactor が常時ほぼ 0
+                //（= D フラグがほぼ無効）だった。
+                double deltaF = nm.npsd > 1 ? fnyq / (nm.npsd - 1) : fnyq;
+                double noisePower = 0;
+                for (int j = 0; j < nm.npsd; j++)
+                    noisePower += Math.Pow(10.0, psd[j] / 10.0) * PsdPhysScale * deltaF;
+
+                double snrDb = 10.0 * Math.Log10(harmonicPower / Math.Max(noisePower, 1e-20));
 
                 double adaptiveFactor;
                 if (snrDb <= 10.0) adaptiveFactor = 1.0;

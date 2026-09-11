@@ -61,11 +61,18 @@ namespace UtauEngineNg.Synthesis
                 var vtmagnPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
                 if (vtmagnPtr != IntPtr.Zero && f0 > 0)
                 {
-                    float[] full = new float[analysisNspec];
-                    Marshal.Copy(vtmagnPtr, full, 0, analysisNspec);
-                    float[] trimmed = new float[originalNspec];
-                    Array.Copy(full, trimmed, originalNspec);
-                    LlsmBindings.Llsm.SetFrameVtMagn(frame, trimmed);
+                    // conf NSPEC でなく実配列長でガード（二重適用や nfft 不一致での
+                    // ネイティブヒープ越え読み出しを防止）
+                    int actualLen = NativeLLSM.llsm_fparray_length(vtmagnPtr);
+                    int copyLen = Math.Min(analysisNspec, actualLen);
+                    if (copyLen >= originalNspec)
+                    {
+                        float[] full = new float[copyLen];
+                        Marshal.Copy(vtmagnPtr, full, 0, copyLen);
+                        float[] trimmed = new float[originalNspec];
+                        Array.Copy(full, trimmed, originalNspec);
+                        LlsmBindings.Llsm.SetFrameVtMagn(frame, trimmed);
+                    }
                 }
 
                 // PSDRES リサンプル（下半分を全体へ）

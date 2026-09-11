@@ -293,11 +293,15 @@ namespace UtauEngineNg.Llsm
         //  VSPHSE ピッチシフト拡張
         // ===================================================================
         /// <summary>
-        /// ピッチ上昇で Layer0 変換時に倍音が切り捨てられるのを防ぐため、VSPHSE を
-        /// 必要倍音数まで拡張し、高次位相を線形外挿で補う。
+        /// ピッチ下降時、Layer0 変換の倍音数が len(vsphse) で頭打ちになり
+        /// （layer1.c: nhar = min(len(vsphse), fnyq/f0)）高域倍音が丸ごと欠落するのを防ぐ。
+        /// VSPHSE を新 F0 で必要な倍音数まで拡張する。拡張部は Rd の LF モデル位相を
+        /// 既存計測位相へ線形整合（オフセット+勾配フィット）して生成し、Rd が無い場合は
+        /// 末尾差分の線形外挿にフォールバックする。拡張不要（ピッチ上昇等）なら no-op。
         /// </summary>
-        public static void ExtendVsphseForPitchShift(IntPtr framePtr, float originalF0, float newF0, int fs)
+        public static void ExtendVsphseForPitchShift(IntPtr framePtr, float newF0, int fs)
         {
+            if (newF0 <= 0) return;
             var vsphsePtr = NativeLLSM.llsm_container_get(framePtr, NativeLLSM.LLSM_FRAME_VSPHSE);
             if (vsphsePtr == IntPtr.Zero) return;
             int currentNhar = NativeLLSM.llsm_fparray_length(vsphsePtr);
@@ -305,30 +309,88 @@ namespace UtauEngineNg.Llsm
 
             float fnyq = fs / 2.0f;
             int targetNhar = (int)(fnyq / newF0);
-            int neededNhar = (int)(fnyq / originalF0);
-            int extendedNhar = Math.Min(targetNhar, Math.Max(currentNhar, neededNhar));
-            if (extendedNhar <= currentNhar) return;
+            if (targetNhar <= currentNhar) return;
 
             float[] vsphse = new float[currentNhar];
             Marshal.Copy(vsphsePtr, vsphse, 0, currentNhar);
 
-            var extended = new float[extendedNhar];
+            var extended = new float[targetNhar];
             Array.Copy(vsphse, extended, currentNhar);
 
+            if (!TryExtendWithLfModel(framePtr, vsphse, extended, currentNhar, targetNhar, newF0))
+                ExtendVsphseLinear(vsphse, extended, currentNhar, targetNhar);
+
+            NativeCallbacks.AttachFpArray(framePtr, NativeLLSM.LLSM_FRAME_VSPHSE, extended);
+        }
+
+        /// <summary>
+        /// LF モデル位相（llsm_compute_vsphse_from_rd）で高次 VSPHSE を補う。
+        /// 計測位相との残差（パルス位置由来の線形位相ランプ+定数）を末尾 N 本で
+        /// アンラップ→最小二乗フィットし、拡張部のモデル位相へ乗せて接続段差を防ぐ。
+        /// </summary>
+        private static bool TryExtendWithLfModel(
+            IntPtr framePtr, float[] vsphse, float[] extended, int currentNhar, int targetNhar, float newF0)
+        {
+            var rdPtr = NativeLLSM.llsm_container_get(framePtr, NativeLLSM.LLSM_FRAME_RD);
+            if (rdPtr == IntPtr.Zero) return false;
+            float rd = Marshal.PtrToStructure<float>(rdPtr);
+            if (!float.IsFinite(rd) || rd <= 0) return false;
+
+            var model = new float[targetNhar];
+            var pin = System.Runtime.InteropServices.GCHandle.Alloc(model, System.Runtime.InteropServices.GCHandleType.Pinned);
+            try { NativeLLSM.llsm_compute_vsphse_from_rd(rd, newF0, targetNhar, pin.AddrOfPinnedObject()); }
+            finally { pin.Free(); }
+
+            int nFit = Math.Min(8, currentNhar);
+            int start = currentNhar - nFit;
+            var diff = new double[nFit];
+            double prev = 0;
+            for (int m = 0; m < nFit; m++)
+            {
+                double d = vsphse[start + m] - model[start + m];
+                if (!double.IsFinite(d)) return false;
+                if (m > 0) d -= 2.0 * Math.PI * Math.Round((d - prev) / (2.0 * Math.PI));
+                prev = d;
+                diff[m] = d;
+            }
+
+            // diff ≈ a + b·k を最小二乗フィット（k = 倍音インデックス）
+            double sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (int m = 0; m < nFit; m++)
+            {
+                double xk = start + m;
+                sx += xk; sy += diff[m]; sxx += xk * xk; sxy += xk * diff[m];
+            }
+            double denom = nFit * sxx - sx * sx;
+            if (Math.Abs(denom) < 1e-9) return false;
+            double b = (nFit * sxy - sx * sy) / denom;
+            double a = (sy - b * sx) / nFit;
+            if (!double.IsFinite(a) || !double.IsFinite(b)) return false;
+
+            for (int k = currentNhar; k < targetNhar; k++)
+            {
+                double e = model[k] + a + b * k;
+                e -= 2.0 * Math.PI * Math.Floor((e + Math.PI) / (2.0 * Math.PI));
+                extended[k] = (float)e;
+            }
+            return true;
+        }
+
+        /// <summary>末尾 2 差分の平均勾配による線形外挿（Rd 不在時のフォールバック）。</summary>
+        private static void ExtendVsphseLinear(float[] vsphse, float[] extended, int currentNhar, int targetNhar)
+        {
             float d1 = vsphse[currentNhar - 1] - vsphse[currentNhar - 2];
             d1 -= 2f * MathF.PI * MathF.Round(d1 / (2f * MathF.PI));
             float d2 = vsphse[currentNhar - 2] - vsphse[currentNhar - 3];
             d2 -= 2f * MathF.PI * MathF.Round(d2 / (2f * MathF.PI));
             float avgDiff = (d1 + d2) * 0.5f;
 
-            for (int k = currentNhar; k < extendedNhar; k++)
+            for (int k = currentNhar; k < targetNhar; k++)
             {
                 float e = vsphse[currentNhar - 1] + avgDiff * (k - currentNhar + 1);
                 e -= 2f * MathF.PI * MathF.Floor((e + MathF.PI) / (2f * MathF.PI));
                 extended[k] = e;
             }
-
-            NativeCallbacks.AttachFpArray(framePtr, NativeLLSM.LLSM_FRAME_VSPHSE, extended);
         }
 
         // ===================================================================

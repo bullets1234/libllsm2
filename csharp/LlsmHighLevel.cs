@@ -13,6 +13,7 @@ namespace LlsmBindings
         // cache native lib and function pointers for attach destructors
         private static readonly IntPtr _hLib;
         private static readonly IntPtr _pDeleteFp;
+        private static readonly IntPtr _pCopyFp;
         private static readonly IntPtr _pDeleteFpArray;
         private static readonly IntPtr _pCopyFpArray;
         private static readonly IntPtr _pDeleteInt;
@@ -27,6 +28,7 @@ namespace LlsmBindings
             // Ensure the native DLL is loadable via default search (same dir as exe)
             _hLib = NativeHelpers.LoadLibrary("libllsm2.dll");
             _pDeleteFp = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_fp));
+            _pCopyFp = NativeHelpers.GetExport(_hLib, "llsm_copy_fp");
             _pDeleteFpArray = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_fparray));
             _pCopyFpArray = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_copy_fparray));
             _pDeleteInt = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_int));
@@ -246,7 +248,7 @@ namespace LlsmBindings
         public static void SetFrameF0(ContainerRef frame, float f0)
         {
             var p = NativeLLSM.llsm_create_fp(f0);
-            NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_F0, p, _pDeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_F0, p, _pDeleteFp, _pCopyFp); // copyctor必須: NULLだとコピーがポインタをエイリアスし解放順依存のUAFになる
         }
 
         /// <summary>
@@ -255,7 +257,7 @@ namespace LlsmBindings
         public static void SetFrameRd(ContainerRef frame, float rd)
         {
             var p = NativeLLSM.llsm_create_fp(rd);
-            NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_RD, p, _pDeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_RD, p, _pDeleteFp, _pCopyFp); // copyctor必須: NULLだとコピーがポインタをエイリアスし解放順依存のUAFになる
         }
 
         /// <summary>
@@ -287,7 +289,7 @@ namespace LlsmBindings
         {
             var p = NativeLLSM.llsm_create_fp(newThop);
             // ホップ長は LLSM_CONF_THOP (index=1)
-            NativeLLSM.llsm_container_attach_(conf.Ptr, NativeLLSM.LLSM_CONF_THOP, p, _pDeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(conf.Ptr, NativeLLSM.LLSM_CONF_THOP, p, _pDeleteFp, _pCopyFp); // copyctor必須: NULLだとコピーがポインタをエイリアスし解放順依存のUAFになる
         }
 
         /// <summary>
@@ -305,7 +307,7 @@ namespace LlsmBindings
         public static void SetConfFloat(ContainerRef conf, int index, float value)
         {
             var p = NativeLLSM.llsm_create_fp(value);
-            NativeLLSM.llsm_container_attach_(conf.Ptr, index, p, _pDeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(conf.Ptr, index, p, _pDeleteFp, _pCopyFp); // copyctor必須: NULLだとコピーがポインタをエイリアスし解放順依存のUAFになる
         }
 
         /// <summary>

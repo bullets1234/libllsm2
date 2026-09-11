@@ -705,11 +705,22 @@ void llsm_chunk_phasepropagate(llsm_chunk* dst, int sign) {
   FP_TYPE* f0 = llsm_chunk_getf0(dst, & nfrm);
   FP_TYPE* thop = llsm_container_get(dst -> conf, LLSM_CONF_THOP);
   if(thop == NULL || f0 == NULL) return;
-  FP_TYPE* delta_phase = cumsum(f0, nfrm);
+  // NOTE: accumulate the running phase in double precision and wrap it to
+  // [-pi, pi] before downcasting to FP_TYPE (float). For long recordings
+  // (many thousands of frames) a plain float32 cumulative sum of f0 loses
+  // enough precision that the resulting per-frame phase becomes noisy;
+  // since llsm_frame_phaseshift() multiplies this value by the harmonic
+  // index (up to maxnhar), even a sub-radian error gets amplified into an
+  // audible high-harmonic buzzing/"fan"-like artifact that grows over the
+  // course of the recording. Wrapping in double keeps the value small so
+  // the final float32 cast retains full precision regardless of duration.
+  double factor = (double)(*thop) * sign * 2.0 * M_PI;
+  double accum = 0.0;
   for(int i = 0; i < nfrm; i ++) {
-    delta_phase[i] *= *thop * sign * 2.0 * M_PI;
-    llsm_frame_phaseshift(dst -> frames[i], delta_phase[i]);
+    accum += (double)f0[i];
+    double theta = accum * factor;
+    theta -= round(theta / (2.0 * M_PI)) * 2.0 * M_PI;
+    llsm_frame_phaseshift(dst -> frames[i], (FP_TYPE)theta);
   }
-  free(delta_phase);
   free(f0);
 }

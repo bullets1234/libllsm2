@@ -10,9 +10,11 @@ namespace UtauEngineNg.Effects
     /// グロウル効果（G フラグ）。Pulse-by-Pulse 合成で声帯の不規則振動を再現する。
     /// サブハーモニクス（F0/3・F0/5）、ガウシアンジッター、声門波形変調を有声フレームに付与。
     /// Layer1 状態で適用するため、有効時は Layer0 変換をスキップする必要がある。
+    /// 注意: 本インスタンスはネイティブ側から呼ばれるコールバックの寿命を握るため、
+    /// llsm_synthesize 完了まで生存させ、その後 Dispose すること。
     /// （UtauEngine GrowlEffectState + GrowlEffectCallback の移植）
     /// </summary>
-    public sealed class GrowlEffect
+    public sealed class GrowlEffect : IDisposable
     {
         private const string Stage = "Growl";
         private readonly int _strength;
@@ -28,6 +30,12 @@ namespace UtauEngineNg.Effects
             _log = log;
         }
 
+        public void Dispose()
+        {
+            if (_stateHandle.IsAllocated) _stateHandle.Free();
+            _callback = null;
+        }
+
         /// <summary>有効なら true（有効時は Layer1 合成が必要）。</summary>
         public bool IsActive => _strength > 0;
 
@@ -39,6 +47,7 @@ namespace UtauEngineNg.Effects
         {
             if (!IsActive) return;
 
+            if (_stateHandle.IsAllocated) _stateHandle.Free(); // 再 Apply 時の旧ハンドル解放
             var growlState = new GrowlEffectState(_strength);
             _stateHandle = GCHandle.Alloc(growlState);
             IntPtr statePtr = GCHandle.ToIntPtr(_stateHandle);
@@ -88,11 +97,16 @@ namespace UtauEngineNg.Effects
 
             state.Oscillator1 += 2 * MathF.PI / subfreq1;
             state.Oscillator2 += 2 * MathF.PI / subfreq2;
+            // 長時間サステインでの float 精度劣化を防ぐ位相ラップ
+            if (state.Oscillator1 > 2 * MathF.PI) state.Oscillator1 -= 2 * MathF.PI;
+            if (state.Oscillator2 > 2 * MathF.PI) state.Oscillator2 -= 2 * MathF.PI;
 
             float osc = MathF.Sin(state.Oscillator1) * 0.7f + MathF.Sin(state.Oscillator2) * 0.3f;
 
-            float jitter1 = (float)state.Random.NextDouble() - 0.5f;
-            float jitter2 = (float)state.Random.NextDouble() - 0.5f;
+            // 決定論的ジッター（PeriodCount ベース）。unseeded Random だと同一ノートの
+            // レンダリング結果が毎回変わり、UTAU のキャッシュ・再現性を壊す
+            float jitter1 = UtauEngineNg.Llsm.DeterministicNoise.Hash(state.PeriodCount, 12345);
+            float jitter2 = UtauEngineNg.Llsm.DeterministicNoise.Hash(state.PeriodCount, 54321);
             float jitter = (jitter1 + jitter2) * 1.4142f;
             delta_t = gfm.T0 * 0.01f * jitter * state.Strength;
 
@@ -107,7 +121,6 @@ namespace UtauEngineNg.Effects
             public int PeriodCount;
             public float Oscillator1;
             public float Oscillator2;
-            public readonly Random Random = new();
             public readonly float Strength;
 
             public GrowlEffectState(float strength) => Strength = strength / 100.0f;

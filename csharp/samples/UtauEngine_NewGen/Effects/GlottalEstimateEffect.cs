@@ -50,6 +50,13 @@ namespace UtauEngineNg.Effects
                 float[] rdPerFrame = new float[nfrm];
                 for (int i = 0; i < nfrm; i++) rdPerFrame[i] = float.NaN;
 
+                // ネイティブ推定器 (layer1.c llsm_analyze_rd) と同じ前処理:
+                // 8kHz までの倍音に制限し、逆リップ放射フィルタ (+6dB/oct 除去) を適用。
+                // これを省くとティルトが乗ったまま比較され、Rd が張り上げ側へ系統的に
+                // バイアスする。
+                var conf = LlsmBindings.Llsm.GetConf(chunk);
+                float lipRadius = LlsmBindings.Llsm.GetConfFloat(conf, NativeLLSM.LLSM_CONF_LIPRADIUS);
+
                 int voicedCount = 0;
                 for (int i = 0; i < nfrm; i++)
                 {
@@ -61,11 +68,19 @@ namespace UtauEngineNg.Effects
                     if (hmPtr == IntPtr.Zero) continue;
 
                     int nhar = LlsmBindings.Llsm.GetHMNHar(hmPtr);
+                    nhar = Math.Min(nhar, (int)MathF.Round(8000f / f0));
                     if (nhar <= 0) continue;
 
                     float[] ampl = LlsmBindings.Llsm.GetHMAmpl(hmPtr, nhar);
+                    // 振幅 0 はネイティブ側 log(0) で NaN 距離になるためフロアを敷く
+                    for (int h = 0; h < ampl.Length; h++)
+                        if (!float.IsFinite(ampl[h]) || ampl[h] < 1e-8f) ampl[h] = 1e-8f;
+                    if (lipRadius > 0)
+                        NativeLLSM.llsm_lipfilter(lipRadius, f0, nhar, ampl, null!, 1);
+
                     float estimatedRd = NativeLLSM.llsm_spectral_glottal_fitting(ampl, nhar, glottalModel);
-                    rdPerFrame[i] = Math.Clamp(estimatedRd, 0.3f, 3.0f);
+                    if (!float.IsFinite(estimatedRd)) continue;
+                    rdPerFrame[i] = Math.Clamp(estimatedRd, 0.3f, 2.7f); // モデルグリッド範囲
                     voicedCount++;
                 }
 
@@ -89,6 +104,11 @@ namespace UtauEngineNg.Effects
                 }
 
                 var validRd = rdSmoothed.Where(x => !float.IsNaN(x)).ToList();
+                if (validRd.Count == 0)
+                {
+                    _log.Warn(Stage, "All Rd estimates invalid, skipping");
+                    return;
+                }
                 float meanRd = validRd.Average();
                 float stdRd = validRd.Count > 1
                     ? MathF.Sqrt(validRd.Select(x => (x - meanRd) * (x - meanRd)).Average())
@@ -110,8 +130,12 @@ namespace UtauEngineNg.Effects
     }
 
     /// <summary>
-    /// 無声音減衰（U フラグ）。無声フレームのノイズエネルギーを指定 dB だけ減衰させる。
-    /// 子音・息のノイズを抑えてクリアにする。バインディングの AttenuateUnvoiced を委譲。
+    /// 無声音減衰（U フラグ）。無声フレームのノイズ PSD を指定 dB だけ減衰させる。
+    /// 子音・息のノイズを抑えてクリアにする。
+    /// 注: 旧実装が委譲していた AttenuateUnvoiced は VTMAGN を編集していたが、
+    /// 合成側は無声フレームで VTMAGN を一切読まない（layer1.c は f0==0 で早期リターン、
+    /// 無声音のレベルは NM が全て）ため完全な no-op だった。NM の PSD（dB パワー）を
+    /// 直接下げる。時間包絡（edc/eenv）は乗算で別途掛かるため PSD のみで十分。
     /// </summary>
     public sealed class UnvoicedAttenuationEffect : IChunkEffect
     {
@@ -130,8 +154,22 @@ namespace UtauEngineNg.Effects
         public void Apply(ChunkHandle chunk, int nfrm, int fs)
         {
             if (!IsActive) return;
-            LlsmBindings.Llsm.AttenuateUnvoiced(chunk, uvDb: -_attenuationDb);
-            _log.Info(Stage, $"Attenuation -{_attenuationDb}dB applied (Layer1)");
+
+            int applied = 0;
+            for (int i = 0; i < nfrm; i++)
+            {
+                var frame = LlsmBindings.Llsm.GetFrame(chunk, i);
+                if (LlsmBindings.Llsm.GetFrameF0(frame) > 0) continue; // 無声のみ
+
+                var nm = UtauEngineNg.Llsm.FrameAccess.TryGetNm(frame);
+                if (nm is not { HasPsd: true } nmv) continue;
+
+                float[] psd = nmv.ReadPsd();
+                for (int j = 0; j < psd.Length; j++) psd[j] -= _attenuationDb;
+                nmv.WritePsd(psd);
+                applied++;
+            }
+            _log.Info(Stage, $"U{_attenuationDb}: NM PSD attenuated -{_attenuationDb}dB on {applied} unvoiced frames");
         }
     }
 
@@ -160,6 +198,10 @@ namespace UtauEngineNg.Effects
         private const float MinRd = 0.3f;
         private const float MaxRd = 3.0f;
 
+        // Rd 変更によるスペクトルティルト変化で倍音全体のエネルギーが落ちる/上がる
+        // （tolayer0 は H1 基準正規化のため）。補償ゲインの暴走防止クランプ。
+        private const float MaxCompensationDb = 12.0f;
+
         public void Apply(ChunkHandle chunk, int nfrm, int fs)
         {
             if (!IsActive) return;
@@ -168,7 +210,12 @@ namespace UtauEngineNg.Effects
                 ? 2.5f - (_closure / 50.0f) * 1.5f          // K0..50 : 2.5 -> 1.0
                 : 1.0f - ((_closure - 50) / 50.0f) * 0.7f;  // K50..100: 1.0 -> 0.3
 
+            var conf = LlsmBindings.Llsm.GetConf(chunk);
+            int nspec = LlsmBindings.Llsm.GetConfInt(conf, NativeLLSM.LLSM_CONF_NSPEC);
+
             int clamped = 0;
+            int compensated = 0;
+            float gainSum = 0;
             for (int i = 0; i < nfrm; i++)
             {
                 var frame = LlsmBindings.Llsm.GetFrame(chunk, i);
@@ -181,9 +228,47 @@ namespace UtauEngineNg.Effects
                 float newRd = currentRd * rdScale;
                 float boundedRd = Math.Clamp(newRd, MinRd, MaxRd);
                 if (boundedRd != newRd) clamped++;
+
+                // 変更前 Rd での倍音エネルギーを実測（tolayer0 で HM を再生成）
+                NativeLLSM.llsm_frame_tolayer0(frame.Ptr, conf.Ptr);
+                double e0 = HarmonicEnergy(frame);
+
                 Marshal.StructureToPtr(boundedRd, rdPtr, false);
+
+                // 変更後 Rd での倍音エネルギー
+                NativeLLSM.llsm_frame_tolayer0(frame.Ptr, conf.Ptr);
+                double e1 = HarmonicEnergy(frame);
+
+                // エネルギー総和を保存するゲインを VTMAGN に付与（ノイズ成分 NM は不変）。
+                // 実声では息漏れ声でも声量はほぼ保たれるため、無補償だと倍音だけが
+                // 落ちて N/S 比が悪化し「シャー」というノイズ感が出る。
+                if (e0 > 0 && e1 > 0)
+                {
+                    float gainDb = Math.Clamp(
+                        (float)(10.0 * Math.Log10(e0 / e1)),
+                        -MaxCompensationDb, MaxCompensationDb);
+                    var vtmagn = LlsmBindings.Llsm.GetFrameVtMagn(frame, nspec);
+                    for (int j = 0; j < nspec; j++)
+                        vtmagn[j] = Math.Max(vtmagn[j] + gainDb, -80.0f);
+                    LlsmBindings.Llsm.SetFrameVtMagn(frame, vtmagn);
+                    gainSum += gainDb;
+                    compensated++;
+                }
             }
-            _log.Info(Stage, $"K{_closure} applied (Rd scale {rdScale:F2}, clamped {clamped}/{nfrm} frames to [{MinRd:F1},{MaxRd:F1}])");
+            float gainAvg = compensated > 0 ? gainSum / compensated : 0;
+            _log.Info(Stage, $"K{_closure} applied (Rd scale {rdScale:F2}, clamped {clamped}/{nfrm}, energy comp avg {gainAvg:+0.0;-0.0}dB on {compensated} frames)");
+        }
+
+        private static double HarmonicEnergy(ContainerRef frame)
+        {
+            IntPtr hm = LlsmBindings.Llsm.GetFrameHM(frame);
+            if (hm == IntPtr.Zero) return 0;
+            int nhar = LlsmBindings.Llsm.GetHMNHar(hm);
+            if (nhar <= 0) return 0;
+            float[] ampl = LlsmBindings.Llsm.GetHMAmpl(hm, nhar);
+            double e = 0;
+            for (int k = 0; k < nhar; k++) e += (double)ampl[k] * ampl[k];
+            return e;
         }
     }
 }

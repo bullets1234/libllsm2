@@ -1,0 +1,9 @@
+# モデル本体はサイズが大きいのでリポジトリに含めない
+# rmvpe.pt : https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt
+# rmvpe.onnx: tools/export_rmvpe_onnx.py で生成
+models/*.pt
+models/*.onnx
+testfiles/*.wav
+
+# RVC からダウンロードしたモデル定義（MIT）
+tools/thirdparty/

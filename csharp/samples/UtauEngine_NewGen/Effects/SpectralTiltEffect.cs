@@ -13,6 +13,9 @@ namespace UtauEngineNg.Effects
     public sealed class SpectralTiltEffect : IChunkEffect
     {
         private const float VtmagnFloorDb = -80f;
+        // T+12 は 20kHz で理論 +52dB になり解析ノイズフロアをヒスとして増幅するため、
+        // ビン毎の傾斜適用量を ±18dB で頭打ちにする（シェルフ飽和）
+        private const float MaxTiltDb = 18f;
         private readonly int _spectralTilt;
 
         public SpectralTiltEffect(int spectralTilt) => _spectralTilt = spectralTilt;
@@ -40,8 +43,9 @@ namespace UtauEngineNg.Effects
 
                 for (int j = 0; j < nspec; j++)
                 {
-                    float freqKhz = (float)j / nspec * (fs / 2000.0f);
-                    vtmagn[j] += _spectralTilt * MathF.Log2(MathF.Max(freqKhz, 0.1f));
+                    float freqKhz = (float)j / Math.Max(1, nspec - 1) * (fs / 2000.0f);
+                    float tiltDb = _spectralTilt * MathF.Log2(MathF.Max(freqKhz, 0.1f));
+                    vtmagn[j] += Math.Clamp(tiltDb, -MaxTiltDb, MaxTiltDb);
                 }
 
                 foreach (var (peakIdx, origMagnitude) in formantPeaks)

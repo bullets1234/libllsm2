@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 
 namespace UtauEngineNg.Cli
 {
@@ -21,7 +22,7 @@ namespace UtauEngineNg.Cli
         public float Cutoff { get; init; }
         public int Volume { get; init; }
         public int Modulation { get; init; }
-        public int Tempo { get; init; }
+        public float Tempo { get; init; }
         public IReadOnlyList<int> PitchBend { get; init; } = Array.Empty<int>();
 
         /// <summary>解析済みフラグ。</summary>
@@ -36,10 +37,16 @@ namespace UtauEngineNg.Cli
         public static ResamplerArgs Parse(string[] args)
         {
             string Get(int i, string def) => args.Length > i ? args[i] : def;
-            int GetInt(int i, int def) => args.Length > i && int.TryParse(args[i], out var v) ? v : def;
-            float GetFloat(int i, float def) => args.Length > i && float.TryParse(args[i], out var v) ? v : def;
+            // UTAU は小数点 '.' 固定で数値を渡すため、ロケール非依存（InvariantCulture）で
+            // パースする。既定カルチャだと欧州圏 Windows（小数点=','）で "25.5" が失敗し、
+            // offset/cutoff 等が黙って 0 になる。整数引数も "100.0" 形式に耐えるよう
+            // float として受けて丸める。
+            float GetFloat(int i, float def) =>
+                args.Length > i && float.TryParse(args[i], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && float.IsFinite(v)
+                    ? v : def;
+            int GetInt(int i, int def) => (int)MathF.Round(GetFloat(i, def));
 
-            int tempo = 120;
+            float tempo = 120f;
             var pitchBend = new List<int>();
             if (args.Length > 11)
                 (tempo, pitchBend) = PitchBendDecoder.ParseWithTempo(args, 11);
@@ -51,14 +58,14 @@ namespace UtauEngineNg.Cli
                 InputWav = Get(0, ""),
                 OutputWav = Get(1, ""),
                 PitchName = Get(2, "C4"),
-                Velocity = GetInt(3, 100),
+                Velocity = Math.Clamp(GetInt(3, 100), 0, 200),
                 Flags = flags,
                 Offset = GetFloat(5, 0),
                 LengthMs = GetFloat(6, 0),
                 Consonant = GetFloat(7, 0),
                 Cutoff = GetFloat(8, 0),
-                Volume = GetInt(9, 100),
-                Modulation = GetInt(10, 0),
+                Volume = Math.Clamp(GetInt(9, 100), 0, 200),
+                Modulation = Math.Clamp(GetInt(10, 0), -200, 200),
                 Tempo = tempo,
                 PitchBend = pitchBend,
                 ParsedFlags = new FlagSet(flags),
