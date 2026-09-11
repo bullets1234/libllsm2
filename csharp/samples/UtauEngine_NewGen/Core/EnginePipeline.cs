@@ -37,7 +37,8 @@ namespace UtauEngineNg.Core
                     (args.ParsedFlags.DisableVsphseExtension ? " vsphse-ext" : "") +
                     (args.ParsedFlags.DisableVsphseSmoother ? " smoother" : "") +
                     (args.ParsedFlags.DisableResidualCorrection ? " residual" : "") +
-                    (args.ParsedFlags.DisableEenvClamp ? " eenv-clamp" : ""));
+                    (args.ParsedFlags.DisableEenvClamp ? " eenv-clamp" : "") +
+                    (args.ParsedFlags.DisableNoiseTexture ? " nm-texture" : ""));
 
             // 1. WAV 読み込み
             var (samples, fs) = WavIo.ReadMono(args.InputWav);

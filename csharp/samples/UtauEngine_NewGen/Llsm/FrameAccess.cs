@@ -133,6 +133,12 @@ namespace UtauEngineNg.Llsm
             return e;
         }
 
+        public void WriteEdc(float[] edc)
+        {
+            if (!HasEdc) return;
+            Marshal.Copy(edc, 0, _nm.edc, Math.Min(edc.Length, _nm.nchannel));
+        }
+
         /// <summary>チャンネル毎の eenv（<see cref="HmView"/>）を列挙する。</summary>
         public HmView? GetEenvChannel(int channel)
         {

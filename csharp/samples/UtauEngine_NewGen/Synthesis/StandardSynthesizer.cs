@@ -135,6 +135,12 @@ namespace UtauEngineNg.Synthesis
             var formantFollow = new FormantFollowEffect(p.FormantFollow);
             var voiceQuality = new VoiceQualityCurveEffect(p.VoiceQuality, srcF0, p.ThopSeconds, dstNfrm, fs);
 
+            // NM テクスチャ実時間転写（冷凍ノイズ対策）。L2R_NMTEX=0 / N16 で無効化（A/B 用）
+            bool noiseTextureEnabled = Environment.GetEnvironmentVariable("L2R_NMTEX") != "0" && !p.DisableNoiseTexture;
+            var noiseTexture = new NoiseTextureTransfer(srcChunk, srcNfrm, noiseTextureEnabled, log);
+            float consonantLocalStretch = p.ConsonantFrames > 0 ? (float)dstConsonantFrames / p.ConsonantFrames : 1f;
+            float vowelLocalStretch = (float)dstStretchedFrames / effectiveStretchableFrames;
+
             using (_diag.Profiler.Measure("frame_interp_loop"))
             {
                 for (int i = 0; i < dstNfrm; i++)
@@ -155,6 +161,12 @@ namespace UtauEngineNg.Synthesis
                     bool isTransientRegion = (isSrcTransient1 || isSrcTransient2) && isConsonant;
 
                     IntPtr newFramePtr = InterpolateFrameAt(srcChunk, srcIdx1, srcIdx2, ratio, srcNfrm, i, isTransientRegion);
+
+                    // 息テクスチャ（PSDRES / edc 残差）を実時間カーソルから転写。
+                    // トランジェント区間は原音フレームをそのまま使うため対象外。
+                    if (!isTransientRegion)
+                        noiseTexture.Apply(newFramePtr, srcPosFloat, srcIdx1, srcIdx2, ratio,
+                            isConsonant ? consonantLocalStretch : vowelLocalStretch);
 
                     var newFrameRef = new ContainerRef(newFramePtr);
                     float originalF0 = LlsmBindings.Llsm.GetFrameF0(newFrameRef);
@@ -233,6 +245,7 @@ namespace UtauEngineNg.Synthesis
             }
 
             voiceQuality.LogSummary(log);
+            noiseTexture.LogSummary();
 
             // 倍音トレース診断: フレーム補間ループ完了後
             if (HarmonicTracer.Enabled) HarmonicTracer.TraceVtmagn(dstChunk, dstNfrm, "post-interp", log, fs);
