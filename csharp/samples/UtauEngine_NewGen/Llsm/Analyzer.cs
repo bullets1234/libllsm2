@@ -94,6 +94,12 @@ namespace UtauEngineNg.Llsm
             if (Environment.GetEnvironmentVariable("L2R_HARMFIX") == "1")
                 HarmonicRefinementCorrector.Apply(chunk, f0.Length, upsampled, analysisFs, thopSec, log);
 
+            // 倍音らしさゲート: 原音で倍音構造を持たない帯域（息由来の高域ノイズ等）の HM パワーを
+            // NM PSD へ移す。ノイズを正弦波の束で再現することによる金属的な異音を防ぐ。
+            // L2R_HARMGATE=0 / N64 で無効化（A/B 用）。
+            if (Environment.GetEnvironmentVariable("L2R_HARMGATE") != "0" && !flags.DisableHarmonicityGate)
+                HarmonicityGate.Apply(chunk, f0.Length, upsampled, analysisFs, thopSec, fs / 2f, log);
+
             // 帯域エネルギー較正（実験的・既定OFF）: NM PSDブーストは帯域エネルギー数値こそ
             // 原音に近づくが、倍音をノイズで置き換えるため聴感はホワイトノイズ化する（実声で確認）。
             // L2R_BANDCAL=1 の明示指定時のみ有効。

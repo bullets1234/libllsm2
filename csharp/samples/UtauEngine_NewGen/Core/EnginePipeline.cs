@@ -45,7 +45,8 @@ namespace UtauEngineNg.Core
                     (args.ParsedFlags.DisableResidualCorrection ? " residual" : "") +
                     (args.ParsedFlags.DisableEenvClamp ? " eenv-clamp" : "") +
                     (args.ParsedFlags.DisableNoiseTexture ? " nm-texture" : "") +
-                    (args.ParsedFlags.DisableEdgePad ? " edge-pad" : ""));
+                    (args.ParsedFlags.DisableEdgePad ? " edge-pad" : "") +
+                    (args.ParsedFlags.DisableHarmonicityGate ? " harm-gate" : ""));
 
             // 1. WAV 読み込み
             var (samples, fs) = WavIo.ReadMono(args.InputWav);

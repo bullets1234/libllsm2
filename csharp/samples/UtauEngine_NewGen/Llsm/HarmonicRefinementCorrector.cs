@@ -226,7 +226,7 @@ namespace UtauEngineNg.Llsm
         /// ゼロパディング（fftLen = N*4）は W(θ) を θ 方向に sinc 補間して分解能を上げるだけで、
         /// windowSum（=W(0)）自体は変化しないため、この換算式は fftLen に依存しない。
         /// </summary>
-        private static void FillWindowedSpectrum(float[] signal, int center, int windowLen, float[] window, int fftLen, double[] re, double[] im)
+        internal static void FillWindowedSpectrum(float[] signal, int center, int windowLen, float[] window, int fftLen, double[] re, double[] im)
         {
             Array.Clear(re, 0, fftLen);
             Array.Clear(im, 0, fftLen);
@@ -240,7 +240,7 @@ namespace UtauEngineNg.Llsm
         }
 
         /// <summary>fk ± f0*0.2 の範囲でピークビンを探し、対数振幅のパラボラ補間で真のピーク振幅を推定する。</summary>
-        private static double FindHarmonicPeakMagnitude(double[] mag, int halfLen, float fk, float f0, int analysisFs, int fftLen)
+        internal static double FindHarmonicPeakMagnitude(double[] mag, int halfLen, float fk, float f0, int analysisFs, int fftLen)
         {
             float loHz = fk - f0 * PeakSearchFrac;
             float hiHz = fk + f0 * PeakSearchFrac;
@@ -269,7 +269,7 @@ namespace UtauEngineNg.Llsm
         }
 
         /// <summary>倍音間フロア（fk±f0*0.5 の ±f0*0.1 範囲、両側まとめて）の中央値を返す。</summary>
-        private static double HarmonicFloorMedian(double[] mag, int halfLen, float fk, float f0, int analysisFs, int fftLen, List<double> scratch)
+        internal static double HarmonicFloorMedian(double[] mag, int halfLen, float fk, float f0, int analysisFs, int fftLen, List<double> scratch)
         {
             scratch.Clear();
             CollectFloorBins(mag, halfLen, fk - f0 * FloorOffsetFrac, f0, analysisFs, fftLen, scratch);
@@ -291,7 +291,7 @@ namespace UtauEngineNg.Llsm
             for (int b = binLo; b <= binHi; b++) dst.Add(mag[b]);
         }
 
-        private static float[] HannWindow(int n)
+        internal static float[] HannWindow(int n)
         {
             var w = new float[n];
             if (n == 1) { w[0] = 1f; return w; }
@@ -300,7 +300,7 @@ namespace UtauEngineNg.Llsm
             return w;
         }
 
-        private static int NextPow2(int n)
+        internal static int NextPow2(int n)
         {
             int p = 1;
             while (p < n) p <<= 1;
@@ -308,7 +308,7 @@ namespace UtauEngineNg.Llsm
         }
 
         /// <summary>反復基数2 Cooley-Tukey FFT（in-place, 未正規化の順変換）。n は2のべき乗。</summary>
-        private static void Fft(double[] re, double[] im)
+        internal static void Fft(double[] re, double[] im)
         {
             int n = re.Length;
             for (int i = 1, j = 0; i < n; i++)
