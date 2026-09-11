@@ -26,6 +26,18 @@ namespace UtauEngineNg.Pitch
             ShimmerDb = shimmerDb;
         }
 
+        /// <summary>フレーム範囲 [start, start+count) を切り出す（解析パディングの除去用）。</summary>
+        public MicroProsodyData Slice(int start, int count)
+        {
+            static float[] Cut(float[] a, int s, int c)
+            {
+                if (a.Length == 0) return a;
+                s = Math.Clamp(s, 0, a.Length); c = Math.Clamp(c, 0, a.Length - s);
+                var r = new float[c]; Array.Copy(a, s, r, 0, c); return r;
+            }
+            return new MicroProsodyData(Cut(PitchCents, start, count), Cut(ShimmerDb, start, count));
+        }
+
         /// <summary>出力フレーム i の等速参照（パリンドローム延長）。</summary>
         public float PitchAt(int i) =>
             PitchCents.Length == 0 ? 0f : PitchCents[Palindrome(i, PitchCents.Length)];

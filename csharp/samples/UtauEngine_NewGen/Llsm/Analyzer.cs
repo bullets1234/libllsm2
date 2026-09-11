@@ -43,7 +43,8 @@ namespace UtauEngineNg.Llsm
         /// <summary>
         /// セグメントを解析する。<paramref name="f0"/> は解析フレーム間隔(thopSec)に一致した F0 列。
         /// </summary>
-        public AnalysisResult Analyze(float[] segment, int fs, float[] f0, float thopSec, float srcF0, FlagSet flags)
+        public AnalysisResult Analyze(float[] segment, int fs, float[] f0, float thopSec, float srcF0, FlagSet flags,
+            int trimStartFrames = 0, int keepFrames = -1)
         {
             var log = _diag.Log;
             using var aopt = LlsmBindings.Llsm.CreateAnalysisOptions();
@@ -99,6 +100,15 @@ namespace UtauEngineNg.Llsm
             if (Environment.GetEnvironmentVariable("L2R_BANDCAL") == "1")
                 BandEnergyCalibrator.Apply(chunk, f0.Length, segment, fs, thopSec, log);
 
+            // 解析パディング（端の窓ゼロ埋め対策で前後に足した実音声）のフレームを捨てる
+            if (trimStartFrames > 0 || (keepFrames >= 0 && keepFrames < LlsmBindings.Llsm.GetNumFrames(chunk)))
+            {
+                int total = LlsmBindings.Llsm.GetNumFrames(chunk);
+                int keep = keepFrames < 0 ? total - trimStartFrames : Math.Min(keepFrames, total - trimStartFrames);
+                chunk = TrimChunk(chunk, trimStartFrames, Math.Max(1, keep));
+                log.Debug(Stage, $"Edge padding trimmed: frames {trimStartFrames}..{trimStartFrames + keep - 1} of {total}");
+            }
+
             var conf = LlsmBindings.Llsm.GetConf(chunk);
             float actualThop = LlsmBindings.Llsm.GetThopSeconds(conf);
             int nfrm = LlsmBindings.Llsm.GetNumFrames(chunk);
@@ -112,6 +122,21 @@ namespace UtauEngineNg.Llsm
                 NumFrames = nfrm,
                 AnalysisFs = analysisFs,
             };
+        }
+
+        /// <summary>チャンクのフレーム [start, start+count) だけを持つ新チャンクを作り、元を解放する。</summary>
+        private static ChunkHandle TrimChunk(ChunkHandle src, int start, int count)
+        {
+            var conf = LlsmBindings.Llsm.GetConf(src);
+            var confCopy = LlsmBindings.Llsm.CopyContainer(conf);
+            var nfrmPtr = NativeLLSM.llsm_container_get(confCopy.Ptr, NativeLLSM.LLSM_CONF_NFRM);
+            System.Runtime.InteropServices.Marshal.WriteInt32(nfrmPtr, count);
+            var dst = LlsmBindings.Llsm.CreateChunk(confCopy, 0);
+            NativeLLSM.llsm_delete_container(confCopy.Ptr); // llsm_create_chunk は conf をディープコピーする
+            for (int i = 0; i < count; i++)
+                LlsmBindings.Llsm.SetFrame(dst, i, LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(src, start + i)));
+            src.Dispose();
+            return dst;
         }
 
         /// <summary>maxnhar / maxnhar_e を決める（H フラグ時は F0 依存の動的調整）。</summary>

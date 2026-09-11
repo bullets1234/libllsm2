@@ -99,6 +99,10 @@ namespace LlsmBindings
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_chunk_phasesync_rps(IntPtr chunk, int layer1_based);
 
+        /// <summary>フレーム内の全調波位相を theta·(k+1) だけ回す（llsm_chunk_phasepropagate の 1 フレーム版）。</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_frame_phaseshift(IntPtr frame, float theta);
+
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_frame_phasesync_rps(IntPtr frame, int layer1_based);
 

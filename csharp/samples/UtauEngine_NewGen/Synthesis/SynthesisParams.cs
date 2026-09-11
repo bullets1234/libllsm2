@@ -48,6 +48,7 @@ namespace UtauEngineNg.Synthesis
         public bool DisableVsphseSmoother { get; init; }
         public bool DisableResidualCorrection { get; init; }
         public bool DisableNoiseTexture { get; init; }
+        public bool DisableEdgePad { get; init; }
 
         // 合成オプション
         public bool UseOversampling { get; init; }
@@ -86,6 +87,7 @@ namespace UtauEngineNg.Synthesis
                 DisableVsphseSmoother = flags.DisableVsphseSmoother,
                 DisableResidualCorrection = flags.DisableResidualCorrection,
                 DisableNoiseTexture = flags.DisableNoiseTexture,
+                DisableEdgePad = flags.DisableEdgePad,
                 UseOversampling = flags.Oversampling,
             };
         }

@@ -26,6 +26,20 @@ namespace UtauEngineNg.Llsm
         /// </summary>
         private const float EenvModulationLimit = 2.5f;
 
+        /// <summary>
+        /// 診断用: L2R_EENV_LIMIT=&lt;倍率&gt; で変調深度上限を上書きする（0 で eenv 変調を無効化、
+        /// 未指定なら <see cref="EenvModulationLimit"/>）。パルス同期ノイズのザラつき切り分け用。
+        /// </summary>
+        private static readonly float EffectiveEenvLimit = ResolveEenvLimit();
+
+        private static float ResolveEenvLimit()
+        {
+            var s = Environment.GetEnvironmentVariable("L2R_EENV_LIMIT");
+            return float.TryParse(s, System.Globalization.NumberStyles.Float,
+                       System.Globalization.CultureInfo.InvariantCulture, out var v) && v >= 0f && v <= 100f
+                ? v : EenvModulationLimit;
+        }
+
         public void ClampEenvModulationDepth(ChunkHandle chunk, float[] f0, int nfrm)
         {
             int clamped = 0;
@@ -49,7 +63,7 @@ namespace UtauEngineNg.Llsm
                     float sum = 0;
                     for (int h = 0; h < ampl.Length; h++) sum += MathF.Abs(ampl[h]);
 
-                    float limit = Math.Max(edc[ch], 0f) * EenvModulationLimit; // 変調深度250%まで許容
+                    float limit = Math.Max(edc[ch], 0f) * EffectiveEenvLimit; // 既定: 変調深度250%まで許容
                     if (sum > limit && sum > 0)
                     {
                         float scale = limit / sum;
@@ -62,7 +76,7 @@ namespace UtauEngineNg.Llsm
             }
 
             if (clamped > 0)
-                _log.Info(Stage, $"Clamped eenv modulation depth on {clamped}/{nfrm} frames");
+                _log.Info(Stage, $"Clamped eenv modulation depth on {clamped}/{nfrm} frames (limit x{EffectiveEenvLimit:F2})");
         }
 
         /// <summary>

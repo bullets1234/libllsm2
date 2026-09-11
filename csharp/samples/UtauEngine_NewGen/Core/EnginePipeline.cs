@@ -21,6 +21,12 @@ namespace UtauEngineNg.Core
     {
         private const string Stage = "Pipeline";
         private const float ThopSeconds = 0.005f; // 5ms
+        /// <summary>
+        /// 解析の端パディング（フレーム）。区間の外側に実音声があればその分を余分に切り出して
+        /// 解析し、後で捨てる。区間端で解析窓がゼロ埋めを見ることによる先頭/末尾フレームの
+        /// HM/NM 崩れ（先頭のクリック・息のスパイク）を防ぐ。L2R_EDGEPAD=0 / N32 で無効化。
+        /// </summary>
+        private const int AnalysisPadFrames = 4;
 
         private readonly DiagnosticsContext _diag;
 
@@ -38,7 +44,8 @@ namespace UtauEngineNg.Core
                     (args.ParsedFlags.DisableVsphseSmoother ? " smoother" : "") +
                     (args.ParsedFlags.DisableResidualCorrection ? " residual" : "") +
                     (args.ParsedFlags.DisableEenvClamp ? " eenv-clamp" : "") +
-                    (args.ParsedFlags.DisableNoiseTexture ? " nm-texture" : ""));
+                    (args.ParsedFlags.DisableNoiseTexture ? " nm-texture" : "") +
+                    (args.ParsedFlags.DisableEdgePad ? " edge-pad" : ""));
 
             // 1. WAV 読み込み
             var (samples, fs) = WavIo.ReadMono(args.InputWav);
@@ -67,18 +74,39 @@ namespace UtauEngineNg.Core
             // 解析フレームが 1 フレーム分ドリフトする。
             float thopSec = nhop / (float)fs;
 
-            // 4. F0 推定
+            // 3.5 解析用の端パディング: 区間外の実音声を前後に足す（利用可能な範囲で、フレーム単位）
+            bool edgePad = Environment.GetEnvironmentVariable("L2R_EDGEPAD") != "0" && !args.ParsedFlags.DisableEdgePad;
+            int padStartFrames = edgePad ? Math.Min(AnalysisPadFrames, seg.StartSample / nhop) : 0;
+            int padEndFrames = edgePad ? Math.Min(AnalysisPadFrames, (samples.Length - (seg.StartSample + seg.TotalLength)) / nhop) : 0;
+            int padStart = padStartFrames * nhop, padEnd = padEndFrames * nhop;
+            float[] analysisSegment = segment;
+            if (padStart > 0 || padEnd > 0)
+            {
+                analysisSegment = new float[seg.TotalLength + padStart + padEnd];
+                Array.Copy(samples, seg.StartSample - padStart, analysisSegment, 0, analysisSegment.Length);
+                log.Debug(Stage, $"Analysis edge padding: +{padStartFrames}f head, +{padEndFrames}f tail");
+            }
+            int expectedFrames = seg.TotalLength / nhop + 1; // パディングなしの場合のフレーム数
+
+            // 4. F0 推定（パディング込みの区間で行い、後でパディング分を捨てる）
             F0Result f0Result;
             using (_diag.Profiler.Measure("f0_estimate"))
                 f0Result = new F0Provider(_diag).Estimate(
-                    segment, fs, nhop, thopSec, frqData, seg.OffsetSamples, seg.TotalLength, args.TargetF0, args.ParsedFlags, neuralF0);
-            float[] f0 = f0Result.F0;
+                    analysisSegment, fs, nhop, thopSec, frqData, seg.OffsetSamples - padStart, analysisSegment.Length,
+                    args.TargetF0, args.ParsedFlags, neuralF0);
+            float[] f0Padded = f0Result.F0;
+            int keepFrames = Math.Min(expectedFrames, f0Padded.Length - padStartFrames - padEndFrames);
+            if (keepFrames < 1) { padStartFrames = 0; keepFrames = f0Padded.Length; }
+            float[] f0 = new float[keepFrames];
+            Array.Copy(f0Padded, padStartFrames, f0, 0, keepFrames);
+            var micro = f0Result.Micro.Slice(padStartFrames, keepFrames);
             _diag.Dump.DumpF0("f0_final", f0, thopSec);
 
-            // 5. LLSM 解析（2x オーバーサンプリング）
+            // 5. LLSM 解析（2x オーバーサンプリング、パディング込み → フレーム切り詰め）
             AnalysisResult analysis;
             using (_diag.Profiler.Measure("analyze"))
-                analysis = new Analyzer(_diag).Analyze(segment, fs, f0, thopSec, f0Result.SrcF0, args.ParsedFlags);
+                analysis = new Analyzer(_diag).Analyze(analysisSegment, fs, f0Padded, thopSec, f0Result.SrcF0, args.ParsedFlags,
+                    padStartFrames, keepFrames);
             using var chunk = analysis.Chunk; // 解析チャンクは Run 完了時に確定的に解放
             int nfrm = analysis.NumFrames;
             float actualThop = analysis.ThopSeconds;
@@ -114,7 +142,7 @@ namespace UtauEngineNg.Core
             var sp = SynthesisParams.FromFlags(
                 args.ParsedFlags, srcF0, args.TargetF0, new System.Collections.Generic.List<int>(args.PitchBend),
                 args.Tempo, consonantFrames, consonantStretch, stretchRatio, actualThop, overlapMs, args.Modulation,
-                f0Result.Micro);
+                micro);
 
             SynthesisResult synth;
             using (_diag.Profiler.Measure("synthesize"))
