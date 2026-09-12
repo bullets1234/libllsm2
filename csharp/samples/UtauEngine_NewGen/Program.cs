@@ -31,6 +31,8 @@ namespace UtauEngineNg
                 return 1;
             }
 
+            CaptureCall(rawArgs);
+
             try
             {
                 var args = ResamplerArgs.Parse(rawArgs);
@@ -52,6 +54,29 @@ namespace UtauEngineNg
                 log.Debug("Main", ex.StackTrace ?? "");
                 return 2;
             }
+        }
+
+        /// <summary>
+        /// 再現用の呼び出し記録。exe と同じフォルダに L2R_capture.on（空ファイル）があるとき、
+        /// 全引数を L2R_calls.log へ 1 行ずつ追記する（UTAU からの呼び出しをそのまま再実行できる）。
+        /// </summary>
+        private static void CaptureCall(string[] rawArgs)
+        {
+            try
+            {
+                string dir = AppContext.BaseDirectory;
+                if (!System.IO.File.Exists(System.IO.Path.Combine(dir, "L2R_capture.on"))) return;
+                var sb = new StringBuilder();
+                sb.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append('	');
+                foreach (var a in rawArgs)
+                {
+                    bool quote = a.Length == 0 || a.IndexOf(' ') >= 0;
+                    if (quote) sb.Append('"').Append(a).Append('"'); else sb.Append(a);
+                    sb.Append(' ');
+                }
+                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "L2R_calls.log"), sb.ToString().TrimEnd() + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { /* 記録失敗は無視 */ }
         }
 
         private static void PrintUsage()
