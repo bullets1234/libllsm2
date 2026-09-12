@@ -40,6 +40,13 @@ namespace UtauEngineNg.Llsm
         private const float EdcFloor = 1e-9f;
         /// <summary>PSD 残差（dB）のクランプ。Kalman 平滑後の PSD が持つ速い変動分。</summary>
         private const float PsdResidualClamp = 6.0f;
+        /// <summary>
+        /// PSDRES 微細成分（dB）のクランプ。PSDRES 自体は log-χ² 残差（標準偏差 5〜6dB）だが、
+        /// Kalman 平滑の追従遅れ由来の「ゆっくり変わる成分」も含む。それを局所平均として
+        /// 伸長位置側に残し、微細成分だけを転写する（遅れ成分ごと ±100ms 先から持ってくると
+        /// 非定常区間でノイズパワーが約 +2.4dB 上振れした、実測）。
+        /// </summary>
+        private const float PsdresResidualClamp = 20.0f;
         /// <summary>eenv 変調深度 log 残差のクランプ。±0.7 ≈ ×0.5〜×2。</summary>
         private const float EenvResidualClamp = 0.7f;
         /// <summary>
@@ -54,6 +61,13 @@ namespace UtauEngineNg.Llsm
         /// </summary>
         private const float IdentityStretchThreshold = 1.05f;
 
+        /// <summary>
+        /// 診断用: L2R_NMTEX_PARTS に含まれる成分だけ転写する（既定 "psdres,psd,edc,eenv"）。
+        /// </summary>
+        private static readonly string PartMask =
+            (Environment.GetEnvironmentVariable("L2R_NMTEX_PARTS") ?? "psdres,psd,edc,eenv").ToLowerInvariant();
+        private static bool PartOn(string name) => PartMask.Contains(name, StringComparison.Ordinal);
+
         private readonly ILogger _log;
         private readonly ChunkHandle _src;
         private readonly int _srcNfrm;
@@ -64,6 +78,12 @@ namespace UtauEngineNg.Llsm
         private readonly float[]?[] _psdResidual;
         /// <summary>フレーム毎・チャンネル毎の eenv 変調深度 log(Σ|ampl|) 残差。eenv 不在なら null。</summary>
         private readonly float[]?[] _eenvResidual;
+        /// <summary>フレーム毎の PSDRES（dB）とその局所平均・微細成分。PSDRES 不在なら null。</summary>
+        private readonly float[]?[] _psdres;
+        private readonly float[]?[] _psdresLocalMean;
+        private readonly float[]?[] _psdresFine;
+        /// <summary>微細成分のフレーム内リニア平均ゲイン（dB）。fine から差し引いて形状のみ転写する。</summary>
+        private readonly float[] _psdresFineGain;
 
         private int _cursor = -1;
         private int _dir = +1;
@@ -83,6 +103,10 @@ namespace UtauEngineNg.Llsm
             _edcResidual = new float[]?[srcNfrm];
             _psdResidual = new float[]?[srcNfrm];
             _eenvResidual = new float[]?[srcNfrm];
+            _psdres = new float[]?[srcNfrm];
+            _psdresLocalMean = new float[]?[srcNfrm];
+            _psdresFine = new float[]?[srcNfrm];
+            _psdresFineGain = new float[srcNfrm];
             if (!IsActive) return;
 
             // 有声フラグ・log(edc)・PSD(dB) を先に読む
@@ -103,6 +127,12 @@ namespace UtauEngineNg.Llsm
                     logEdc[i] = le;
                 }
                 if (nmv.HasPsd) psd[i] = nmv.ReadPsd();
+                var prPtr = NativeLLSM.llsm_container_get(fr.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
+                if (prPtr != IntPtr.Zero)
+                {
+                    int n = NativeLLSM.llsm_fparray_length(prPtr);
+                    if (n > 0) { var a = new float[n]; Marshal.Copy(prPtr, a, 0, n); _psdres[i] = a; }
+                }
                 if (nmv.HasEenv && _srcVoiced[i])
                 {
                     var le = new float[nmv.NChannel];
@@ -121,6 +151,26 @@ namespace UtauEngineNg.Llsm
             _edcResidual = ComputeResiduals(logEdc, EdcResidualClamp);
             _psdResidual = ComputeResiduals(psd, PsdResidualClamp);
             _eenvResidual = ComputeResiduals(logEenv, EenvResidualClamp);
+            var psdresFine = ComputeResiduals(_psdres, PsdresResidualClamp);
+            for (int i = 0; i < srcNfrm; i++)
+            {
+                var pr = _psdres[i]; var fine = psdresFine[i];
+                if (pr == null || fine == null) continue;
+                var lm = new float[pr.Length];
+                for (int b = 0; b < pr.Length; b++) lm[b] = pr[b] - fine[b];
+                // フレーム内のリニア平均ゲインを分離する: fine = shape + gain。
+                // 局所平均は dB 平均なので、fine のリニア平均は 1 にならず（Jensen）、しかも
+                // 局所平均と負相関する（バーストで平滑が遅れる箇所ほど fine が正）。
+                // gain を伸長位置側で補間し、テクスチャ側からは shape（リニア平均 1）だけ持ってくる
+                // ことで、フレーム毎のノイズパワーを原音の対応位置と一致させる。
+                double lin = 0;
+                for (int b = 0; b < fine.Length; b++) lin += Math.Pow(10.0, fine[b] / 10.0);
+                float gain = (float)(10.0 * Math.Log10(lin / fine.Length + 1e-30));
+                for (int b = 0; b < fine.Length; b++) fine[b] -= gain;
+                _psdresFineGain[i] = gain;
+                _psdresLocalMean[i] = lm;
+                _psdresFine[i] = fine;
+            }
         }
 
         /// <summary>チャンネル c の eenv 変調深度 Σ|ampl|（0 なら eenv なし）。</summary>
@@ -199,12 +249,32 @@ namespace UtauEngineNg.Llsm
 
             var texFrame = LlsmBindings.Llsm.GetFrame(_src, tex);
 
-            // 1. PSDRES: テクスチャフレームのものをそのまま載せ替える
-            var psdresPtr = NativeLLSM.llsm_container_get(texFrame.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
-            if (psdresPtr != IntPtr.Zero && NativeLLSM.llsm_fparray_length(psdresPtr) > 0)
+            // 1. PSDRES: 局所平均とフレーム内ゲインは伸長位置で補間し、形状だけテクスチャから載せる
+            //    psdres_out = lerp(lm[idx1], lm[idx2]) + lerp(gain[idx1], gain[idx2]) + shape[tex]
+            var fineTex = _psdresFine[tex];
+            if (PartOn("psdres") && fineTex != null)
             {
-                NativeCallbacks.AttachFpArrayCopy(dstFramePtr, NativeLLSM.LLSM_FRAME_PSDRES, psdresPtr);
-                _psdresTransferred++;
+                var lm1 = IndexOrNull(_psdresLocalMean, srcIdx1);
+                var lm2 = IndexOrNull(_psdresLocalMean, srcIdx2);
+                var lmBase = lm1 ?? lm2;
+                if (lmBase != null && lmBase.Length == fineTex.Length)
+                {
+                    int n = fineTex.Length;
+                    float g1 = srcIdx1 >= 0 && srcIdx1 < _srcNfrm && _psdresFine[srcIdx1] != null ? _psdresFineGain[srcIdx1] : float.NaN;
+                    float g2 = srcIdx2 >= 0 && srcIdx2 < _srcNfrm && _psdresFine[srcIdx2] != null ? _psdresFineGain[srcIdx2] : float.NaN;
+                    if (float.IsNaN(g1)) g1 = float.IsNaN(g2) ? 0f : g2;
+                    if (float.IsNaN(g2)) g2 = g1;
+                    float gain = g1 * (1f - ratio) + g2 * ratio;
+                    var outArr = new float[n];
+                    for (int b = 0; b < n; b++)
+                    {
+                        float a = lm1 != null && lm1.Length == n ? lm1[b] : lmBase[b];
+                        float c = lm2 != null && lm2.Length == n ? lm2[b] : lmBase[b];
+                        outArr[b] = a * (1f - ratio) + c * ratio + gain + fineTex[b];
+                    }
+                    NativeCallbacks.AttachFpArray(dstFramePtr, NativeLLSM.LLSM_FRAME_PSDRES, outArr);
+                    _psdresTransferred++;
+                }
             }
 
             var nmOut = FrameAccess.TryGetNm(new ContainerRef(dstFramePtr));
@@ -217,7 +287,7 @@ namespace UtauEngineNg.Llsm
             // 2. PSD(dB): 補間値から「補間位置の残差」を除き「テクスチャ位置の残差」を載せる
             //    psd_out = psd_interp - lerp(res[idx1], res[idx2]) + res[tex]
             var resTexPsd = _psdResidual[tex];
-            if (resTexPsd != null && nmv.HasPsd)
+            if (PartOn("psd") && resTexPsd != null && nmv.HasPsd)
             {
                 float[] p = nmv.ReadPsd();
                 if (p.Length == resTexPsd.Length)
@@ -232,7 +302,7 @@ namespace UtauEngineNg.Llsm
             // 3. edc(log パワー): 同様に残差を付け替える
             //    edc_out = exp( log(edc_interp) - lerp(res[idx1], res[idx2]) + res[tex] )
             var resTexEdc = _edcResidual[tex];
-            if (resTexEdc != null && nmv.HasEdc)
+            if (PartOn("edc") && resTexEdc != null && nmv.HasEdc)
             {
                 float[] edc = nmv.ReadEdc();
                 if (edc.Length == resTexEdc.Length)
@@ -251,7 +321,7 @@ namespace UtauEngineNg.Llsm
 
             // 4. eenv 変調深度: チャンネル毎に Σ|ampl| の log 残差を付け替える（振幅を一様スケール）
             var resTexEenv = _eenvResidual[tex];
-            if (resTexEenv != null && nmv.HasEenv && outVoiced)
+            if (PartOn("eenv") && resTexEenv != null && nmv.HasEenv && outVoiced)
             {
                 var res1E = IndexOrNull(_eenvResidual, srcIdx1);
                 var res2E = IndexOrNull(_eenvResidual, srcIdx2);

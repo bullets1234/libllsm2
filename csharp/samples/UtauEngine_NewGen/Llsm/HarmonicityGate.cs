@@ -28,11 +28,20 @@ namespace UtauEngineNg.Llsm
         private const string Stage = "HarmGate";
 
         /// <summary>これ以上のピーク対谷なら完全に倍音（w=1）。</summary>
-        private const float HarmonicDb = 14f;
+        private const float HarmonicDb = 10f;
         /// <summary>これ以下のピーク対谷ならノイズ（w=0）。Hann 窓のノイズで max/median の偏りが約 +5dB。</summary>
-        private const float NoiseDb = 6f;
-        /// <summary>これ未満の倍音は対象外（低域は常に倍音で、窓の分解能も相対的に粗い）。</summary>
-        private const float MinFreqHz = 1500f;
+        private const float NoiseDb = 3f;
+        /// <summary>
+        /// これ未満の倍音は対象外。実歌唱（UTAU 曲）での試聴で 1.5kHz 起点は「ノイズが目立つ」
+        /// 判定だったため、耳の感度が高く倍音が支配的な 4kHz 未満は触らない。
+        /// </summary>
+        private const float MinFreqHz = 4000f;
+        /// <summary>
+        /// 遷移保護: 前後フレームとの F0 変化率がこれを超えるフレーム、および無声フレームから
+        /// この距離（フレーム）以内は測定が窓内スミアで低く出るため対象外（w=1）。
+        /// </summary>
+        private const float MaxF0ChangeRatio = 0.03f;
+        private const int VuvGuardFrames = 3;
         /// <summary>解析窓長（F0 周期の倍数）。谷測定位置 ±0.5F0 が主ローブ外になるよう 5 周期。</summary>
         private const float WindowPeriods = 5f;
         private const float WindowMinSec = 0.020f, WindowMaxSec = 0.060f;
@@ -96,11 +105,28 @@ namespace UtauEngineNg.Llsm
             var w = new float[nfrm, maxNhar];
             for (int i = 0; i < nfrm; i++) for (int h = 0; h < maxNhar; h++) w[i, h] = float.NaN;
 
+            // 遷移保護フレーム（F0 急変 / V/UV 境界近傍）は測定せず w=1 相当（NaN=対象外）
+            var guarded = new bool[nfrm];
+            for (int i = 0; i < nfrm; i++)
+            {
+                if (f0s[i] <= 0) continue;
+                for (int d = 1; d <= VuvGuardFrames; d++)
+                {
+                    if ((i - d >= 0 && f0s[i - d] <= 0) || (i + d < nfrm && f0s[i + d] <= 0)) { guarded[i] = true; break; }
+                }
+                if (guarded[i]) continue;
+                float prev = i > 0 ? f0s[i - 1] : f0s[i], next = i < nfrm - 1 ? f0s[i + 1] : f0s[i];
+                if (prev > 0 && MathF.Abs(prev - f0s[i]) / f0s[i] > MaxF0ChangeRatio) guarded[i] = true;
+                if (next > 0 && MathF.Abs(next - f0s[i]) / f0s[i] > MaxF0ChangeRatio) guarded[i] = true;
+            }
+
             var floorScratch = new List<double>();
+            int guardedCount = 0;
             for (int i = 0; i < nfrm; i++)
             {
                 float f0 = f0s[i];
                 if (f0 <= 0 || hmFrames[i] == null) continue;
+                if (guarded[i]) { guardedCount++; continue; }
                 int nhar = hmFrames[i]!.Value.NHar;
 
                 float winSec = Math.Clamp(WindowPeriods / f0, WindowMinSec, WindowMaxSec);
@@ -217,7 +243,7 @@ namespace UtauEngineNg.Llsm
             }
 
             string Pct(int b) => bandTotal[b] > 0 ? $"{100.0 * bandMoved[b] / bandTotal[b]:F0}%" : "-";
-            log.Info(Stage, $"Harmonicity gate (>= {MinFreq:F0}Hz, {GateDb.noise:F0}..{GateDb.harmonic:F0}dB): {touchedFrames}/{nfrm} frames, mean w={(wCnt > 0 ? wSum / wCnt : 1):F2}, " +
+            log.Info(Stage, $"Harmonicity gate (>= {MinFreq:F0}Hz, {GateDb.noise:F0}..{GateDb.harmonic:F0}dB): {touchedFrames}/{nfrm} frames, {guardedCount} guarded, mean w={(wCnt > 0 ? wSum / wCnt : 1):F2}, " +
                             $"HM power moved to NM: 1.5-3k {Pct(0)}, 3-6k {Pct(1)}, 6-10k {Pct(2)}, 10k+ {Pct(3)} " +
                             $"(total {(harmonicTotal > 0 ? 100.0 * movedTotal / harmonicTotal : 0):F1}%)");
         }
