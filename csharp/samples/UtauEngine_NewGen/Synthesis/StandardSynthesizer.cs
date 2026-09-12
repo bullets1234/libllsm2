@@ -327,8 +327,8 @@ namespace UtauEngineNg.Synthesis
                 int nhopExc = Math.Max(1, (int)MathF.Round(p.ThopSeconds * fs));
                 var srcF0s = new float[srcNfrm];
                 for (int s = 0; s < srcNfrm; s++) srcF0s[s] = LlsmBindings.Llsm.GetFrameF0(LlsmBindings.Llsm.GetFrame(srcChunk, s));
-                excitation = ResidualExcitation.Build(residual!, excSourceFrame, nhopExc, srcNfrm, srcF0s, dstF0, sourceSegment);
-                log.Info(Stage, $"Residual excitation: {excitation.Length} samples from {srcNfrm} source frames (pitch-sync grains)");
+                excitation = ResidualExcitation.Build(residual!, excSourceFrame, nhopExc, srcNfrm, srcF0s, dstF0, sourceSegment, p.PsolaExcitation);
+                log.Info(Stage, $"Residual excitation: {excitation.Length} samples from {srcNfrm} source frames" + (p.PsolaExcitation ? " (PSOLA, p flag)" : ""));
             }
 
             var result = Render(dstChunk, fs, p.UseOversampling, useLayer1Synthesis, log, excitation);

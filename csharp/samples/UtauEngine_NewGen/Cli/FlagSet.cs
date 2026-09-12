@@ -42,6 +42,8 @@ namespace UtauEngineNg.Cli
         public bool FixedAmplitudeRatio { get; }
         /// <summary>V: F0 ベースの有声境界自動検出。</summary>
         public bool F0Boundary { get; }
+        /// <summary>p（小文字）: 残差励振のピッチ同期再配置（PSOLA、試験）。</summary>
+        public bool PsolaExcitation { get; }
 
         // --- 数値フラグ ---
         /// <summary>B: 息成分（0-100、既定 50）。</summary>
@@ -103,6 +105,7 @@ namespace UtauEngineNg.Cli
             GlottalAutoEstimate = Has("L");
             FixedAmplitudeRatio = HasChar('X');
             F0Boundary = Has("V");
+            PsolaExcitation = Has("p");
             ModulationPlus = Raw.Contains("M+", StringComparison.Ordinal)
                           || Raw.Contains("M1", StringComparison.Ordinal);
 

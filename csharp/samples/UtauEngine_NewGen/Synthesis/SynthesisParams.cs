@@ -50,6 +50,8 @@ namespace UtauEngineNg.Synthesis
         public bool DisableNoiseTexture { get; init; }
         public bool DisableEdgePad { get; init; }
         public bool DisableResidualExcitation { get; init; }
+        /// <summary>p: 残差励振の PSOLA 再配置を有効化（試験）。</summary>
+        public bool PsolaExcitation { get; init; }
 
         // 合成オプション
         public bool UseOversampling { get; init; }
@@ -90,6 +92,7 @@ namespace UtauEngineNg.Synthesis
                 DisableNoiseTexture = flags.DisableNoiseTexture,
                 DisableEdgePad = flags.DisableEdgePad,
                 DisableResidualExcitation = flags.DisableResidualExcitation,
+                PsolaExcitation = flags.PsolaExcitation,
                 UseOversampling = flags.Oversampling,
             };
         }

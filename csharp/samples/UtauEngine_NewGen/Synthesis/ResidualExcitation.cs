@@ -40,8 +40,9 @@ namespace UtauEngineNg.Synthesis
         /// <param name="srcF0">原音フレーム毎の F0（無声 0）。</param>
         /// <param name="dstF0">出力フレーム毎の目標 F0（無声 0）。sourceFrame と同じ長さ。</param>
         /// <param name="source">原音波形（残差と同じ整列）。位相マーク検出に使う。null なら残差包絡マーク。</param>
-        public static float[] Build(float[] residual, int[] sourceFrame, int nhop, int srcNfrm, float[]? srcF0 = null, float[]? dstF0 = null, float[]? source = null)
+        public static float[] Build(float[] residual, int[] sourceFrame, int nhop, int srcNfrm, float[]? srcF0 = null, float[]? dstF0 = null, float[]? source = null, bool psola = false)
         {
+            bool pitchSync = PitchSync || psola;
             int nfrm = sourceFrame.Length;
             int ny = (nfrm + 1) * nhop;
             var y = new float[ny];
@@ -50,7 +51,7 @@ namespace UtauEngineNg.Synthesis
             var voiced = new bool[nfrm];
             int[]? marks = null;
             int[]? markOfFrame = null; // 原音フレーム s に最も近いマークのインデックス（無ければ -1）
-            if (PitchSync && srcF0 != null && dstF0 != null && srcF0.Length >= srcNfrm)
+            if (pitchSync && srcF0 != null && dstF0 != null && srcF0.Length >= srcNfrm)
             {
                 marks = source != null && source.Length > 0
                     ? FindPhaseMarks(source, srcF0, srcNfrm, nhop)
