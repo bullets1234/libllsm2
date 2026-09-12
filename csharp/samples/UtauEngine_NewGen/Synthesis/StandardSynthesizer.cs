@@ -46,7 +46,7 @@ namespace UtauEngineNg.Synthesis
 
         public StandardSynthesizer(DiagnosticsContext diag) => _diag = diag;
 
-        public SynthesisResult Synthesize(ChunkHandle srcChunk, int fs, SynthesisParams p, float[]? residual = null)
+        public SynthesisResult Synthesize(ChunkHandle srcChunk, int fs, SynthesisParams p, float[]? residual = null, float[]? sourceSegment = null)
         {
             var log = _diag.Log;
             float srcF0 = p.SrcF0, targetF0 = p.TargetF0;
@@ -327,7 +327,7 @@ namespace UtauEngineNg.Synthesis
                 int nhopExc = Math.Max(1, (int)MathF.Round(p.ThopSeconds * fs));
                 var srcF0s = new float[srcNfrm];
                 for (int s = 0; s < srcNfrm; s++) srcF0s[s] = LlsmBindings.Llsm.GetFrameF0(LlsmBindings.Llsm.GetFrame(srcChunk, s));
-                excitation = ResidualExcitation.Build(residual!, excSourceFrame, nhopExc, srcNfrm, srcF0s, dstF0);
+                excitation = ResidualExcitation.Build(residual!, excSourceFrame, nhopExc, srcNfrm, srcF0s, dstF0, sourceSegment);
                 log.Info(Stage, $"Residual excitation: {excitation.Length} samples from {srcNfrm} source frames (pitch-sync grains)");
             }
 

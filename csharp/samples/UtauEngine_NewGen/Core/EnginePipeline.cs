@@ -148,7 +148,7 @@ namespace UtauEngineNg.Core
 
             SynthesisResult synth;
             using (_diag.Profiler.Measure("synthesize"))
-                synth = new StandardSynthesizer(_diag).Synthesize(chunk, fs, sp, analysis.Residual);
+                synth = new StandardSynthesizer(_diag).Synthesize(chunk, fs, sp, analysis.Residual, segment);
             float[] output = synth.Output;
 
             // 10. 子音原音ブレンド（C フラグ）

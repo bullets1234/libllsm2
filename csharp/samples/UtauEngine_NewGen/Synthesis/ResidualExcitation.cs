@@ -39,7 +39,8 @@ namespace UtauEngineNg.Synthesis
         /// </summary>
         /// <param name="srcF0">原音フレーム毎の F0（無声 0）。</param>
         /// <param name="dstF0">出力フレーム毎の目標 F0（無声 0）。sourceFrame と同じ長さ。</param>
-        public static float[] Build(float[] residual, int[] sourceFrame, int nhop, int srcNfrm, float[]? srcF0 = null, float[]? dstF0 = null)
+        /// <param name="source">原音波形（残差と同じ整列）。位相マーク検出に使う。null なら残差包絡マーク。</param>
+        public static float[] Build(float[] residual, int[] sourceFrame, int nhop, int srcNfrm, float[]? srcF0 = null, float[]? dstF0 = null, float[]? source = null)
         {
             int nfrm = sourceFrame.Length;
             int ny = (nfrm + 1) * nhop;
@@ -51,7 +52,9 @@ namespace UtauEngineNg.Synthesis
             int[]? markOfFrame = null; // 原音フレーム s に最も近いマークのインデックス（無ければ -1）
             if (PitchSync && srcF0 != null && dstF0 != null && srcF0.Length >= srcNfrm)
             {
-                marks = FindSourceMarks(residual, srcF0, srcNfrm, nhop);
+                marks = source != null && source.Length > 0
+                    ? FindPhaseMarks(source, srcF0, srcNfrm, nhop)
+                    : FindSourceMarks(residual, srcF0, srcNfrm, nhop);
                 if (marks.Length > 0)
                 {
                     markOfFrame = NearestMarkPerFrame(marks, srcNfrm, nhop);
@@ -152,6 +155,52 @@ namespace UtauEngineNg.Synthesis
                 float wn = 0.5f - 0.5f * MathF.Cos(2f * MathF.PI * n / glen);
                 y[di] += v * wn;
             }
+        }
+
+        /// <summary>
+        /// 基本波の位相からパルスマークを作る。各有声フレームで原音を 2 周期 Hann 窓で切り、
+        /// F0 の DFT で基本波の位相 φ を求め、基本波が正のピークになる時刻
+        /// t0 = c − φ·fs/(2π·f0) を基準に周期 T で並べる。バースト包絡の最大値を使う方式と違い、
+        /// グレインが常に「エネルギーの山」を中心に持つ偏り（人工的な振幅変調＝ブツブツ）が出ない。
+        /// </summary>
+        private static int[] FindPhaseMarks(float[] x, float[] srcF0, int srcNfrm, int nhop)
+        {
+            double fs = SampleRateOf(nhop);
+            var marks = new List<int>();
+            int n = x.Length;
+            double lastMark = double.NegativeInfinity;
+            for (int s = 0; s < srcNfrm; s++)
+            {
+                float f0 = srcF0[s];
+                if (f0 <= 0) { lastMark = double.NegativeInfinity; continue; }
+                double T = fs / f0;
+                int c = s * nhop;
+                int half = (int)Math.Round(T);                 // 2 周期窓
+                double re = 0, im = 0;
+                for (int i = -half; i <= half; i++)
+                {
+                    int idx = c + i;
+                    if (idx < 0 || idx >= n) continue;
+                    double w = 0.5 + 0.5 * Math.Cos(Math.PI * i / (half + 1));
+                    double ph = 2.0 * Math.PI * f0 * i / fs;
+                    re += x[idx] * w * Math.Cos(ph);
+                    im -= x[idx] * w * Math.Sin(ph);
+                }
+                if (re == 0 && im == 0) continue;
+                double phi = Math.Atan2(im, re);               // x ≈ A cos(2π f0 (t−c)/fs + φ)
+                double t0 = c - phi / (2.0 * Math.PI * f0) * fs; // 基本波ピーク時刻
+                // このフレームの担当区間 [c − nhop/2, c + nhop/2) 内のマークを並べる
+                double lo = c - nhop / 2.0, hi = c + nhop / 2.0;
+                double t = t0 - Math.Ceiling((t0 - lo) / T) * T;
+                for (; t < hi; t += T)
+                {
+                    if (t < lo) continue;
+                    if (t - lastMark < 0.5 * T) continue;      // 前フレームとの重複除去
+                    marks.Add((int)Math.Round(t));
+                    lastMark = t;
+                }
+            }
+            return marks.ToArray();
         }
 
         /// <summary>
