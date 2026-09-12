@@ -6,9 +6,11 @@ namespace UtauEngineNg.Synthesis
     /// <summary>
     /// 出力後処理：基準レベル正規化 → ボリューム適用 → ピークリミット。
     ///
-    /// UTAU 音源は録音レベルがまちまちで、合成チェーン（ピッチ比エネルギー補償等）の
-    /// ゲインもノート毎に異なるため、出力の実効音量（無音除外 RMS）を基準レベル
-    /// （-16dBFS）へ正規化してノート間・音源間のバランスを揃える。
+    /// 合成チェーン（ピッチ比エネルギー補償等）のゲインはノート毎に異なるため、出力の
+    /// 実効音量（無音除外 RMS）を基準レベルへ正規化してノート間のバランスを揃える。
+    /// 基準レベルは既定で「原音区間の実効音量」（＝音源の録音レベルをそのまま保つ。
+    /// 旧版のピーク処理のみの挙動と同じ音量感）。環境変数 L2R_TARGET_DB=-16 等を指定した
+    /// 場合のみ絶対値（dBFS）を基準にし、音源間のレベルも揃える。
     /// ゲインは ±12dB でクランプするため、囁き・息・語尾などの極端に静かな素材が
     /// 通常ノートと同じ音量まで爆音化することはない（+12dB 止まり）。
     /// 最後に UTAU ミキサーのオーバーラップ加算でクリップしないよう
@@ -18,15 +20,16 @@ namespace UtauEngineNg.Synthesis
     {
         private const string Stage = "Volume";
         private const float MaxPeak = 0.70f;        // -3dB
+        /// <summary>L2R_TARGET_DB 未指定時のフォールバック（原音レベルが取れない場合のみ使用）。</summary>
         private const float DefaultTargetRmsDb = -16f;
         private const float MaxNormGainDb = 12f;    // 正規化ゲインの安全クランプ ±12dB
         private const int RmsFrameLen = 441;        // 10ms @44.1k 相当（絶対時間でなくてよい）
 
         /// <summary>
-        /// 基準レベル（実効 RMS, dBFS）。UTAU ミックスで音割れする場合は
-        /// 環境変数 L2R_TARGET_DB=-18 等でヘッドルームを増やせる。
+        /// 絶対基準レベル（実効 RMS, dBFS）。環境変数 L2R_TARGET_DB=-16 等で指定した場合のみ有効。
+        /// 未指定（NaN）なら原音区間のレベルに合わせる。
         /// </summary>
-        private static readonly float TargetRmsDb = ResolveTargetDb();
+        private static readonly float AbsoluteTargetDb = ResolveTargetDb();
 
         private static float ResolveTargetDb()
         {
@@ -34,26 +37,40 @@ namespace UtauEngineNg.Synthesis
             return float.TryParse(s, System.Globalization.NumberStyles.Float,
                        System.Globalization.CultureInfo.InvariantCulture, out var v)
                    && v > -40f && v < 0f
-                ? v : DefaultTargetRmsDb;
+                ? v : float.NaN;
         }
 
-        /// <summary>基準レベル正規化＋ボリューム適用＋ピークリミット（in-place）。</summary>
-        public static void Apply(float[] output, int volume, ILogger log)
+        /// <summary>原音区間の実効レベル（dBFS）。<see cref="Apply"/> の基準に使う。</summary>
+        public static float SourceLevelDb(float[] segment)
+        {
+            float rms = ActiveRms(segment);
+            return rms > 1e-6f ? 20f * MathF.Log10(rms) : float.NaN;
+        }
+
+        /// <summary>
+        /// 基準レベル正規化＋ボリューム適用＋ピークリミット（in-place）。
+        /// <paramref name="sourceLevelDb"/> は原音区間の実効レベル（NaN なら -16dBFS フォールバック）。
+        /// </summary>
+        public static void Apply(float[] output, int volume, ILogger log, float sourceLevelDb = float.NaN)
         {
             if (output.Length == 0) return;
 
             // 1. 基準レベルへの正規化（±12dB クランプ）
+            bool absolute = !float.IsNaN(AbsoluteTargetDb);
+            float targetDb = absolute ? AbsoluteTargetDb
+                           : !float.IsNaN(sourceLevelDb) ? sourceLevelDb
+                           : DefaultTargetRmsDb;
             float outRms = ActiveRms(output);
             if (outRms > 1e-6f)
             {
                 float gainDb = Math.Clamp(
-                    TargetRmsDb - 20f * MathF.Log10(outRms), -MaxNormGainDb, MaxNormGainDb);
+                    targetDb - 20f * MathF.Log10(outRms), -MaxNormGainDb, MaxNormGainDb);
                 if (MathF.Abs(gainDb) > 0.1f)
                 {
                     float gain = MathF.Pow(10f, gainDb / 20f);
                     for (int i = 0; i < output.Length; i++) output[i] *= gain;
                     log.Debug(Stage, $"Normalize: {20f * MathF.Log10(outRms):F1}dBFS -> " +
-                                     $"target {TargetRmsDb:F0}dBFS (gain {gainDb:+0.0;-0.0}dB)");
+                                     $"{(absolute ? "target" : "source")} {targetDb:F1}dBFS (gain {gainDb:+0.0;-0.0}dB)");
                 }
             }
 

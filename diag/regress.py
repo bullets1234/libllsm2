@@ -185,7 +185,8 @@ def main():
               f"below={below:.1f}dB above={above:.1f}dB diff={below-above:.1f}dB")
 
     # 3.5 レベル一貫性: 同一ソースを A2/A3/A4 でレンダリングしたとき、
-    #     実効 RMS（無音除外）が基準レベル -16dBFS ±2dB に揃うこと
+    #     実効 RMS（無音除外）が原音区間の実効レベル ±2dB に揃うこと
+    #     （既定は原音レベル追従。L2R_TARGET_DB 指定時のみ絶対値）
     def active_rms_db(path):
         fs, s = read_wav(path)
         fl = 441
@@ -199,15 +200,15 @@ def main():
         act = [m for m in ms if m >= mx * 0.01]
         return 10 * math.log10(sum(act) / len(act) + 1e-20)
 
-    TARGET_DB = -16.0
+    TARGET_DB = active_rms_db(src)  # 原音（先頭 700ms 区間 ≈ 全体）の実効レベル
     levels = {}
     for pitch in ("A2", "A3", "A4"):
         out = os.path.join(tmp, f"lvl_{pitch}.wav")
         run(exe, [src, out, pitch, "100", "", "0", "700", "100", "0", "100", "0"])
         levels[pitch] = active_rms_db(out)
     off = max(abs(v - TARGET_DB) for v in levels.values())
-    check("level normalization to -16dBFS", off < 2.0,
-          " ".join(f"{p}={v:.1f}dB" for p, v in levels.items()))
+    check("level follows source level", off < 2.0,
+          f"src={TARGET_DB:.1f}dB " + " ".join(f"{p}={v:.1f}dB" for p, v in levels.items()))
 
     # 3.6 囁き保護: -40dB 以下の極小ソースが基準レベルまで爆音化しないこと
     #     （正規化ゲインは +12dB 止まり）
@@ -221,8 +222,8 @@ def main():
     qout = os.path.join(tmp, "quiet_out.wav")
     run(exe, [quiet, qout, "A3", "100", "", "0", "700", "100", "0", "100", "0"])
     q_db = active_rms_db(qout)
-    check("whisper protection (no blast to target)", q_db < TARGET_DB - 6.0,
-          f"quiet source rendered at {q_db:.1f}dB (target={TARGET_DB:.0f}dB)")
+    check("whisper protection (quiet source stays quiet)", q_db < TARGET_DB - 6.0,
+          f"quiet source rendered at {q_db:.1f}dB (normal source level={TARGET_DB:.0f}dB)")
 
     # 4. マイクロプロソディ: J80 で既定（オフ）と出力が変わり、
     #    かつ J 有効でも決定論的であること
