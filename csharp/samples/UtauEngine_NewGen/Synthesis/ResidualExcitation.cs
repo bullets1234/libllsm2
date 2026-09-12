@@ -19,7 +19,7 @@ namespace UtauEngineNg.Synthesis
     /// 進めたマーク位置に原音マーク周りの 2 周期 Hann グレインを置く。マーク間隔は原音の実測
     /// 間隔をピッチ比で縮尺するので、ジッタは原音由来のまま、等倍では恒等になる。
     /// 無声区間は実時間グレインの Hann 重畳（hop=nhop で和が 1）。
-    /// L2R_RESEXC_PSYNC=0 で PSOLA を無効化し全フレームをグレイン重畳にする（A/B 用）。
+    /// PSOLA は既定オフ（試聴で不評）。L2R_RESEXC_PSYNC=1 で有効化。既定は全フレームがグレイン重畳。
     /// </summary>
     public static class ResidualExcitation
     {
@@ -27,7 +27,11 @@ namespace UtauEngineNg.Synthesis
         private const float DitherAmplitude = 3e-5f;
         /// <summary>時間伸縮比のクランプ（2 オクターブ）。</summary>
         private const float MinRatio = 0.25f, MaxRatio = 4f;
-        private static readonly bool PitchSync = Environment.GetEnvironmentVariable("L2R_RESEXC_PSYNC") != "0";
+        /// <summary>
+        /// PSOLA 再配置は実歌唱の試聴で「ダメ」判定（2026-09-13）のため既定オフ。
+        /// L2R_RESEXC_PSYNC=1 で有効化（実験用）。
+        /// </summary>
+        private static readonly bool PitchSync = Environment.GetEnvironmentVariable("L2R_RESEXC_PSYNC") == "1";
 
         /// <summary>
         /// <paramref name="sourceFrame"/>[k] = 出力フレーム k が参照する原音フレーム。
