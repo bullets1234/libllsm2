@@ -351,6 +351,15 @@ llsm_chunk* llsm_analyze(llsm_aoptions* options, FP_TYPE* x, int nx,
   FP_TYPE fs, FP_TYPE* f0, int nfrm, FP_TYPE** x_ap);
 /** @brief Generate speech from a LLSM parameter chunk. */
 llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src);
+/** @brief Same as llsm_synthesize, but uses the caller-provided waveform
+ *    (length nexc, at options->fs) as the noise excitation instead of the
+ *    internally generated band-limited white noise. NULL falls back to the
+ *    default behaviour. */
+llsm_output* llsm_synthesize_ex(llsm_soptions* options, llsm_chunk* src,
+  FP_TYPE* excitation, int nexc);
+/** @brief Free a buffer allocated by libllsm2 (e.g. the residual from
+ *    llsm_analyze's x_ap) with the library's own CRT. */
+void llsm_free_buffer(void* p);
 /** @} */
 
 /** @defgroup group_coder LLSM Coder

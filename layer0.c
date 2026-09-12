@@ -563,8 +563,16 @@ static FP_TYPE* llsm_synthesize_noise_excitation(llsm_soptions* options,
   return y;
 }
 
+// preserve_fine: the excitation is a real waveform (e.g. the analysis residual)
+// whose within-frame fine structure (pulse-synchronous bursts, transients)
+// should survive. The usual +/-3-bin whitening already keeps it (measured:
+// waveform correlation with the residual ~0.49 vs ~0.01 for white noise, and
+// widening the envelope did not help), so the only difference is that PSDRES
+// is not re-imposed - the excitation carries its own fine spectral texture -
+// while the LOGRESBIAS level offset is still applied so the output level
+// matches the default path.
 static FP_TYPE* llsm_filter_noise(llsm_chunk* src, int nfrm, FP_TYPE thop,
-  FP_TYPE fs, FP_TYPE* x, int nx) {
+  FP_TYPE fs, FP_TYPE* x, int nx, int preserve_fine) {
   const int nfade = 16;
   int nwin = round(thop * fs * 2);
   FP_TYPE* w = hanning(nwin);
@@ -605,9 +613,11 @@ static FP_TYPE* llsm_filter_noise(llsm_chunk* src, int nfrm, FP_TYPE thop,
     llsm_fft_to_psd(x_re, x_im, nfft, wsqr, psd);
     FP_TYPE* env = moving_avg(psd, nspec, 3);
     for(int j = 0; j < npsd; j ++) src_psd[j] = nm -> psd[j];
-    if(resvec != NULL)
+    if(resvec != NULL && ! preserve_fine)
     for(int j = 0; j < npsd; j ++)
-      src_psd[j] += resvec[j] - LOG2IN(LOGRESBIAS);
+      src_psd[j] += resvec[j];
+    for(int j = 0; j < npsd; j ++)
+      src_psd[j] -= LOG2IN(LOGRESBIAS);
     FP_TYPE* H = llsm_spectrum_from_envelope(
       src_axis, src_psd, npsd, nspec - 1, fs / 2.0);
     for(int j = 0; j < nspec - 1; j ++)
@@ -642,7 +652,8 @@ static FP_TYPE* llsm_filter_noise(llsm_chunk* src, int nfrm, FP_TYPE thop,
   return y;
 }
 
-llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src) {
+llsm_output* llsm_synthesize_ex(llsm_soptions* options, llsm_chunk* src,
+  FP_TYPE* excitation, int nexc) {
   if(! llsm_synthesis_check_integrity(src)) return NULL;
   int nfrm;
   FP_TYPE thop = *((FP_TYPE*)llsm_container_get(src -> conf, LLSM_CONF_THOP));
@@ -658,9 +669,22 @@ llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src) {
     thop, fs, ny);
   ret -> y_sin = y_sin;
 
-  FP_TYPE* y_exc = llsm_synthesize_noise_excitation(options, src, f0, nfrm,
-    thop, fs, ny);
-  FP_TYPE* y_nos = llsm_filter_noise(src, nfrm, thop, fs, y_exc, ny);
+  // Noise excitation: either the model's own (band-limited white noise shaped
+  // by the pulse-synchronous envelopes), or a caller-provided waveform (e.g.
+  // the analysis residual re-timed to the output). llsm_filter_noise whitens
+  // the excitation per frame before imposing PSD + PSDRES, so only the
+  // within-frame time structure of a provided excitation is retained.
+  FP_TYPE* y_exc;
+  if(excitation != NULL && nexc > 0) {
+    y_exc = calloc(ny, sizeof(FP_TYPE));
+    int ncopy = nexc < ny ? nexc : ny;
+    for(int i = 0; i < ncopy; i ++) y_exc[i] = excitation[i];
+  } else {
+    y_exc = llsm_synthesize_noise_excitation(options, src, f0, nfrm,
+      thop, fs, ny);
+  }
+  FP_TYPE* y_nos = llsm_filter_noise(src, nfrm, thop, fs, y_exc, ny,
+    excitation != NULL && nexc > 0);
   ret -> y_noise = y_nos;
 
   ret -> y = calloc(ny, sizeof(FP_TYPE));
@@ -670,6 +694,14 @@ llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src) {
   free(y_exc);
   free(f0);
   return ret;
+}
+
+llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src) {
+  return llsm_synthesize_ex(options, src, NULL, 0);
+}
+
+void llsm_free_buffer(void* p) {
+  free(p);
 }
 
 void llsm_delete_output(llsm_output* dst) {

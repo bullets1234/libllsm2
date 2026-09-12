@@ -14,6 +14,11 @@ namespace UtauEngineNg.Llsm
         public required float ThopSeconds { get; init; }
         public required int NumFrames { get; init; }
         public required int AnalysisFs { get; init; }
+        /// <summary>
+        /// 解析残差（原音 − 調波再合成）。合成 fs、パディング除去済みで、サンプル i·nhop が
+        /// フレーム i の中心に対応する。残差励振が無効なら null。
+        /// </summary>
+        public float[]? Residual { get; init; }
     }
 
     /// <summary>
@@ -76,8 +81,15 @@ namespace UtauEngineNg.Llsm
             log.Debug(Stage, $"Oversampled analysis {fs}Hz -> {analysisFs}Hz ({segment.Length} -> {upsampled.Length} samples)");
 
             ChunkHandle chunk;
+            float[]? residualUp = null;
+            bool wantResidual = Environment.GetEnvironmentVariable("L2R_RESEXC") != "0" && !flags.DisableResidualExcitation;
             using (_diag.Profiler.Measure("llsm_analyze"))
-                chunk = LlsmBindings.Llsm.Analyze(aopt, upsampled, analysisFs, f0, f0.Length);
+            {
+                if (wantResidual)
+                    chunk = LlsmBindings.Llsm.AnalyzeWithResidual(aopt, upsampled, analysisFs, f0, f0.Length, out residualUp);
+                else
+                    chunk = LlsmBindings.Llsm.Analyze(aopt, upsampled, analysisFs, f0, f0.Length);
+            }
 
             // eenv 変調深度クランプ（子音過渡の誤フィット抑制）
             // N8 フラグ / L2R_EENVCLAMP=0 で無効化可能（切り分け用）
@@ -119,6 +131,20 @@ namespace UtauEngineNg.Llsm
             float actualThop = LlsmBindings.Llsm.GetThopSeconds(conf);
             int nfrm = LlsmBindings.Llsm.GetNumFrames(chunk);
 
+            // 残差: パディング分を落として合成 fs へダウンサンプル（フレーム中心 = i·nhop に整列）
+            float[]? residual = null;
+            if (residualUp != null)
+            {
+                int nhopUp = Math.Max(1, (int)MathF.Round(thopSec * analysisFs));
+                int start = Math.Clamp(trimStartFrames * nhopUp, 0, residualUp.Length);
+                int len = Math.Clamp((nfrm + 1) * nhopUp, 0, residualUp.Length - start);
+                var cut = new float[len];
+                Array.Copy(residualUp, start, cut, 0, len);
+                residual = Resampling.Downsample(cut, 2);
+                log.Debug(Stage, $"Residual captured: {residual.Length} samples @ {fs}Hz");
+                _diag.Dump.DumpWav("residual", residual, fs);
+            }
+
             log.Info(Stage, $"Analyzed {nfrm} frames (thop={actualThop * 1000f:F2}ms, maxnhar={maxnhar}, maxnhar_e={maxnharE})");
 
             return new AnalysisResult
@@ -127,6 +153,7 @@ namespace UtauEngineNg.Llsm
                 ThopSeconds = actualThop,
                 NumFrames = nfrm,
                 AnalysisFs = analysisFs,
+                Residual = residual,
             };
         }
 

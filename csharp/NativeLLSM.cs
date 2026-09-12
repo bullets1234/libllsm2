@@ -50,6 +50,18 @@ namespace LlsmBindings
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_analyze(IntPtr aoptions, float[] x, int nx, float fs, float[] f0, int nfrm, IntPtr x_ap);
 
+        /// <summary>llsm_analyze の残差出力版: x_ap に残差波形（nx 要素、free() 必要）のポインタを受け取る。</summary>
+        [DllImport(Dll, EntryPoint = "llsm_analyze", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_analyze_res(IntPtr aoptions, float[] x, int nx, float fs, float[] f0, int nfrm, out IntPtr x_ap);
+
+        /// <summary>llsm_synthesize の励振指定版（excitation が null なら既定の乱数励振）。</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_synthesize_ex(IntPtr soptions, IntPtr chunk, float[]? excitation, int nexc);
+
+        /// <summary>libllsm2 が malloc/calloc したバッファを、同じ CRT ヒープで解放する。</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_free_buffer(IntPtr p);
+
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_synthesize(IntPtr soptions, IntPtr chunk);
 

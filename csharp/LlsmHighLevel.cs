@@ -139,6 +139,35 @@ namespace LlsmBindings
         }
 
         /// <summary>
+        /// 解析と同時に残差波形（x − 調波再合成、x と同じ長さ・同じ fs）を取得します。
+        /// 残差は雑音励振の実波形として再利用できます。
+        /// </summary>
+        public static ChunkHandle AnalyzeWithResidual(AOptionsHandle aopts, float[] x, float fs, float[] f0, int nfrm, out float[] residual)
+        {
+            var p = NativeLLSM.llsm_analyze_res(aopts.DangerousGetHandle(), x, x.Length, fs, f0, nfrm, out var resPtr);
+            if (p == IntPtr.Zero) throw new Exception("llsm_analyze failed");
+            residual = new float[x.Length];
+            if (resPtr != IntPtr.Zero)
+            {
+                Marshal.Copy(resPtr, residual, 0, x.Length);
+                NativeLLSM.llsm_free_buffer(resPtr); // libllsm2 は calloc で確保し所有権を渡す（同一 CRT で解放）
+            }
+            return ChunkHandle.FromExisting(p);
+        }
+
+        /// <summary>
+        /// 雑音励振を指定して合成します（<paramref name="excitation"/> は出力 fs、
+        /// 長さは (nfrm+1)·thop·fs 以上を推奨。null なら既定の乱数励振）。
+        /// </summary>
+        public static OutputHandle SynthesizeEx(SOptionsHandle sopts, ChunkHandle chunk, float[]? excitation)
+        {
+            var p = NativeLLSM.llsm_synthesize_ex(sopts.DangerousGetHandle(), chunk.DangerousGetHandle(),
+                excitation, excitation?.Length ?? 0);
+            if (p == IntPtr.Zero) throw new Exception("llsm_synthesize_ex failed");
+            return OutputHandle.FromExisting(p);
+        }
+
+        /// <summary>
         /// チャンクから波形を合成します。
         /// </summary>
         /// <param name="sopts">合成オプション</param>

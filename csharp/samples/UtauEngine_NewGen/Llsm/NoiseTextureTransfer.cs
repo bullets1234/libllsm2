@@ -229,23 +229,11 @@ namespace UtauEngineNg.Llsm
         /// <param name="localStretch">この区間の伸長比（出力フレーム数/原音フレーム数）。≤1 なら恒等。</param>
         public void Apply(IntPtr dstFramePtr, float srcPos, int srcIdx1, int srcIdx2, float ratio, float localStretch)
         {
-            if (!IsActive) return;
-
             bool outVoiced = ReadF0(dstFramePtr) > 0;
-            int nearest = Math.Clamp((int)MathF.Round(srcPos), 0, _srcNfrm - 1);
-
-            if (localStretch <= IdentityStretchThreshold)
-            {
-                // 圧縮・等倍（±5%）: 原音は出力とほぼ同速以上で進むのでテクスチャは補間器の
-                // 基準フレーム由来のままでよい。何も触らず従来と同一出力にする（恒等）。
-                _cursor = nearest;
-                _dir = +1;
-                return;
-            }
-
-            int tex = AdvanceCursor(srcPos, outVoiced, nearest);
+            int tex = NextIndex(srcPos, outVoiced, localStretch, out bool identity);
+            if (!IsActive || identity) return;
             _applied++;
-            _maxDrift = Math.Max(_maxDrift, Math.Abs(tex - nearest));
+            _maxDrift = Math.Max(_maxDrift, Math.Abs(tex - LastNearest));
 
             var texFrame = LlsmBindings.Llsm.GetFrame(_src, tex);
 
@@ -357,6 +345,35 @@ namespace UtauEngineNg.Llsm
             float va = a != null && a.Length == len ? a[i] : 0f;
             float vb = b != null && b.Length == len ? b[i] : 0f;
             return va * (1f - ratio) + vb * ratio;
+        }
+
+        /// <summary>直前の <see cref="NextIndex"/> が返したテクスチャ参照フレーム。</summary>
+        public int LastIndex { get; private set; }
+        /// <summary>直前の <see cref="NextIndex"/> 時点の最近傍原音フレーム。</summary>
+        public int LastNearest { get; private set; }
+
+        /// <summary>
+        /// 出力 1 フレーム分カーソルを進め、テクスチャ参照に使う原音フレームを返す。
+        /// 伸長比が恒等域なら最近傍フレーム（identity=true）。転写が無効でもカーソルは動く
+        /// （残差励振など、同じ実時間参照を共有する処理のため）。
+        /// </summary>
+        public int NextIndex(float srcPos, bool outVoiced, float localStretch, out bool identity)
+        {
+            int nearest = Math.Clamp((int)MathF.Round(srcPos), 0, Math.Max(0, _srcNfrm - 1));
+            LastNearest = nearest;
+            if (_srcNfrm <= 0) { identity = true; LastIndex = 0; return 0; }
+            if (localStretch <= IdentityStretchThreshold)
+            {
+                // 圧縮・等倍（±5%）: 原音は出力とほぼ同速以上で進むのでカーソル不要（恒等）
+                _cursor = nearest;
+                _dir = +1;
+                identity = true;
+                LastIndex = nearest;
+                return nearest;
+            }
+            identity = false;
+            LastIndex = AdvanceCursor(srcPos, outVoiced, nearest);
+            return LastIndex;
         }
 
         /// <summary>

@@ -46,7 +46,8 @@ namespace UtauEngineNg.Core
                     (args.ParsedFlags.DisableEenvClamp ? " eenv-clamp" : "") +
                     (args.ParsedFlags.DisableNoiseTexture ? " nm-texture" : "") +
                     (args.ParsedFlags.DisableEdgePad ? " edge-pad" : "") +
-                    (args.ParsedFlags.DisableHarmonicityGate ? " harm-gate" : ""));
+                    (args.ParsedFlags.DisableHarmonicityGate ? " harm-gate" : "") +
+                    (args.ParsedFlags.DisableResidualExcitation ? " res-exc" : ""));
 
             // 1. WAV 読み込み
             var (samples, fs) = WavIo.ReadMono(args.InputWav);
@@ -147,7 +148,7 @@ namespace UtauEngineNg.Core
 
             SynthesisResult synth;
             using (_diag.Profiler.Measure("synthesize"))
-                synth = new StandardSynthesizer(_diag).Synthesize(chunk, fs, sp);
+                synth = new StandardSynthesizer(_diag).Synthesize(chunk, fs, sp, analysis.Residual);
             float[] output = synth.Output;
 
             // 10. 子音原音ブレンド（C フラグ）

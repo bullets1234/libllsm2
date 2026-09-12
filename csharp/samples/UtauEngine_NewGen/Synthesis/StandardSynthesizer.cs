@@ -46,7 +46,7 @@ namespace UtauEngineNg.Synthesis
 
         public StandardSynthesizer(DiagnosticsContext diag) => _diag = diag;
 
-        public SynthesisResult Synthesize(ChunkHandle srcChunk, int fs, SynthesisParams p)
+        public SynthesisResult Synthesize(ChunkHandle srcChunk, int fs, SynthesisParams p, float[]? residual = null)
         {
             var log = _diag.Log;
             float srcF0 = p.SrcF0, targetF0 = p.TargetF0;
@@ -148,6 +148,12 @@ namespace UtauEngineNg.Synthesis
             // NM テクスチャ実時間転写（冷凍ノイズ対策）。L2R_NMTEX=0 / N16 で無効化（A/B 用）
             bool noiseTextureEnabled = Environment.GetEnvironmentVariable("L2R_NMTEX") != "0" && !p.DisableNoiseTexture;
             var noiseTexture = new NoiseTextureTransfer(srcChunk, srcNfrm, noiseTextureEnabled, log);
+
+            // 残差励振: 原音の解析残差を実時間カーソルで並べ直し、雑音励振として使う。
+            // 4x オーバーサンプリング合成時は励振の fs が合わないため従来の乱数励振。
+            bool residualExcitation = residual != null && residual.Length > 0 && !p.UseOversampling
+                && Environment.GetEnvironmentVariable("L2R_RESEXC") != "0" && !p.DisableResidualExcitation;
+            var excSourceFrame = residualExcitation ? new int[dstTotal] : null;
             float consonantLocalStretch = p.ConsonantFrames > 0 ? (float)dstConsonantFrames / p.ConsonantFrames : 1f;
             float vowelLocalStretch = (float)dstStretchedFrames / effectiveStretchableFrames;
 
@@ -173,10 +179,14 @@ namespace UtauEngineNg.Synthesis
                     IntPtr newFramePtr = InterpolateFrameAt(srcChunk, srcIdx1, srcIdx2, ratio, srcNfrm, i, isTransientRegion);
 
                     // 息テクスチャ（PSDRES / edc 残差）を実時間カーソルから転写。
-                    // トランジェント区間は原音フレームをそのまま使うため対象外。
+                    // トランジェント区間は原音フレームをそのまま使うため対象外（カーソルは進める）。
+                    float localStretch = isConsonant ? consonantLocalStretch : vowelLocalStretch;
                     if (!isTransientRegion)
-                        noiseTexture.Apply(newFramePtr, srcPosFloat, srcIdx1, srcIdx2, ratio,
-                            isConsonant ? consonantLocalStretch : vowelLocalStretch);
+                        noiseTexture.Apply(newFramePtr, srcPosFloat, srcIdx1, srcIdx2, ratio, localStretch);
+                    else
+                        noiseTexture.NextIndex(srcPosFloat, LlsmBindings.Llsm.GetFrameF0(new ContainerRef(newFramePtr)) > 0, localStretch, out _);
+                    if (excSourceFrame != null)
+                        excSourceFrame[i + pad] = isTransientRegion ? noiseTexture.LastNearest : noiseTexture.LastIndex;
 
                     var newFrameRef = new ContainerRef(newFramePtr);
                     float originalF0 = LlsmBindings.Llsm.GetFrameF0(newFrameRef);
@@ -255,6 +265,14 @@ namespace UtauEngineNg.Synthesis
             }
 
             // 端パディング: 先頭/末尾フレームの複製で前後を埋める
+            if (excSourceFrame != null)
+            {
+                for (int k = 0; k < pad; k++)
+                {
+                    excSourceFrame[k] = excSourceFrame[pad];
+                    excSourceFrame[pad + dstNfrm + k] = excSourceFrame[pad + dstNfrm - 1];
+                }
+            }
             for (int k = 0; k < pad; k++)
             {
                 LlsmBindings.Llsm.SetFrame(dstChunk, k, LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(dstChunk, pad)));
@@ -303,7 +321,15 @@ namespace UtauEngineNg.Synthesis
             }
             else log.Info(Stage, "Keeping Layer1 for PBP synthesis (Growl active)");
 
-            var result = Render(dstChunk, fs, p.UseOversampling, useLayer1Synthesis, log);
+            float[]? excitation = null;
+            if (excSourceFrame != null)
+            {
+                int nhopExc = Math.Max(1, (int)MathF.Round(p.ThopSeconds * fs));
+                excitation = ResidualExcitation.Build(residual!, excSourceFrame, nhopExc, srcNfrm);
+                log.Info(Stage, $"Residual excitation: {excitation.Length} samples from {srcNfrm} source frames");
+            }
+
+            var result = Render(dstChunk, fs, p.UseOversampling, useLayer1Synthesis, log, excitation);
             if (pad > 0)
             {
                 // llsm_synthesize の出力長は (nfrm+1)*nhop。パディング分を前後から切り落とし、
@@ -378,7 +404,7 @@ namespace UtauEngineNg.Synthesis
         }
 
         /// <summary>Layer0/Layer1 チャンクを波形へ合成する（O フラグ時は 4x オーバーサンプリング）。</summary>
-        private SynthesisResult Render(ChunkHandle dstChunk, int fs, bool useOversampling, bool useLayer1Synthesis, ILogger log)
+        private SynthesisResult Render(ChunkHandle dstChunk, int fs, bool useOversampling, bool useLayer1Synthesis, ILogger log, float[]? excitation = null)
         {
             bool dump = _diag.Dump.Enabled;
             using (_diag.Profiler.Measure("llsm_synthesize"))
@@ -406,10 +432,12 @@ namespace UtauEngineNg.Synthesis
                 }
                 else
                 {
-                    log.Info(Stage, $"Direct synthesis at {fs}Hz");
+                    log.Info(Stage, $"Direct synthesis at {fs}Hz" + (excitation != null ? " (residual excitation)" : ""));
                     using var sopt = LlsmBindings.Llsm.CreateSynthesisOptions(fs);
                     SetUseL1(sopt, useLayer1Synthesis);
-                    using var output = LlsmBindings.Llsm.Synthesize(sopt, dstChunk);
+                    using var output = excitation != null
+                        ? LlsmBindings.Llsm.SynthesizeEx(sopt, dstChunk, excitation)
+                        : LlsmBindings.Llsm.Synthesize(sopt, dstChunk);
 
                     if (dump)
                     {

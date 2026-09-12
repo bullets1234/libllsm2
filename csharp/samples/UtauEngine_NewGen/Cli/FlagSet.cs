@@ -72,7 +72,8 @@ namespace UtauEngineNg.Cli
         /// <summary>
         /// N: 診断用の機能無効化ビットマスク（アーティファクト切り分け用）。
         /// N1=VSPHSE高域拡張off, N2=位相スムーザoff, N4=残差包絡補正off, N8=eenvクランプoff,
-        /// N16=NMテクスチャ実時間転写off, N32=解析/合成の端パディングoff, N64=倍音らしさゲートoff。
+        /// N16=NMテクスチャ実時間転写off, N32=解析/合成の端パディングoff, N64=倍音らしさゲートoff,
+        /// N128=残差励振off。
         /// 合算可（例 N3 = 拡張+スムーザoff）。環境変数トグル（L2R_VSEXT等）と OR で効く。
         /// </summary>
         public int DiagDisable { get; }
@@ -83,6 +84,7 @@ namespace UtauEngineNg.Cli
         public bool DisableNoiseTexture => (DiagDisable & 16) != 0;
         public bool DisableEdgePad => (DiagDisable & 32) != 0;
         public bool DisableHarmonicityGate => (DiagDisable & 64) != 0;
+        public bool DisableResidualExcitation => (DiagDisable & 128) != 0;
 
         public FlagSet(string? flags)
         {
@@ -116,7 +118,7 @@ namespace UtauEngineNg.Cli
             Jitter = Num(@"J(\d+)", def: 0, lo: 0, hi: 100);
             HybridExcitation = OptNum(@"Y(\d+)", lo: 1, hi: 100);
             VoiceQuality = OptNum(@"Q(\d+)", lo: 1, hi: 100);
-            DiagDisable = Num(@"N(\d+)", def: 0, lo: 0, hi: 127);
+            DiagDisable = Num(@"N(\d+)", def: 0, lo: 0, hi: 255);
         }
 
         // UTAU フラグは大文字小文字が意味を持つ（e=弾性ストレッチ / E=FRQ直用 など）ため
