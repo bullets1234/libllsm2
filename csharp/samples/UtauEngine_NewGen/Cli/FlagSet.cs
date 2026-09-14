@@ -44,6 +44,12 @@ namespace UtauEngineNg.Cli
         public bool F0Boundary { get; }
         /// <summary>p（小文字）: 残差励振のピッチ同期再配置（PSOLA、試験）。</summary>
         public bool PsolaExcitation { get; }
+        /// <summary>
+        /// h（小文字）: 倍音らしさゲート（高域の非調波成分を雑音へ移す）。実歌唱で高域が雑音優勢に
+        /// なり「ザラザラ」した音源があったため既定オフ（2026-09-14）。息っぽい高域を正弦波の束で
+        /// 再現して金属的になる音源に対してだけ有効化する。
+        /// </summary>
+        public bool HarmonicityGate { get; }
 
         // --- 数値フラグ ---
         /// <summary>B: 息成分（0-100、既定 50）。</summary>
@@ -106,6 +112,7 @@ namespace UtauEngineNg.Cli
             FixedAmplitudeRatio = HasChar('X');
             F0Boundary = Has("V");
             PsolaExcitation = Has("p");
+            HarmonicityGate = Has("h");
             ModulationPlus = Raw.Contains("M+", StringComparison.Ordinal)
                           || Raw.Contains("M1", StringComparison.Ordinal);
 

@@ -108,8 +108,9 @@ namespace UtauEngineNg.Llsm
 
             // 倍音らしさゲート: 原音で倍音構造を持たない帯域（息由来の高域ノイズ等）の HM パワーを
             // NM PSD へ移す。ノイズを正弦波の束で再現することによる金属的な異音を防ぐ。
-            // L2R_HARMGATE=0 / N64 で無効化（A/B 用）。
-            if (Environment.GetEnvironmentVariable("L2R_HARMGATE") != "0" && !flags.DisableHarmonicityGate)
+            // 既定オフ（h フラグ / L2R_HARMGATE=1 で有効化。N64 は強制オフ）。
+            bool gateOn = flags.HarmonicityGate || Environment.GetEnvironmentVariable("L2R_HARMGATE") == "1";
+            if (gateOn && !flags.DisableHarmonicityGate)
                 HarmonicityGate.Apply(chunk, f0.Length, upsampled, analysisFs, thopSec, fs / 2f, log);
 
             // 帯域エネルギー較正（実験的・既定OFF）: NM PSDブーストは帯域エネルギー数値こそ
