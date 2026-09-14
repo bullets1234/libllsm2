@@ -57,15 +57,29 @@ namespace UtauEngineNg
         }
 
         /// <summary>
-        /// 再現用の呼び出し記録。exe と同じフォルダに L2R_capture.on（空ファイル）があるとき、
-        /// 全引数を L2R_calls.log へ 1 行ずつ追記する（UTAU からの呼び出しをそのまま再実行できる）。
+        /// 再現用の呼び出し記録。exe 本体（Environment.ProcessPath）と同じフォルダに
+        /// L2R_capture.on（空ファイル）があるとき、全引数を L2R_calls.log へ 1 行ずつ追記する
+        /// （UTAU からの呼び出しをそのまま再実行できる）。exe のフォルダに書けない場合は
+        /// %TEMP%\L2R_calls.log へ書く。環境変数 L2R_CAPTURE=&lt;ログのパス&gt; でも有効化できる。
         /// </summary>
         private static void CaptureCall(string[] rawArgs)
         {
             try
             {
-                string dir = AppContext.BaseDirectory;
-                if (!System.IO.File.Exists(System.IO.Path.Combine(dir, "L2R_capture.on"))) return;
+                string? exeDir = null;
+                try { var pp = Environment.ProcessPath; if (!string.IsNullOrEmpty(pp)) exeDir = System.IO.Path.GetDirectoryName(pp); } catch { }
+                string baseDir = AppContext.BaseDirectory;
+                string? logPath = Environment.GetEnvironmentVariable("L2R_CAPTURE");
+                if (string.IsNullOrEmpty(logPath))
+                {
+                    foreach (var d in new[] { exeDir, baseDir })
+                    {
+                        if (d != null && System.IO.File.Exists(System.IO.Path.Combine(d, "L2R_capture.on")))
+                        { logPath = System.IO.Path.Combine(d, "L2R_calls.log"); break; }
+                    }
+                }
+                if (string.IsNullOrEmpty(logPath)) return;
+
                 var sb = new StringBuilder();
                 sb.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append('	');
                 foreach (var a in rawArgs)
@@ -74,7 +88,13 @@ namespace UtauEngineNg
                     if (quote) sb.Append('"').Append(a).Append('"'); else sb.Append(a);
                     sb.Append(' ');
                 }
-                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "L2R_calls.log"), sb.ToString().TrimEnd() + Environment.NewLine, Encoding.UTF8);
+                string line = sb.ToString().TrimEnd() + Environment.NewLine;
+                try { System.IO.File.AppendAllText(logPath, line, Encoding.UTF8); }
+                catch
+                {
+                    // 書き込み不可（Program Files 等）: TEMP へ退避
+                    System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "L2R_calls.log"), line, Encoding.UTF8);
+                }
             }
             catch { /* 記録失敗は無視 */ }
         }
