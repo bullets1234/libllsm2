@@ -322,16 +322,26 @@ namespace UtauEngineNg.Synthesis
             else log.Info(Stage, "Keeping Layer1 for PBP synthesis (Growl active)");
 
             float[]? excitation = null;
+            int excitationMode = 0;
             if (excSourceFrame != null)
             {
                 int nhopExc = Math.Max(1, (int)MathF.Round(p.ThopSeconds * fs));
                 var srcF0s = new float[srcNfrm];
                 for (int s = 0; s < srcNfrm; s++) srcF0s[s] = LlsmBindings.Llsm.GetFrameF0(LlsmBindings.Llsm.GetFrame(srcChunk, s));
+                var mode = ResidualExcitation.ResolveMode(p.ResidualFull);
+                if (mode == ResidualExcitation.Mode.Full && ResidualExcitation.FlattenAm)
+                {
+                    residual = (float[])residual!.Clone();
+                    ResidualExcitation.FlattenVoicedAm(residual, srcF0s, nhopExc);
+                }
+                ResidualExcitation.UnvoicedOnly = mode == ResidualExcitation.Mode.UnvoicedOnly;
                 excitation = ResidualExcitation.Build(residual!, excSourceFrame, nhopExc, srcNfrm, srcF0s, dstF0, sourceSegment, p.PsolaExcitation);
-                log.Info(Stage, $"Residual excitation: {excitation.Length} samples from {srcNfrm} source frames" + (p.PsolaExcitation ? " (PSOLA, p flag)" : ""));
+                excitationMode = mode == ResidualExcitation.Mode.UnvoicedOnly ? 2
+                               : mode == ResidualExcitation.Mode.Full && ResidualExcitation.FlattenAm ? 1 : 0;
+                log.Info(Stage, $"Residual excitation ({mode}): {excitation.Length} samples from {srcNfrm} source frames" + (p.PsolaExcitation ? " (PSOLA, p flag)" : ""));
             }
 
-            var result = Render(dstChunk, fs, p.UseOversampling, useLayer1Synthesis, log, excitation);
+            var result = Render(dstChunk, fs, p.UseOversampling, useLayer1Synthesis, log, excitation, excitationMode);
             if (pad > 0)
             {
                 // llsm_synthesize の出力長は (nfrm+1)*nhop。パディング分を前後から切り落とし、
@@ -406,7 +416,7 @@ namespace UtauEngineNg.Synthesis
         }
 
         /// <summary>Layer0/Layer1 チャンクを波形へ合成する（O フラグ時は 4x オーバーサンプリング）。</summary>
-        private SynthesisResult Render(ChunkHandle dstChunk, int fs, bool useOversampling, bool useLayer1Synthesis, ILogger log, float[]? excitation = null)
+        private SynthesisResult Render(ChunkHandle dstChunk, int fs, bool useOversampling, bool useLayer1Synthesis, ILogger log, float[]? excitation = null, int excitationMode = 0)
         {
             bool dump = _diag.Dump.Enabled;
             using (_diag.Profiler.Measure("llsm_synthesize"))
@@ -438,7 +448,7 @@ namespace UtauEngineNg.Synthesis
                     using var sopt = LlsmBindings.Llsm.CreateSynthesisOptions(fs);
                     SetUseL1(sopt, useLayer1Synthesis);
                     using var output = excitation != null
-                        ? LlsmBindings.Llsm.SynthesizeEx(sopt, dstChunk, excitation)
+                        ? LlsmBindings.Llsm.SynthesizeEx(sopt, dstChunk, excitation, excitationMode)
                         : LlsmBindings.Llsm.Synthesize(sopt, dstChunk);
 
                     if (dump)

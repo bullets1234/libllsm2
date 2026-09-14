@@ -89,6 +89,9 @@ FP_TYPE* llsm_generate_white_noise(int nx);
 
 /** @brief Generate a bandlimited Gaussian noise of length nx. */
 FP_TYPE* llsm_generate_bandlimited_noise(int nx, FP_TYPE fmin, FP_TYPE fmax);
+/** @brief Band-pass x with the same Chebyshev filter used for the noise
+ *    channels (fmin/fmax normalized to fs; 0 / 0.5 = open ends). */
+FP_TYPE* llsm_bandpass_chebyshev(FP_TYPE* x, int nx, FP_TYPE fmin, FP_TYPE fmax);
 
 /** @brief Apply or remove lip radiation from a spectrum or harmonic model. */
 void llsm_lipfilter(FP_TYPE radius, FP_TYPE f0, int nhar,

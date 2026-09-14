@@ -32,6 +32,42 @@ namespace UtauEngineNg.Synthesis
         /// L2R_RESEXC_PSYNC=1 で有効化（実験用）。
         /// </summary>
         private static readonly bool PitchSync = Environment.GetEnvironmentVariable("L2R_RESEXC_PSYNC") == "1";
+        /// <summary>
+        /// 有声フレームの残差から周期的な振幅変調（パルス同期バースト）を平坦化する。
+        /// バーストは原音の周期で刻まれるため、ピッチシフト時に出力調波との差周波数でうなり
+        /// （20〜150Hz の振幅変調＝ザラつき）になる（実歌唱で確認、2026-09-15）。平坦化した
+        /// 励振には合成側でモデルの雑音包絡（目標 F0 に同期）を掛け直す。L2R_RESEXC_FLAT=0 で無効化。
+        /// </summary>
+        public static readonly bool FlattenAm = Environment.GetEnvironmentVariable("L2R_RESEXC_FLAT") != "0";
+
+        /// <summary>残差励振の使い方。</summary>
+        public enum Mode
+        {
+            /// <summary>無声フレームだけ残差、有声フレームは白色雑音＋モデル包絡（＋PSDRES）。既定。</summary>
+            UnvoicedOnly,
+            /// <summary>全フレーム残差。有声部は振幅変調を平坦化してモデル包絡を掛け直す（r フラグ）。</summary>
+            Full,
+            /// <summary>全フレーム残差をそのまま（実験用、L2R_RESEXC_MODE=raw）。</summary>
+            Raw,
+        }
+
+        /// <summary>
+        /// 実歌唱では有声部の残差（原音周期のバースト）が目標ピッチの調波とうなり、ザラつきに
+        /// なった（2026-09-15）ため、既定は無声フレームのみ残差にする。環境変数
+        /// L2R_RESEXC_MODE=unvoiced|full|raw で上書き、r フラグで full。
+        /// </summary>
+        public static Mode ResolveMode(bool fullFlag)
+        {
+            var s = Environment.GetEnvironmentVariable("L2R_RESEXC_MODE");
+            if (string.Equals(s, "raw", StringComparison.OrdinalIgnoreCase)) return Mode.Raw;
+            if (string.Equals(s, "full", StringComparison.OrdinalIgnoreCase)) return Mode.Full;
+            if (string.Equals(s, "unvoiced", StringComparison.OrdinalIgnoreCase)) return Mode.UnvoicedOnly;
+            return fullFlag ? Mode.Full : Mode.UnvoicedOnly;
+        }
+        /// <summary>Build() の無声のみモード（呼び出し側が設定）。</summary>
+        [ThreadStatic] public static bool UnvoicedOnly;
+        private const float FlattenSmoothSec = 0.0004f; // ±0.4ms（周期の 1/3 未満、400Hz 以上でも有効）
+        private const float FlattenFloorRatio = 0.05f;  // 包絡の下限（フレーム RMS 比）
 
         /// <summary>
         /// <paramref name="sourceFrame"/>[k] = 出力フレーム k が参照する原音フレーム。
@@ -76,6 +112,18 @@ namespace UtauEngineNg.Synthesis
             {
                 if (voiced[k]) continue;
                 int sidx = Math.Clamp(sourceFrame[k], 0, Math.Max(0, srcNfrm - 1));
+                if (UnvoicedOnly && srcF0 != null && sidx < srcF0.Length && srcF0[sidx] > 0)
+                {
+                    // 有声フレーム: 白色雑音グレイン（合成側で帯域分割＋モデル包絡）
+                    int dstStart0 = k * nhop - nhop;
+                    for (int n = 0; n < glen; n++)
+                    {
+                        int di = dstStart0 + n;
+                        if (di < 0 || di >= ny) continue;
+                        y[di] += DeterministicNoise.Hash(di, 4241) * 0.02f * w[n];
+                    }
+                    continue;
+                }
                 int srcStart = sidx * nhop - nhop;
                 int dstStart = k * nhop - nhop;
                 for (int n = 0; n < glen; n++)
@@ -128,6 +176,39 @@ namespace UtauEngineNg.Synthesis
             for (int i = 0; i < ny; i++)
                 y[i] += DeterministicNoise.Hash(i, 7919) * DitherAmplitude;
             return y;
+        }
+
+        /// <summary>
+        /// 有声フレームの区間で残差の短時間包絡（±0.4ms RMS）を割って振幅変調を平坦化する
+        /// （in-place、無声フレームは無変更。フレーム RMS は保つ）。
+        /// </summary>
+        public static void FlattenVoicedAm(float[] residual, float[] srcF0, int nhop)
+        {
+            int n = residual.Length;
+            if (n == 0) return;
+            double fs = SampleRateOf(nhop);
+            int half = Math.Max(1, (int)Math.Round(fs * FlattenSmoothSec));
+            var cum = new double[n + 1];
+            for (int i = 0; i < n; i++) cum[i + 1] = cum[i] + (double)residual[i] * residual[i];
+            float Env(int i)
+            {
+                int lo = Math.Max(0, i - half), hi = Math.Min(n, i + half + 1);
+                return (float)Math.Sqrt((cum[hi] - cum[lo]) / (hi - lo));
+            }
+            var outp = new float[n];
+            Array.Copy(residual, outp, n);
+            for (int s = 0; s < srcF0.Length; s++)
+            {
+                if (srcF0[s] <= 0) continue;
+                int lo = Math.Max(0, s * nhop - nhop / 2), hi = Math.Min(n, s * nhop + nhop / 2);
+                if (hi <= lo) continue;
+                float frameRms = (float)Math.Sqrt((cum[hi] - cum[lo]) / (hi - lo));
+                if (frameRms <= 1e-9f) continue;
+                float floor = frameRms * FlattenFloorRatio;
+                for (int i = lo; i < hi; i++)
+                    outp[i] = residual[i] / Math.Max(Env(i), floor) * frameRms;
+            }
+            Array.Copy(outp, residual, n);
         }
 
         private static double Mod(double a, double m) { double v = a % m; return v < 0 ? v + m : v; }

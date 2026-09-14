@@ -381,6 +381,10 @@ static FP_TYPE* stretch_stationary_noise(FP_TYPE* x, int nx, int ny,
   return y;
 }
 
+FP_TYPE* llsm_bandpass_chebyshev(FP_TYPE* x, int nx, FP_TYPE fmin, FP_TYPE fmax) {
+  return chebyfilt(x, nx, fmin, fmax);
+}
+
 FP_TYPE* llsm_generate_bandlimited_noise(int nx, FP_TYPE fmin, FP_TYPE fmax) {
   // Filter the full length instead of loop-extending a 20000-sample template;
   // the loop period (~450ms at 44.1kHz) was audible as periodic noise.

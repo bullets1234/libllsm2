@@ -354,9 +354,12 @@ llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src);
 /** @brief Same as llsm_synthesize, but uses the caller-provided waveform
  *    (length nexc, at options->fs) as the noise excitation instead of the
  *    internally generated band-limited white noise. NULL falls back to the
- *    default behaviour. */
+ *    default behaviour. apply_envelope 1 band-splits the excitation and
+ *    multiplies each channel by the pulse-synchronous noise envelope (use
+ *    with an AM-flattened excitation); 2 does the same but treats voiced
+ *    frames as carrying white noise (PSDRES is re-imposed there). */
 llsm_output* llsm_synthesize_ex(llsm_soptions* options, llsm_chunk* src,
-  FP_TYPE* excitation, int nexc);
+  FP_TYPE* excitation, int nexc, int apply_envelope);
 /** @brief Free a buffer allocated by libllsm2 (e.g. the residual from
  *    llsm_analyze's x_ap) with the library's own CRT. */
 void llsm_free_buffer(void* p);

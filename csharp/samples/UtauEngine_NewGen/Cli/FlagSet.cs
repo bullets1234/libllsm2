@@ -50,6 +50,11 @@ namespace UtauEngineNg.Cli
         /// 再現して金属的になる音源に対してだけ有効化する。
         /// </summary>
         public bool HarmonicityGate { get; }
+        /// <summary>
+        /// r（小文字）: 残差励振を全フレームに使う（有声部は振幅変調を平坦化し、モデル包絡を掛け直す）。
+        /// 既定は無声フレームのみ残差（母音は従来のモデル雑音）。
+        /// </summary>
+        public bool ResidualFull { get; }
 
         // --- 数値フラグ ---
         /// <summary>B: 息成分（0-100、既定 50）。</summary>
@@ -113,6 +118,7 @@ namespace UtauEngineNg.Cli
             F0Boundary = Has("V");
             PsolaExcitation = Has("p");
             HarmonicityGate = Has("h");
+            ResidualFull = Has("r");
             ModulationPlus = Raw.Contains("M+", StringComparison.Ordinal)
                           || Raw.Contains("M1", StringComparison.Ordinal);
 

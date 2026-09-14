@@ -142,6 +142,16 @@ namespace UtauEngineNg.Llsm
                 var cut = new float[len];
                 Array.Copy(residualUp, start, cut, 0, len);
                 residual = Resampling.Downsample(cut, 2);
+                // 調波の引き残し除去（ピッチシフト時に原音音高のゴーストが雑音側に残るのを防ぐ）。
+                // L2R_RESEXC_DEHARM=0 で無効化（A/B 用）。
+                if (Environment.GetEnvironmentVariable("L2R_RESEXC_DEHARM") != "0")
+                {
+                    var f0Trim = new float[nfrm];
+                    for (int i = 0; i < nfrm; i++) f0Trim[i] = LlsmBindings.Llsm.GetFrameF0(LlsmBindings.Llsm.GetFrame(chunk, i));
+                    int nhopFs = Math.Max(1, (int)MathF.Round(thopSec * fs));
+                    ResidualDeharmonizer.Apply(residual, f0Trim, nhopFs, fs, out int deharmFrames);
+                    log.Info(Stage, $"Residual de-harmonized on {deharmFrames} voiced frames");
+                }
                 log.Debug(Stage, $"Residual captured: {residual.Length} samples @ {fs}Hz");
                 _diag.Dump.DumpWav("residual", residual, fs);
             }

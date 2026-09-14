@@ -159,10 +159,11 @@ namespace LlsmBindings
         /// 雑音励振を指定して合成します（<paramref name="excitation"/> は出力 fs、
         /// 長さは (nfrm+1)·thop·fs 以上を推奨。null なら既定の乱数励振）。
         /// </summary>
-        public static OutputHandle SynthesizeEx(SOptionsHandle sopts, ChunkHandle chunk, float[]? excitation)
+        /// <param name="excitationMode">0: 励振をそのまま, 1: 帯域分割＋雑音包絡, 2: 1 に加え有声フレームは白色扱い（PSDRES 再付与）</param>
+        public static OutputHandle SynthesizeEx(SOptionsHandle sopts, ChunkHandle chunk, float[]? excitation, int excitationMode = 0)
         {
             var p = NativeLLSM.llsm_synthesize_ex(sopts.DangerousGetHandle(), chunk.DangerousGetHandle(),
-                excitation, excitation?.Length ?? 0);
+                excitation, excitation?.Length ?? 0, excitationMode);
             if (p == IntPtr.Zero) throw new Exception("llsm_synthesize_ex failed");
             return OutputHandle.FromExisting(p);
         }
