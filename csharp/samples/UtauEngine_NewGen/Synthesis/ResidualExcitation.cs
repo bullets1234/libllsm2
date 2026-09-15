@@ -66,8 +66,10 @@ namespace UtauEngineNg.Synthesis
         }
         /// <summary>Build() の無声のみモード（呼び出し側が設定）。</summary>
         [ThreadStatic] public static bool UnvoicedOnly;
-        private const float FlattenSmoothSec = 0.0004f; // ±0.4ms（周期の 1/3 未満、400Hz 以上でも有効）
-        private const float FlattenFloorRatio = 0.05f;  // 包絡の下限（フレーム RMS 比）
+        private const float FlattenSmoothSec = 0.0006f; // ±0.6ms（周期の 1/3 未満、300Hz 以上でも有効）
+        // 包絡の下限（フレーム RMS 比）。5% だと静かな瞬間を最大 20 倍持ち上げ、減衰すべき部分が
+        // 持続して「反響のような尾」になった（r フラグの試聴、2026-09-16）。25% で最大 4 倍に制限。
+        private const float FlattenFloorRatio = 0.25f;
 
         /// <summary>
         /// <paramref name="sourceFrame"/>[k] = 出力フレーム k が参照する原音フレーム。
