@@ -176,6 +176,9 @@ namespace UtauEngineNg.Effects
     /// <summary>
     /// 声門閉鎖係数（K フラグ）。有声フレームの Rd（声門波形パラメータ）をスケールして
     /// 声質を調整する。K0=息漏れ声(Rd大)、K50=標準(identity)、K100=硬い声(Rd小)。
+    /// 2026-09-16 調整: 旧来は K0 で高域 -13dB・低域 +2dB・雑音不変で「こもる」だけになり、
+    /// K100 では Rd が下限に張り付いていた。Rd 倍率を 2.0〜0.5 に穏やかにし、エネルギー補償を
+    /// 半分にして低域の持ち上がりを抑え、息漏れ側では気息雑音を増やす（K0 +6dB、K100 -6dB）。
     /// （UtauEngine の K フラグ Rd 編集ブロックの移植）
     /// </summary>
     public sealed class GlottalClosureEffect : IChunkEffect
@@ -199,16 +202,21 @@ namespace UtauEngineNg.Effects
         private const float MaxRd = 3.0f;
 
         // Rd 変更によるスペクトルティルト変化で倍音全体のエネルギーが落ちる/上がる
-        // （tolayer0 は H1 基準正規化のため）。補償ゲインの暴走防止クランプ。
-        private const float MaxCompensationDb = 12.0f;
+        // （tolayer0 は H1 基準正規化のため）。補償は半分だけ掛ける（全量だと低域が持ち上がり
+        // こもる）。暴走防止クランプ付き。
+        private const float MaxCompensationDb = 6.0f;
+        private const float CompensationFraction = 0.5f;
+        // 息漏れ側で増やす気息雑音（PSD, dB）: K0 で +NoiseCoupleDb、K100 で -NoiseCoupleDb
+        private const float NoiseCoupleDb = 6.0f;
 
         public void Apply(ChunkHandle chunk, int nfrm, int fs)
         {
             if (!IsActive) return;
 
             float rdScale = _closure <= 50
-                ? 2.5f - (_closure / 50.0f) * 1.5f          // K0..50 : 2.5 -> 1.0
-                : 1.0f - ((_closure - 50) / 50.0f) * 0.7f;  // K50..100: 1.0 -> 0.3
+                ? 2.0f - (_closure / 50.0f) * 1.0f          // K0..50 : 2.0 -> 1.0
+                : 1.0f - ((_closure - 50) / 50.0f) * 0.5f;  // K50..100: 1.0 -> 0.5
+            float noiseDb = -NoiseCoupleDb * (_closure - 50) / 50.0f; // K0 +6dB .. K100 -6dB
 
             var conf = LlsmBindings.Llsm.GetConf(chunk);
             int nspec = LlsmBindings.Llsm.GetConfInt(conf, NativeLLSM.LLSM_CONF_NSPEC);
@@ -245,7 +253,7 @@ namespace UtauEngineNg.Effects
                 if (e0 > 0 && e1 > 0)
                 {
                     float gainDb = Math.Clamp(
-                        (float)(10.0 * Math.Log10(e0 / e1)),
+                        (float)(10.0 * Math.Log10(e0 / e1)) * CompensationFraction,
                         -MaxCompensationDb, MaxCompensationDb);
                     var vtmagn = LlsmBindings.Llsm.GetFrameVtMagn(frame, nspec);
                     for (int j = 0; j < nspec; j++)
@@ -254,9 +262,21 @@ namespace UtauEngineNg.Effects
                     gainSum += gainDb;
                     compensated++;
                 }
+
+                // 気息雑音の連動（有声フレームの NM PSD）
+                if (MathF.Abs(noiseDb) > 0.01f)
+                {
+                    var nm = UtauEngineNg.Llsm.FrameAccess.TryGetNm(frame);
+                    if (nm is { HasPsd: true } nmv)
+                    {
+                        float[] psd = nmv.ReadPsd();
+                        for (int j = 0; j < psd.Length; j++) psd[j] += noiseDb;
+                        nmv.WritePsd(psd);
+                    }
+                }
             }
             float gainAvg = compensated > 0 ? gainSum / compensated : 0;
-            _log.Info(Stage, $"K{_closure} applied (Rd scale {rdScale:F2}, clamped {clamped}/{nfrm}, energy comp avg {gainAvg:+0.0;-0.0}dB on {compensated} frames)");
+            _log.Info(Stage, $"K{_closure} applied (Rd scale {rdScale:F2}, clamped {clamped}/{nfrm}, energy comp avg {gainAvg:+0.0;-0.0}dB on {compensated} frames, noise {noiseDb:+0.0;-0.0}dB)");
         }
 
         private static double HarmonicEnergy(ContainerRef frame)
