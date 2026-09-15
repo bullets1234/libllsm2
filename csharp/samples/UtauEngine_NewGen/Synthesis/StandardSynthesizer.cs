@@ -16,6 +16,8 @@ namespace UtauEngineNg.Synthesis
         public required float[] Output { get; init; }
         public float[]? Sinusoid { get; init; }
         public float[]? Noise { get; init; }
+        /// <summary>出力フレーム毎の F0（無声 0、パディング除去済み）。レベル正規化の有声判定に使う。</summary>
+        public float[]? FrameF0 { get; init; }
     }
 
     /// <summary>
@@ -355,6 +357,9 @@ namespace UtauEngineNg.Synthesis
                     Noise = result.Noise != null ? Cut(result.Noise, trimStart, keepLen) : null,
                 };
             }
+            var frameF0 = new float[dstNfrm];
+            Array.Copy(dstF0, pad, frameF0, 0, dstNfrm);
+            result = new SynthesisResult { Output = result.Output, Sinusoid = result.Sinusoid, Noise = result.Noise, FrameF0 = frameF0 };
             // JIT の生存解析による srcChunk の早期 finalize（=ネイティブ解放）防止
             GC.KeepAlive(srcChunk);
             return result;

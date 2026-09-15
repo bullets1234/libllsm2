@@ -157,7 +157,8 @@ namespace UtauEngineNg.Core
                 args.ParsedFlags.ConsonantBlend, synth.Sinusoid, synth.Noise, log);
 
             // 11. 後処理（基準レベル正規化・ボリューム・ピークリミット）
-            PostProcessor.Apply(output, args.Volume, log, PostProcessor.SourceLevelDb(segment));
+            // 基準は原音・出力とも有声フレームのみの実効レベル（無音/子音/ノイズ床の割合に非依存）
+            PostProcessor.Apply(output, args.Volume, log, PostProcessor.VoicedLevelDb(segment, f0, nhop), synth.FrameF0, nhop);
 
             // 12. 書き出し
             _diag.Dump.DumpWav("output", output, fs);

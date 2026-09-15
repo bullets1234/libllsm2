@@ -20,6 +20,13 @@ namespace UtauEngineNg.Synthesis
     {
         private const string Stage = "Volume";
         private const float MaxPeak = 0.70f;        // -3dB
+        /// <summary>
+        /// ピーク下限（-12dBFS）。作業前の版が持っていた「小さいノートはここまで持ち上げる」規則。
+        /// 録音レベルの小さい音源はサンプル間のレベルが揃っていないことが多く、原音レベル追従だけ
+        /// だとその不揃いがそのまま出る（2026-09-16 報告）。原音追従の後にこの下限を掛けることで、
+        /// 通常レベルの音源は原音の音量感を保ちつつ、小さい音源は作業前と同じ扱いになる。
+        /// </summary>
+        private const float MinPeak = 0.25f;        // -12dB
         /// <summary>L2R_TARGET_DB 未指定時のフォールバック（原音レベルが取れない場合のみ使用）。</summary>
         private const float DefaultTargetRmsDb = -16f;
         private const float MaxNormGainDb = 12f;    // 正規化ゲインの安全クランプ ±12dB
@@ -48,10 +55,48 @@ namespace UtauEngineNg.Synthesis
         }
 
         /// <summary>
+        /// 有声フレーム（<paramref name="frameF0"/>[i] &gt; 0、フレーム i の中心 = i·nhop）だけで
+        /// 測った実効レベル（dBFS）。無音・子音・録音ノイズ床の割合に左右されないので、
+        /// 伸長やゲインの小さい音源でもノート間で基準が揃う。有声フレームが無ければ
+        /// <see cref="SourceLevelDb"/> と同じ全体の実効レベル。
+        /// </summary>
+        public static float VoicedLevelDb(float[] x, float[]? frameF0, int nhop)
+        {
+            float rms = frameF0 != null ? VoicedRms(x, frameF0, nhop) : 0f;
+            if (rms <= 1e-6f) rms = ActiveRms(x);
+            return rms > 1e-6f ? 20f * MathF.Log10(rms) : float.NaN;
+        }
+
+        private static float VoicedRms(float[] x, float[] frameF0, int nhop)
+        {
+            if (x.Length == 0 || nhop <= 0) return 0f;
+            var ms = new System.Collections.Generic.List<double>();
+            double maxMs = 0;
+            for (int i = 0; i < frameF0.Length; i++)
+            {
+                if (frameF0[i] <= 0) continue;
+                int lo = Math.Max(0, i * nhop - nhop / 2), hi = Math.Min(x.Length, i * nhop + nhop / 2);
+                if (hi <= lo) continue;
+                double e = 0;
+                for (int k = lo; k < hi; k++) e += (double)x[k] * x[k];
+                e /= hi - lo;
+                ms.Add(e);
+                if (e > maxMs) maxMs = e;
+            }
+            if (ms.Count == 0 || maxMs <= 0) return 0f;
+            double threshold = maxMs * 0.01; // 有声中でも -20dB 未満（無音混入）は除外
+            double sum = 0; int cnt = 0;
+            foreach (var e in ms) { if (e >= threshold) { sum += e; cnt++; } }
+            return cnt > 0 ? (float)Math.Sqrt(sum / cnt) : 0f;
+        }
+
+        /// <summary>
         /// 基準レベル正規化＋ボリューム適用＋ピークリミット（in-place）。
         /// <paramref name="sourceLevelDb"/> は原音区間の実効レベル（NaN なら -16dBFS フォールバック）。
         /// </summary>
-        public static void Apply(float[] output, int volume, ILogger log, float sourceLevelDb = float.NaN)
+        /// <param name="outputFrameF0">出力フレーム毎の F0（有声判定用、null なら全体の実効値）。</param>
+        public static void Apply(float[] output, int volume, ILogger log, float sourceLevelDb = float.NaN,
+            float[]? outputFrameF0 = null, int nhop = 0)
         {
             if (output.Length == 0) return;
 
@@ -60,7 +105,8 @@ namespace UtauEngineNg.Synthesis
             float targetDb = absolute ? AbsoluteTargetDb
                            : !float.IsNaN(sourceLevelDb) ? sourceLevelDb
                            : DefaultTargetRmsDb;
-            float outRms = ActiveRms(output);
+            float outRms = outputFrameF0 != null && nhop > 0 ? VoicedRms(output, outputFrameF0, nhop) : 0f;
+            if (outRms <= 1e-6f) outRms = ActiveRms(output);
             if (outRms > 1e-6f)
             {
                 float gainDb = Math.Clamp(
@@ -81,7 +127,7 @@ namespace UtauEngineNg.Synthesis
                 for (int i = 0; i < output.Length; i++) output[i] *= volScale;
             }
 
-            // 3. ピークリミッタ
+            // 3. ピーク下限 / ピークリミッタ
             float peak = 0f;
             for (int i = 0; i < output.Length; i++)
             {
@@ -94,6 +140,12 @@ namespace UtauEngineNg.Synthesis
                 float limiterGain = MaxPeak / peak;
                 for (int i = 0; i < output.Length; i++) output[i] *= limiterGain;
                 log.Debug(Stage, $"Peak {peak:F3} too loud -> {MaxPeak:F3} (gain {limiterGain:F3})");
+            }
+            else if (peak < MinPeak && peak > 0f)
+            {
+                float floorGain = MinPeak / peak;
+                for (int i = 0; i < output.Length; i++) output[i] *= floorGain;
+                log.Debug(Stage, $"Peak {peak:F3} too quiet -> {MinPeak:F3} (gain {floorGain:F3})");
             }
             else
             {

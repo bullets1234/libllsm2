@@ -222,7 +222,8 @@ def main():
     qout = os.path.join(tmp, "quiet_out.wav")
     run(exe, [quiet, qout, "A3", "100", "", "0", "700", "100", "0", "100", "0"])
     q_db = active_rms_db(qout)
-    check("whisper protection (quiet source stays quiet)", q_db < TARGET_DB - 6.0,
+    # 小さい音源はピーク下限 -12dBFS まで持ち上がる（作業前の挙動）。爆音化（+12dB 正規化クランプ超え）しないこと。
+    check("quiet source lifted to the -12dBFS peak floor, not beyond", -30.0 < q_db < TARGET_DB + 1.0,
           f"quiet source rendered at {q_db:.1f}dB (normal source level={TARGET_DB:.0f}dB)")
 
     # 4. マイクロプロソディ: J80 で既定（オフ）と出力が変わり、
