@@ -76,7 +76,9 @@ namespace UtauEngineNg.Synthesis
                 if (residualCorrectionEnabled)
                     residualSnapshots = ResidualEnvelopeCorrector.Snapshot(srcChunk, srcNfrm, out residualF0s);
 
-                LlsmBindings.Llsm.ChunkToLayer1(srcChunk, Nfft);
+                // 等倍解析（L2R_OS=0）では同じ周波数分解能になるよう nfft を半分にする
+                float confFnyq = LlsmBindings.Llsm.GetConfFloat(LlsmBindings.Llsm.GetConf(srcChunk), NativeLLSM.LLSM_CONF_FNYQ);
+                LlsmBindings.Llsm.ChunkToLayer1(srcChunk, confFnyq <= fs / 2f * 1.01f ? Nfft / 2 : Nfft);
                 SpectrumDownsampler.Apply(srcChunk, fs, log);
 
                 // 倍音トレース診断: Layer1変換+ダウンサンプル直後（逆位相伝播前）

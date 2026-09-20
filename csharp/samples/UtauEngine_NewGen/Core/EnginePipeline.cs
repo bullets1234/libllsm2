@@ -119,8 +119,13 @@ namespace UtauEngineNg.Core
 
             // 6. 解析後のノイズモデル品質処理
             var nmProc = new NoiseModelProcessor(log);
-            nmProc.ApplyMedianFilterToPsd(chunk, nfrm);
-            nmProc.ConstrainBoundaryPsd(chunk, nfrm);
+            // L2R_PSDMED=0 / L2R_PSDBOUND=0 で無効化（A/B 用）
+            if (Environment.GetEnvironmentVariable("L2R_PSDMED") != "0") nmProc.ApplyMedianFilterToPsd(chunk, nfrm);
+            if (Environment.GetEnvironmentVariable("L2R_PSDBOUND") != "0") nmProc.ConstrainBoundaryPsd(chunk, nfrm);
+            // 有声部の低域ノイズ塊（弾き音・渡りの「ブッ」）を定常レベル基準で頭打ち（L2R_LFCAP=0 で無効化）
+            if (Environment.GetEnvironmentVariable("L2R_LFCAP") != "0") nmProc.CapVoicedLowFreqPsd(chunk, nfrm);
+            // 原音倍音位置の櫛形の谷を均す（試験・既定オフ。L2R_DECOMB=1 で有効）
+            if (Environment.GetEnvironmentVariable("L2R_DECOMB") == "1") nmProc.DecombVoicedPsd(chunk, nfrm);
 
             // 7. ストレッチ係数
             float consonantStretch = MathF.Pow(2.0f, (100.0f - args.Velocity) / 100.0f);

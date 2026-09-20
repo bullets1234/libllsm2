@@ -24,6 +24,7 @@ namespace UtauEngineNg.Synthesis
             int nfrm = LlsmBindings.Llsm.GetNumFrames(chunk);
 
             float originalFnyq = originalFs / 2.0f;
+            if (analysisFnyq <= originalFnyq * 1.01f) return; // 等倍解析（L2R_OS=0）では不要
             int originalNspec = (analysisNspec - 1) / 2 + 1;
 
             log.Debug(Stage, $"Spectrum nspec {analysisNspec} -> {originalNspec}, fnyq {analysisFnyq:F0} -> {originalFnyq:F0}");

@@ -75,10 +75,11 @@ namespace UtauEngineNg.Llsm
                 p->rel_winsize = relWinsize;
             }
 
-            // 2x オーバーサンプリング解析
-            int analysisFs = fs * 2;
-            float[] upsampled = Resampling.Upsample2x(segment);
-            log.Debug(Stage, $"Oversampled analysis {fs}Hz -> {analysisFs}Hz ({segment.Length} -> {upsampled.Length} samples)");
+            // 2x オーバーサンプリング解析（L2R_OS=0 で等倍解析。A/B 用）
+            int osFactor = Environment.GetEnvironmentVariable("L2R_OS") == "0" ? 1 : 2;
+            int analysisFs = fs * osFactor;
+            float[] upsampled = osFactor == 2 ? Resampling.Upsample2x(segment) : segment;
+            log.Debug(Stage, $"Analysis {fs}Hz -> {analysisFs}Hz ({segment.Length} -> {upsampled.Length} samples)");
 
             ChunkHandle chunk;
             float[]? residualUp = null;
@@ -141,7 +142,7 @@ namespace UtauEngineNg.Llsm
                 int len = Math.Clamp((nfrm + 1) * nhopUp, 0, residualUp.Length - start);
                 var cut = new float[len];
                 Array.Copy(residualUp, start, cut, 0, len);
-                residual = Resampling.Downsample(cut, 2);
+                residual = osFactor == 2 ? Resampling.Downsample(cut, 2) : cut;
                 // 調波の引き残し除去（ピッチシフト時に原音音高のゴーストが雑音側に残るのを防ぐ）。
                 // L2R_RESEXC_DEHARM=0 で無効化（A/B 用）。
                 if (Environment.GetEnvironmentVariable("L2R_RESEXC_DEHARM") != "0")

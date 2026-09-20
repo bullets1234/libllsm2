@@ -176,6 +176,130 @@ namespace UtauEngineNg.Llsm
         }
 
         /// <summary>
+        /// 有声フレームの NM PSD 低域を、チャンク内有声フレームの定常レベル（ビン毎の中央値）
+        /// + <see cref="LowFreqCapMarginDb"/> で頭打ちにする。弾き音・渡りなど倍音振幅が急変する
+        /// 箇所では調波モデルが追従できず、倍音の引き残しが残差へ漏れて低域 PSD が定常部より
+        /// 13〜20 dB 盛り上がる（実測: 「ら」の弾き周辺 60 ms）。これを雑音として再合成すると
+        /// 25 ms 程度の低域ノイズ塊になり、乱数の実現値次第で「ブッ」と聞こえる。有声部の 1 kHz
+        /// 以下の息成分は倍音にマスクされるため、定常レベル基準の上限は聴感上安全。
+        /// 1〜2 kHz は上限を 6→18 dB へ緩めてスペクトルの段差を避ける。頭打ちしたビンでは
+        /// PSDRES の正の偏差も落とす（合成時に dB 加算で戻ってしまうため）。
+        /// </summary>
+        public void CapVoicedLowFreqPsd(ChunkHandle chunk, int nfrm)
+        {
+            float fnyq = LlsmBindings.Llsm.GetConfFloat(LlsmBindings.Llsm.GetConf(chunk), NativeLLSM.LLSM_CONF_FNYQ);
+            var psds = new float[nfrm][];
+            int npsd = -1, nVoiced = 0;
+            for (int i = 0; i < nfrm; i++)
+            {
+                var frame = LlsmBindings.Llsm.GetFrame(chunk, i);
+                if (FrameAccess.GetF0(frame) <= 0) continue;
+                if (FrameAccess.TryGetNm(frame) is not { HasPsd: true } nm) continue;
+                if (npsd == -1) npsd = nm.NPsd;
+                if (nm.NPsd != npsd) continue;
+                psds[i] = nm.ReadPsd();
+                nVoiced++;
+            }
+            if (nVoiced < LowFreqCapMinFrames || npsd <= 1) return;
+
+            float binHz = fnyq / (npsd - 1);
+            int nbins = Math.Min(npsd, (int)(LowFreqCapEndHz / binHz) + 1);
+            var column = new float[nVoiced];
+            var cap = new float[nbins];
+            for (int j = 0; j < nbins; j++)
+            {
+                int c = 0;
+                for (int i = 0; i < nfrm; i++) if (psds[i] != null) column[c++] = psds[i][j];
+                Array.Sort(column, 0, c);
+                float f = j * binHz;
+                float margin = f <= LowFreqCapFullHz ? LowFreqCapMarginDb
+                    : LowFreqCapMarginDb + (f - LowFreqCapFullHz) / (LowFreqCapEndHz - LowFreqCapFullHz) * 12f;
+                cap[j] = column[c / 2] + margin;
+            }
+
+            int capped = 0;
+            for (int i = 0; i < nfrm; i++)
+            {
+                if (psds[i] == null) continue;
+                var frame = LlsmBindings.Llsm.GetFrame(chunk, i);
+                var resPtr = NativeLLSM.llsm_container_get(frame.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
+                int resLen = resPtr != IntPtr.Zero ? NativeLLSM.llsm_fparray_length(resPtr) : 0;
+                float[]? res = null;
+                bool modified = false;
+                for (int j = 0; j < nbins; j++)
+                {
+                    if (psds[i][j] <= cap[j]) continue;
+                    psds[i][j] = cap[j];
+                    modified = true;
+                    if (j < resLen)
+                    {
+                        if (res == null) { res = new float[resLen]; System.Runtime.InteropServices.Marshal.Copy(resPtr, res, 0, resLen); }
+                        if (res[j] > 0) res[j] = 0;
+                    }
+                }
+                if (!modified) continue;
+                FrameAccess.TryGetNm(frame)?.WritePsd(psds[i]);
+                if (res != null) System.Runtime.InteropServices.Marshal.Copy(res, 0, resPtr, resLen);
+                capped++;
+            }
+            if (capped > 0) _log.Info(Stage, $"Capped low-frequency NM PSD on {capped}/{nVoiced} voiced frames");
+        }
+
+        private const float LowFreqCapMarginDb = 6f;
+        private const float LowFreqCapFullHz = 1000f;
+        private const float LowFreqCapEndHz = 2000f;
+        private const int LowFreqCapMinFrames = 10;
+
+        /// <summary>
+        /// 有声フレームの NM PSD から原音倍音位置の櫛形の谷を均す。解析残差（原音 − 調波再合成）は
+        /// 各倍音 k·f0 の周りが引き抜かれているため、PSD に f0 周期の谷（実測 3〜6 dB）が残る。
+        /// 等倍では HM 側の狭帯域成分がその谷を埋めるが、ピッチを動かすと谷は原音ピッチの位置に
+        /// 取り残され、雑音床に原音ピッチの櫛、倍音側は谷を埋めない純トーンになる（1.2% のシフトで
+        /// 8-16 kHz の山/谷比 +3 dB を実測）。パワー領域で幅 f0 の移動平均を取ると f0 周期の
+        /// 櫛は消え、帯域エネルギーは保存される。
+        /// </summary>
+        public void DecombVoicedPsd(ChunkHandle chunk, int nfrm)
+        {
+            float fnyq = LlsmBindings.Llsm.GetConfFloat(LlsmBindings.Llsm.GetConf(chunk), NativeLLSM.LLSM_CONF_FNYQ);
+            int done = 0;
+            for (int i = 0; i < nfrm; i++)
+            {
+                var frame = LlsmBindings.Llsm.GetFrame(chunk, i);
+                float f0 = FrameAccess.GetF0(frame);
+                if (f0 <= 0) continue;
+                if (FrameAccess.TryGetNm(frame) is not { HasPsd: true } nm) continue;
+
+                float[] psd = nm.ReadPsd();
+                int n = psd.Length;
+                float binHz = fnyq / (n - 1);
+                float halfBins = 0.5f * f0 / binHz;   // 窓の半幅（ビン、実数）
+                if (halfBins < 1f) continue;
+
+                // 累積和で実数幅の箱型平均（端は折り返さず有効範囲で正規化）
+                var cum = new double[n + 1];
+                for (int j = 0; j < n; j++) cum[j + 1] = cum[j] + Math.Pow(10.0, psd[j] / 10.0);
+                var outPsd = new float[n];
+                for (int j = 0; j < n; j++)
+                {
+                    double lo = Math.Max(0.0, j + 0.5 - halfBins), hi = Math.Min(n, j + 0.5 + halfBins);
+                    double sum = CumAt(cum, hi) - CumAt(cum, lo);
+                    outPsd[j] = (float)(10.0 * Math.Log10(Math.Max(sum / (hi - lo), 1e-12)));
+                }
+                nm.WritePsd(outPsd);
+                done++;
+            }
+            if (done > 0) _log.Info(Stage, $"De-combed NM PSD on {done} voiced frames");
+        }
+
+        /// <summary>累積和の実数位置での線形補間。</summary>
+        private static double CumAt(double[] cum, double pos)
+        {
+            int k = (int)pos;
+            if (k >= cum.Length - 1) return cum[^1];
+            return cum[k] + (cum[k + 1] - cum[k]) * (pos - k);
+        }
+
+        /// <summary>
         /// V/UV 境界（±1 フレーム）の有声側 eenv 振幅を最小 50% まで漸減し、
         /// 有声→無声の急変によるポップノイズを抑える。
         /// </summary>
