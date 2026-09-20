@@ -230,6 +230,14 @@ namespace UtauEngineNg.Pitch
                 srcF0 = corrected.Length > 0 ? corrected.Average() : targetF0;
             }
 
+            // 弾き音直後などの PYIN の追従遅れを波形の局所自己相関で修正（L2R_F0ACF=0 で無効化。A/B 用）
+            if (Environment.GetEnvironmentVariable("L2R_F0ACF") != "0"
+                && F0Stabilizer.RefineWithAutocorrelation(f0, segment, fs, nhop, log) > 0)
+            {
+                var refined = f0.Where(x => x > 0).ToArray();
+                srcF0 = refined.Length > 0 ? refined.Average() : targetF0;
+            }
+
             if (flags.BypassFrq && frqData != null)
                 log.Info(Stage, $"Initial F0 from PYIN (P flag, bypassing FRQ): {srcF0:F1}Hz");
             else

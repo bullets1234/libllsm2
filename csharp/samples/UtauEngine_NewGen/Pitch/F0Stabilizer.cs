@@ -157,6 +157,61 @@ namespace UtauEngineNg.Pitch
         }
 
         /// <summary>
+        /// PYIN 由来 F0 を波形の局所正規化相互相関（NCCF）で検証し、外れたフレームを置き換える。
+        /// PYIN は HMM の平滑化で弾き音・鼻音渡りの直後に数フレーム遅れ、実 F0 から 4〜8% 外れる
+        /// ことがある（実測: 「ら」の弾き直後に 404 Hz を 372 Hz と報告）。この誤差では高次倍音が
+        /// 調波解析から外れて残差へ漏れ、雑音モデルが低域の「ブッ」というバーストを出す。
+        /// PYIN 値の ±12% 内で約 3 周期窓の NCCF ピークを探し、十分に周期的（≥ minCorr）かつ
+        /// 2.5% 以上ずれているフレームだけを置換する。
+        /// </summary>
+        /// <returns>置換したフレーム数。</returns>
+        public static int RefineWithAutocorrelation(float[] f0, float[] x, int fs, int nhop, ILogger log,
+            float searchRange = 0.12f, float minCorr = 0.7f, float minDeviation = 0.025f)
+        {
+            int replaced = 0;
+            for (int i = 0; i < f0.Length; i++)
+            {
+                if (f0[i] <= 0) continue;
+                float period = fs / f0[i];
+                int lagLo = Math.Max(2, (int)MathF.Floor(period / (1f + searchRange)));
+                int lagHi = (int)MathF.Ceiling(period / (1f - searchRange));
+                int half = (int)(1.5f * period);
+                int start = i * nhop - half, len = 2 * half;
+                if (start < 0 || start + len + lagHi + 1 >= x.Length) continue;
+
+                int bestLag = -1; double best = -1, prev = 0, bestPrev = 0, bestNext = 0;
+                bool wantNext = false;
+                for (int lag = lagLo - 1; lag <= lagHi + 1; lag++)
+                {
+                    double xy = 0, xx = 0, yy = 0;
+                    for (int k = 0; k < len; k++)
+                    {
+                        double a = x[start + k], b = x[start + k + lag];
+                        xy += a * b; xx += a * a; yy += b * b;
+                    }
+                    double c = xy / Math.Sqrt(xx * yy + 1e-20);
+                    if (wantNext) { bestNext = c; wantNext = false; }
+                    if (lag >= lagLo && lag <= lagHi && c > best)
+                    {
+                        best = c; bestLag = lag; bestPrev = prev; wantNext = true;
+                    }
+                    prev = c;
+                }
+                // 探索範囲の端に張り付いたピークは（範囲外に真のピークがある）信用しない
+                if (bestLag <= lagLo || bestLag >= lagHi || best < minCorr) continue;
+
+                double denom = bestPrev - 2 * best + bestNext;
+                double offset = Math.Abs(denom) > 1e-12 ? Math.Clamp(0.5 * (bestPrev - bestNext) / denom, -0.5, 0.5) : 0;
+                float refined = (float)(fs / (bestLag + offset));
+                if (MathF.Abs(refined / f0[i] - 1f) < minDeviation) continue;
+                f0[i] = refined;
+                replaced++;
+            }
+            if (replaced > 0) log.Info(Stage, $"F0 refined by local autocorrelation on {replaced} frames");
+            return replaced;
+        }
+
+        /// <summary>
         /// PYIN 由来 F0 の局所オクターブジャンプを補正する（前後±15フレームの局所中央値基準、
         /// V/UV 境界でウィンドウ打ち切り）。補正があれば true。
         /// </summary>
