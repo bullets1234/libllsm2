@@ -93,6 +93,10 @@ namespace UtauEngineNg.Llsm
                     chunk = LlsmBindings.Llsm.Analyze(aopt, upsampled, analysisFs, f0, f0.Length);
             }
 
+            // 位相導出 F0（f フラグ / L2R_PHF0=1）: H1 位相差からフレーム F0 を導出し、位相伝播と整合させる
+            if (flags.PhaseConsistentF0 || Environment.GetEnvironmentVariable("L2R_PHF0") == "1")
+                PhaseConsistentF0.Apply(chunk, f0.Length, thopSec, log);
+
             // eenv 変調深度クランプ（子音過渡の誤フィット抑制）
             // N8 フラグ / L2R_EENVCLAMP=0 で無効化可能（切り分け用）
             if (Environment.GetEnvironmentVariable("L2R_EENVCLAMP") != "0" && !flags.DisableEenvClamp)

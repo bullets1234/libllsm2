@@ -53,6 +53,8 @@ namespace UtauEngineNg.Synthesis
             var log = _diag.Log;
             float srcF0 = p.SrcF0, targetF0 = p.TargetF0;
             float pitchShiftRatio = targetF0 / srcF0;
+            // 診断用: L2R_IDENTITY=1 でピッチ比 1（原音 F0 のまま）に固定する（等倍再合成の上限測定用）
+            if (Environment.GetEnvironmentVariable("L2R_IDENTITY") == "1") pitchShiftRatio = 1f;
 
             var unwrappedPb = PitchBendGrid.Unwrap(p.PitchBend);
             int srcNfrm = LlsmBindings.Llsm.GetNumFrames(srcChunk);
@@ -126,6 +128,8 @@ namespace UtauEngineNg.Synthesis
             // ストレッチ計算（末尾不安定フレームを保護）
             int stretchableFrames = srcNfrm - p.ConsonantFrames;
             int tailMargin = Math.Min(3, stretchableFrames / 4);
+            // 診断用: L2R_IDENTITY=1 では末尾保護を外し、出力フレーム＝原音フレーム（複製経路）にする
+            if (Environment.GetEnvironmentVariable("L2R_IDENTITY") == "1") tailMargin = 0;
             int effectiveStretchableFrames = Math.Max(1, stretchableFrames - tailMargin);
             int dstConsonantFrames = (int)Math.Round(p.ConsonantFrames * p.ConsonantStretch);
             int dstStretchedFrames = (int)Math.Round(stretchableFrames * p.StretchRatio);
@@ -335,7 +339,14 @@ namespace UtauEngineNg.Synthesis
                 using (_diag.Profiler.Measure("to_layer0"))
                 {
                     LlsmBindings.Llsm.ChunkToLayer0(dstChunk);
-                    NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
+                    // RPS 位相同期: 各フレームで H1 の声門位相を 0 に揃え、逆伝播後に残る F0 積分誤差の
+                    // ランダムウォークを消す処理。F0 が位相と整合している（f フラグ）ときは残りは定数で、
+                    // RPS はむしろ等倍で約 5dB の位相忠実度を損なう（実測）ため省略する。
+                    // L2R_RPS=1 で強制オン、L2R_RPS=0 で強制オフ。
+                    string? rpsEnv = Environment.GetEnvironmentVariable("L2R_RPS");
+                    bool useRps = rpsEnv == "1" || (rpsEnv != "0" && !p.PhaseConsistentF0);
+                    if (useRps)
+                        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
                     LlsmBindings.Llsm.ChunkPhasePropagate(dstChunk, +1);
                     // 端パディングで位相伝播の起点が pad フレーム前へずれた分を戻し、
                     // パディングなしと同じ絶対位相にする（A/B 比較で波形が揃う）。

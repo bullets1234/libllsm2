@@ -58,6 +58,8 @@ namespace UtauEngineNg.Synthesis
         public bool TextureTransfer { get; init; }
         public bool SmootherAndResidualCorrection { get; init; }
         public bool HarmonicDeviation { get; init; }
+        /// <summary>f: 位相導出 F0 ＋ RPS 位相同期の省略（等倍再合成の位相忠実度を回復）。</summary>
+        public bool PhaseConsistentF0 { get; init; }
 
         // 合成オプション
         public bool UseOversampling { get; init; }
@@ -104,6 +106,7 @@ namespace UtauEngineNg.Synthesis
                 TextureTransfer = flags.TextureTransfer,
                 SmootherAndResidualCorrection = flags.SmootherAndResidualCorrection,
                 HarmonicDeviation = flags.HarmonicDeviation,
+                PhaseConsistentF0 = flags.PhaseConsistentF0,
                 UseOversampling = flags.Oversampling,
             };
         }

@@ -63,6 +63,8 @@ namespace UtauEngineNg.Cli
         public bool SmootherAndResidualCorrection { get; }
         /// <summary>d（小文字）: 倍音番号索引の振幅偏差補正（Layer1 で失われる倍音ごとの偏差をシフト後に当て直す）。</summary>
         public bool HarmonicDeviation { get; }
+        /// <summary>f（小文字）: 位相導出 F0（H1 の実測位相差からフレーム F0 を導出し、位相伝播と整合させる）。</summary>
+        public bool PhaseConsistentF0 { get; }
 
         // --- 数値フラグ ---
         /// <summary>B: 息成分（0-100、既定 50）。</summary>
@@ -131,6 +133,7 @@ namespace UtauEngineNg.Cli
             TextureTransfer = Has("t");
             SmootherAndResidualCorrection = Has("s");
             HarmonicDeviation = Has("d");
+            PhaseConsistentF0 = Has("f");
             ModulationPlus = Raw.Contains("M+", StringComparison.Ordinal)
                           || Raw.Contains("M1", StringComparison.Ordinal);
 
