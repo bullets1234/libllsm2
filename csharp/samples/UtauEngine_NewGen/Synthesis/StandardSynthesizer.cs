@@ -56,6 +56,7 @@ namespace UtauEngineNg.Synthesis
 
             var unwrappedPb = PitchBendGrid.Unwrap(p.PitchBend);
             int srcNfrm = LlsmBindings.Llsm.GetNumFrames(srcChunk);
+            float[]?[]? harmonicDeviations = null;
 
             // L フラグ: 声門パラメータ自動推定（Layer1 変換前、HM が存在する状態）
             new GlottalEstimateEffect(p.UseGlottalAutoEstimate, log).Apply(srcChunk, srcNfrm, fs);
@@ -73,15 +74,21 @@ namespace UtauEngineNg.Synthesis
                 bool residualCorrectionEnabled =
                     (p.SmootherAndResidualCorrection || Environment.GetEnvironmentVariable("L2R_RESIDUAL") == "1")
                     && !p.DisableResidualCorrection;
+                bool harmonicDeviationEnabled = p.HarmonicDeviation || Environment.GetEnvironmentVariable("L2R_HARMDEV") == "1";
+                if (harmonicDeviationEnabled) residualCorrectionEnabled = false; // d は s の残差包絡補正を置き換える
                 float[][]? residualSnapshots = null;
                 float[]? residualF0s = null;
-                if (residualCorrectionEnabled)
+                if (residualCorrectionEnabled || harmonicDeviationEnabled)
                     residualSnapshots = ResidualEnvelopeCorrector.Snapshot(srcChunk, srcNfrm, out residualF0s);
 
                 // 等倍解析（L2R_OS=0）では同じ周波数分解能になるよう nfft を半分にする
                 float confFnyq = LlsmBindings.Llsm.GetConfFloat(LlsmBindings.Llsm.GetConf(srcChunk), NativeLLSM.LLSM_CONF_FNYQ);
                 LlsmBindings.Llsm.ChunkToLayer1(srcChunk, confFnyq <= fs / 2f * 1.01f ? Nfft / 2 : Nfft);
                 SpectrumDownsampler.Apply(srcChunk, fs, log);
+
+                // 倍音番号索引の振幅偏差（d フラグ）: Layer1 再生成との比を倍音毎に保持
+                if (harmonicDeviationEnabled && residualSnapshots != null)
+                    harmonicDeviations = HarmonicDeviation.Measure(srcChunk, srcNfrm, residualSnapshots!, log);
 
                 // 倍音トレース診断: Layer1変換+ダウンサンプル直後（逆位相伝播前）
                 if (HarmonicTracer.Enabled)
@@ -247,6 +254,16 @@ namespace UtauEngineNg.Synthesis
                             Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
                             for (int j = 0; j < nspec; j++)
                                 vtmagn[j] = Math.Max(vtmagn[j] + vtmagnCompensation, VtmagnFloorDb);
+                            // 倍音番号索引の振幅偏差を新しい倍音周波数の位置へ当て直す（d フラグ）
+                            if (harmonicDeviations != null)
+                            {
+                                float cents = 1200f * MathF.Log2(newF0 / originalF0);
+                                float wdev = HarmonicDeviation.Weight(cents);
+                                HarmonicDeviation.ApplyToVtmagn(vtmagn, fs / 2f, newF0,
+                                    srcIdx1 < harmonicDeviations.Length ? harmonicDeviations[srcIdx1] : null,
+                                    srcIdx2 < harmonicDeviations.Length ? harmonicDeviations[srcIdx2] : null,
+                                    ratio, wdev, VtmagnFloorDb);
+                            }
                             Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
                         }
 

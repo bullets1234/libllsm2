@@ -57,6 +57,7 @@ namespace UtauEngineNg.Synthesis
         public bool ResidualUnvoiced { get; init; }
         public bool TextureTransfer { get; init; }
         public bool SmootherAndResidualCorrection { get; init; }
+        public bool HarmonicDeviation { get; init; }
 
         // 合成オプション
         public bool UseOversampling { get; init; }
@@ -102,6 +103,7 @@ namespace UtauEngineNg.Synthesis
                 ResidualUnvoiced = flags.ResidualUnvoiced,
                 TextureTransfer = flags.TextureTransfer,
                 SmootherAndResidualCorrection = flags.SmootherAndResidualCorrection,
+                HarmonicDeviation = flags.HarmonicDeviation,
                 UseOversampling = flags.Oversampling,
             };
         }

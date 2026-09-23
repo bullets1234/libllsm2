@@ -61,6 +61,8 @@ namespace UtauEngineNg.Cli
         public bool TextureTransfer { get; }
         /// <summary>s（小文字）: VSPHSE 位相スムーザ＋残差包絡補正（旧 UtauEngine に無い NewGen の処理）。</summary>
         public bool SmootherAndResidualCorrection { get; }
+        /// <summary>d（小文字）: 倍音番号索引の振幅偏差補正（Layer1 で失われる倍音ごとの偏差をシフト後に当て直す）。</summary>
+        public bool HarmonicDeviation { get; }
 
         // --- 数値フラグ ---
         /// <summary>B: 息成分（0-100、既定 50）。</summary>
@@ -128,6 +130,7 @@ namespace UtauEngineNg.Cli
             ResidualUnvoiced = Has("u");
             TextureTransfer = Has("t");
             SmootherAndResidualCorrection = Has("s");
+            HarmonicDeviation = Has("d");
             ModulationPlus = Raw.Contains("M+", StringComparison.Ordinal)
                           || Raw.Contains("M1", StringComparison.Ordinal);
 
