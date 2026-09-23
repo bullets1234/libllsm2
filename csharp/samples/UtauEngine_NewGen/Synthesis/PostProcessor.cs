@@ -95,10 +95,14 @@ namespace UtauEngineNg.Synthesis
         /// <paramref name="sourceLevelDb"/> は原音区間の実効レベル（NaN なら -16dBFS フォールバック）。
         /// </summary>
         /// <param name="outputFrameF0">出力フレーム毎の F0（有声判定用、null なら全体の実効値）。</param>
+        /// <summary>直前の <see cref="Apply"/> の音量処理の内訳（呼び出し記録用）。</summary>
+        public static string LastSummary { get; private set; } = "";
+
         public static void Apply(float[] output, int volume, ILogger log, float sourceLevelDb = float.NaN,
             float[]? outputFrameF0 = null, int nhop = 0)
         {
             if (output.Length == 0) return;
+            float normGainDb = 0f, floorGainDb = 0f, limiterGainDb = 0f, outLevelDb = float.NaN;
 
             // 1. 基準レベルへの正規化（±12dB クランプ）
             bool absolute = !float.IsNaN(AbsoluteTargetDb);
@@ -111,8 +115,10 @@ namespace UtauEngineNg.Synthesis
             {
                 float gainDb = Math.Clamp(
                     targetDb - 20f * MathF.Log10(outRms), -MaxNormGainDb, MaxNormGainDb);
+                outLevelDb = 20f * MathF.Log10(outRms);
                 if (MathF.Abs(gainDb) > 0.1f)
                 {
+                    normGainDb = gainDb;
                     float gain = MathF.Pow(10f, gainDb / 20f);
                     for (int i = 0; i < output.Length; i++) output[i] *= gain;
                     log.Debug(Stage, $"Normalize: {20f * MathF.Log10(outRms):F1}dBFS -> " +
@@ -135,15 +141,18 @@ namespace UtauEngineNg.Synthesis
                 if (a > peak) peak = a;
             }
 
+            float peakBefore = peak;
             if (peak > MaxPeak)
             {
                 float limiterGain = MaxPeak / peak;
+                limiterGainDb = 20f * MathF.Log10(limiterGain);
                 for (int i = 0; i < output.Length; i++) output[i] *= limiterGain;
                 log.Debug(Stage, $"Peak {peak:F3} too loud -> {MaxPeak:F3} (gain {limiterGain:F3})");
             }
             else if (peak < MinPeak && peak > 0f)
             {
                 float floorGain = MinPeak / peak;
+                floorGainDb = 20f * MathF.Log10(floorGain);
                 for (int i = 0; i < output.Length; i++) output[i] *= floorGain;
                 log.Debug(Stage, $"Peak {peak:F3} too quiet -> {MinPeak:F3} (gain {floorGain:F3})");
             }
@@ -151,6 +160,8 @@ namespace UtauEngineNg.Synthesis
             {
                 log.Debug(Stage, $"Peak {peak:F3} within range, no adjustment");
             }
+
+            LastSummary = $"src {(float.IsNaN(sourceLevelDb) ? float.NaN : sourceLevelDb):F1}dB out {outLevelDb:F1}dB norm {normGainDb:+0.0;-0.0}dB vol {volume} peak {peakBefore:F2} floor {floorGainDb:+0.0;-0.0}dB lim {limiterGainDb:+0.0;-0.0}dB";
         }
 
         /// <summary>

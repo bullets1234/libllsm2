@@ -43,6 +43,7 @@ namespace UtauEngineNg
                 }
 
                 new EnginePipeline(diag).Run(args);
+                CaptureAppend("  -> level: " + UtauEngineNg.Synthesis.PostProcessor.LastSummary);
                 foreach (var t in diag.Profiler.Report())
                     log.Debug("Profiler", $"{t.Stage}: {t.DurationMs:F1}ms");
                 diag.Trace.Flush();
@@ -62,6 +63,15 @@ namespace UtauEngineNg
         /// （UTAU からの呼び出しをそのまま再実行できる）。exe のフォルダに書けない場合は
         /// %TEMP%\L2R_calls.log へ書く。環境変数 L2R_CAPTURE=&lt;ログのパス&gt; でも有効化できる。
         /// </summary>
+        private static string? s_capturePath;
+
+        /// <summary>呼び出し記録が有効なとき、直前の呼び出し行の下に 1 行追記する。</summary>
+        private static void CaptureAppend(string text)
+        {
+            if (s_capturePath == null) return;
+            try { System.IO.File.AppendAllText(s_capturePath, text + Environment.NewLine, Encoding.UTF8); } catch { }
+        }
+
         private static void CaptureCall(string[] rawArgs)
         {
             try
@@ -89,11 +99,12 @@ namespace UtauEngineNg
                     sb.Append(' ');
                 }
                 string line = sb.ToString().TrimEnd() + Environment.NewLine;
-                try { System.IO.File.AppendAllText(logPath, line, Encoding.UTF8); }
+                try { System.IO.File.AppendAllText(logPath, line, Encoding.UTF8); s_capturePath = logPath; }
                 catch
                 {
                     // 書き込み不可（Program Files 等）: TEMP へ退避
-                    System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "L2R_calls.log"), line, Encoding.UTF8);
+                    string alt = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "L2R_calls.log");
+                    System.IO.File.AppendAllText(alt, line, Encoding.UTF8); s_capturePath = alt;
                 }
             }
             catch { /* 記録失敗は無視 */ }
