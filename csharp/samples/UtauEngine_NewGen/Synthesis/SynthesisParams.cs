@@ -54,6 +54,9 @@ namespace UtauEngineNg.Synthesis
         public bool PsolaExcitation { get; init; }
         /// <summary>r: 残差励振を全フレームに（既定は無声のみ）。</summary>
         public bool ResidualFull { get; init; }
+        public bool ResidualUnvoiced { get; init; }
+        public bool TextureTransfer { get; init; }
+        public bool SmootherAndResidualCorrection { get; init; }
 
         // 合成オプション
         public bool UseOversampling { get; init; }
@@ -96,6 +99,9 @@ namespace UtauEngineNg.Synthesis
                 DisableResidualExcitation = flags.DisableResidualExcitation,
                 PsolaExcitation = flags.PsolaExcitation,
                 ResidualFull = flags.ResidualFull,
+                ResidualUnvoiced = flags.ResidualUnvoiced,
+                TextureTransfer = flags.TextureTransfer,
+                SmootherAndResidualCorrection = flags.SmootherAndResidualCorrection,
                 UseOversampling = flags.Oversampling,
             };
         }

@@ -69,8 +69,10 @@ namespace UtauEngineNg.Synthesis
                 // 残差包絡補正: Layer1包絡フィットで失われる高域倍音振幅（実測2k-16kHzで
                 // -3〜-7dB）を残差包絡としてVTMAGNへ還元するため、変換前のHM振幅を保存する。
                 // L2R_RESIDUAL=0 で無効化（A/B用）。
+                // 既定オフ（旧 UtauEngine 相当）。s フラグ / L2R_RESIDUAL=1 で有効化、N4 で強制オフ。
                 bool residualCorrectionEnabled =
-                    Environment.GetEnvironmentVariable("L2R_RESIDUAL") != "0" && !p.DisableResidualCorrection;
+                    (p.SmootherAndResidualCorrection || Environment.GetEnvironmentVariable("L2R_RESIDUAL") == "1")
+                    && !p.DisableResidualCorrection;
                 float[][]? residualSnapshots = null;
                 float[]? residualF0s = null;
                 if (residualCorrectionEnabled)
@@ -94,7 +96,8 @@ namespace UtauEngineNg.Synthesis
                 // tolayer1 の vs_phse = phse - vt_phse(最小位相) はノイズフロア帯の乱れを
                 // 全域に拡散させるため、時間方向の円環/移動平均で除去する。
                 // 補正量が閾値を超えるビン（＝実際の音声変化）は素通し。L2R_SMOOTH=0 で無効化（A/B用）。
-                if (Environment.GetEnvironmentVariable("L2R_SMOOTH") != "0" && !p.DisableVsphseSmoother)
+                // 既定オフ（旧 UtauEngine 相当）。s フラグ / L2R_SMOOTH=1 で有効化、N2 で強制オフ。
+                if ((p.SmootherAndResidualCorrection || Environment.GetEnvironmentVariable("L2R_SMOOTH") == "1") && !p.DisableVsphseSmoother)
                 {
                     VsphseSmoother.Apply(srcChunk, srcNfrm);
                     VsphseSmoother.SmoothVtmagn(srcChunk, srcNfrm);
@@ -150,13 +153,16 @@ namespace UtauEngineNg.Synthesis
             var voiceQuality = new VoiceQualityCurveEffect(p.VoiceQuality, srcF0, p.ThopSeconds, dstNfrm, fs);
 
             // NM テクスチャ実時間転写（冷凍ノイズ対策）。L2R_NMTEX=0 / N16 で無効化（A/B 用）
-            bool noiseTextureEnabled = Environment.GetEnvironmentVariable("L2R_NMTEX") != "0" && !p.DisableNoiseTexture;
+            // 既定オフ（旧 UtauEngine 相当）。t フラグ / L2R_NMTEX=1 で有効化、N16 で強制オフ。
+            bool noiseTextureEnabled = (p.TextureTransfer || Environment.GetEnvironmentVariable("L2R_NMTEX") == "1") && !p.DisableNoiseTexture;
             var noiseTexture = new NoiseTextureTransfer(srcChunk, srcNfrm, noiseTextureEnabled, log);
 
             // 残差励振: 原音の解析残差を実時間カーソルで並べ直し、雑音励振として使う。
             // 4x オーバーサンプリング合成時は励振の fs が合わないため従来の乱数励振。
+            // 既定オフ（旧 UtauEngine 相当）。u（無声のみ）/ r（全フレーム）/ L2R_RESEXC=1 で有効化、N128 で強制オフ。
             bool residualExcitation = residual != null && residual.Length > 0 && !p.UseOversampling
-                && Environment.GetEnvironmentVariable("L2R_RESEXC") != "0" && !p.DisableResidualExcitation;
+                && (p.ResidualUnvoiced || p.ResidualFull || Environment.GetEnvironmentVariable("L2R_RESEXC") == "1")
+                && !p.DisableResidualExcitation;
             var excSourceFrame = residualExcitation ? new int[dstTotal] : null;
             float consonantLocalStretch = p.ConsonantFrames > 0 ? (float)dstConsonantFrames / p.ConsonantFrames : 1f;
             float vowelLocalStretch = (float)dstStretchedFrames / effectiveStretchableFrames;

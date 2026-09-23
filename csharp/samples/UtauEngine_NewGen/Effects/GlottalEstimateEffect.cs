@@ -204,18 +204,19 @@ namespace UtauEngineNg.Effects
         // Rd 変更によるスペクトルティルト変化で倍音全体のエネルギーが落ちる/上がる
         // （tolayer0 は H1 基準正規化のため）。補償は半分だけ掛ける（全量だと低域が持ち上がり
         // こもる）。暴走防止クランプ付き。
-        private const float MaxCompensationDb = 6.0f;
-        private const float CompensationFraction = 0.5f;
-        // 息漏れ側で増やす気息雑音（PSD, dB）: K0 で +NoiseCoupleDb、K100 で -NoiseCoupleDb
-        private const float NoiseCoupleDb = 6.0f;
+        // 2026-09-24: 穏やかな倍率＋半分補償＋雑音連動の版は実歌唱で「最悪」判定だったため、
+        // 旧 UtauEngine と同じ写像（2.5〜0.3、全量補償、雑音不変）に戻す。
+        private const float MaxCompensationDb = 12.0f;
+        private const float CompensationFraction = 1.0f;
+        private const float NoiseCoupleDb = 0.0f;
 
         public void Apply(ChunkHandle chunk, int nfrm, int fs)
         {
             if (!IsActive) return;
 
             float rdScale = _closure <= 50
-                ? 2.0f - (_closure / 50.0f) * 1.0f          // K0..50 : 2.0 -> 1.0
-                : 1.0f - ((_closure - 50) / 50.0f) * 0.5f;  // K50..100: 1.0 -> 0.5
+                ? 2.5f - (_closure / 50.0f) * 1.5f          // K0..50 : 2.5 -> 1.0（旧 UtauEngine と同一）
+                : 1.0f - ((_closure - 50) / 50.0f) * 0.7f;  // K50..100: 1.0 -> 0.3
             float noiseDb = -NoiseCoupleDb * (_closure - 50) / 50.0f; // K0 +6dB .. K100 -6dB
 
             var conf = LlsmBindings.Llsm.GetConf(chunk);

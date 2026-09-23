@@ -83,7 +83,8 @@ namespace UtauEngineNg.Llsm
 
             ChunkHandle chunk;
             float[]? residualUp = null;
-            bool wantResidual = Environment.GetEnvironmentVariable("L2R_RESEXC") != "0" && !flags.DisableResidualExcitation;
+            bool wantResidual = (flags.ResidualUnvoiced || flags.ResidualFull || Environment.GetEnvironmentVariable("L2R_RESEXC") == "1")
+                && !flags.DisableResidualExcitation;
             using (_diag.Profiler.Measure("llsm_analyze"))
             {
                 if (wantResidual)

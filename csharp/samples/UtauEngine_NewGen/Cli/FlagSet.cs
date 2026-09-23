@@ -55,6 +55,12 @@ namespace UtauEngineNg.Cli
         /// 既定は無声フレームのみ残差（母音は従来のモデル雑音）。
         /// </summary>
         public bool ResidualFull { get; }
+        /// <summary>u（小文字）: 無声フレームだけ残差励振（子音・息の時間構造を原音から取る）。</summary>
+        public bool ResidualUnvoiced { get; }
+        /// <summary>t（小文字）: NM テクスチャ実時間転写（伸長区間の雑音の凍結を防ぐ）。</summary>
+        public bool TextureTransfer { get; }
+        /// <summary>s（小文字）: VSPHSE 位相スムーザ＋残差包絡補正（旧 UtauEngine に無い NewGen の処理）。</summary>
+        public bool SmootherAndResidualCorrection { get; }
 
         // --- 数値フラグ ---
         /// <summary>B: 息成分（0-100、既定 50）。</summary>
@@ -119,6 +125,9 @@ namespace UtauEngineNg.Cli
             PsolaExcitation = Has("p");
             HarmonicityGate = Has("h");
             ResidualFull = Has("r");
+            ResidualUnvoiced = Has("u");
+            TextureTransfer = Has("t");
+            SmootherAndResidualCorrection = Has("s");
             ModulationPlus = Raw.Contains("M+", StringComparison.Ordinal)
                           || Raw.Contains("M1", StringComparison.Ordinal);
 
