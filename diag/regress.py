@@ -223,7 +223,9 @@ def main():
     run(exe, [quiet, qout, "A3", "100", "", "0", "700", "100", "0", "100", "0"])
     q_db = active_rms_db(qout)
     # 小さい音源はピーク下限 -12dBFS まで持ち上がる（作業前の挙動）。爆音化（+12dB 正規化クランプ超え）しないこと。
-    check("quiet source lifted to the -12dBFS peak floor, not beyond", -30.0 < q_db < TARGET_DB + 1.0,
+    # 小さい音源は有声部実効レベル -22dBFS まで持ち上がる（ノート間で揃う）が、持ち上げは +20dB 止まり。
+    # この合成音源は -49dBFS なので、上限 +20dB で約 -29dBFS になるはず（爆音化しないこと）。
+    check("quiet source lifted by at most +20dB toward the -22dBFS level floor", -33.0 < q_db < -25.0,
           f"quiet source rendered at {q_db:.1f}dB (normal source level={TARGET_DB:.0f}dB)")
 
     # 4. マイクロプロソディ: J80 で既定（オフ）と出力が変わり、

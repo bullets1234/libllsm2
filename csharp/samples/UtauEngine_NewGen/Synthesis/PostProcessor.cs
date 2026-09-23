@@ -26,7 +26,16 @@ namespace UtauEngineNg.Synthesis
         /// だとその不揃いがそのまま出る（2026-09-16 報告）。原音追従の後にこの下限を掛けることで、
         /// 通常レベルの音源は原音の音量感を保ちつつ、小さい音源は作業前と同じ扱いになる。
         /// </summary>
-        private const float MinPeak = 0.25f;        // -12dB
+        private const float MinPeak = 0.25f;        // -12dB（旧規則。現在は実効レベル下限に置き換え、参考値として保持）
+        /// <summary>
+        /// 実効レベル下限（有声部 RMS, dBFS）。小さい音源のノートはここまで持ち上げる。
+        /// 旧規則のピーク下限（0.25）はノートのピーク値で持ち上げ量が決まるため、子音のピークが立つ
+        /// ノートほど持ち上がらず、隣接ノート間で最大 5dB の段差になった（2026-09-24 実測）。
+        /// 実効レベルで揃えれば同じ音源のノートは同じ音量感に収束する。-22dBFS は旧規則が母音で
+        /// 実現していた水準に相当。
+        /// </summary>
+        private const float MinLevelDb = -22f;
+        private const float MaxFloorGainDb = 20f;
         /// <summary>L2R_TARGET_DB 未指定時のフォールバック（原音レベルが取れない場合のみ使用）。</summary>
         private const float DefaultTargetRmsDb = -16f;
         private const float MaxNormGainDb = 12f;    // 正規化ゲインの安全クランプ ±12dB
@@ -133,7 +142,22 @@ namespace UtauEngineNg.Synthesis
                 for (int i = 0; i < output.Length; i++) output[i] *= volScale;
             }
 
-            // 3. ピーク下限 / ピークリミッタ
+            // 3. 実効レベル下限（小さい音源のノートを同じ音量感に揃える）
+            float levelNow = outputFrameF0 != null && nhop > 0 ? VoicedRms(output, outputFrameF0, nhop) : 0f;
+            if (levelNow <= 1e-6f) levelNow = ActiveRms(output);
+            if (levelNow > 1e-6f)
+            {
+                float levelDb = 20f * MathF.Log10(levelNow);
+                if (levelDb < MinLevelDb)
+                {
+                    floorGainDb = Math.Min(MinLevelDb - levelDb, MaxFloorGainDb);
+                    float floorGain = MathF.Pow(10f, floorGainDb / 20f);
+                    for (int i = 0; i < output.Length; i++) output[i] *= floorGain;
+                    log.Debug(Stage, $"Level {levelDb:F1}dBFS below floor -> {MinLevelDb:F0}dBFS (gain {floorGainDb:+0.0}dB)");
+                }
+            }
+
+            // 4. ピークリミッタ
             float peak = 0f;
             for (int i = 0; i < output.Length; i++)
             {
@@ -148,13 +172,6 @@ namespace UtauEngineNg.Synthesis
                 limiterGainDb = 20f * MathF.Log10(limiterGain);
                 for (int i = 0; i < output.Length; i++) output[i] *= limiterGain;
                 log.Debug(Stage, $"Peak {peak:F3} too loud -> {MaxPeak:F3} (gain {limiterGain:F3})");
-            }
-            else if (peak < MinPeak && peak > 0f)
-            {
-                float floorGain = MinPeak / peak;
-                floorGainDb = 20f * MathF.Log10(floorGain);
-                for (int i = 0; i < output.Length; i++) output[i] *= floorGain;
-                log.Debug(Stage, $"Peak {peak:F3} too quiet -> {MinPeak:F3} (gain {floorGain:F3})");
             }
             else
             {
