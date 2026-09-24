@@ -306,57 +306,127 @@ namespace UtauEngineNg.Llsm
         /// （戯白メリー e+あ: 原音包絡は平坦なまま雑音 PSD が +14dB, 2026-09-24）。
         /// 有声フレームについて、雑音 PSD の広帯域レベルが近傍（±3〜±8 フレーム）の中央値より
         /// <see cref="BurstThresholdDb"/> 以上高く、かつ原音の包絡が近傍中央値から
-        /// <see cref="EnvelopeTolDb"/> 以内（＝実際の過渡ではない）のフレームを、中央値 + 2dB まで下げる。
+        /// <see cref="EnvelopeTolDb"/> 以内（＝実際の過渡ではない）のフレームを対象にする。
+        /// バーストは Kalman 平滑後の PSD ではなくフレーム毎の残差 PSDRES（低域の倍音位置）と
+        /// 包絡 edc / eenv（低域チャンネル）に入るので、PSDRES の広帯域レベルで検出し、PSDRES を
+        /// ビン毎、包絡をチャンネル毎に「近傍中央値 + 1dB」へクランプする。
         /// 子音の破裂や息継ぎは包絡が変化するので対象にならない。N256 で無効化。
         /// </summary>
-        private const float BurstThresholdDb = 6f;
+        private const float BurstThresholdDb = 3f;
         private const float EnvelopeTolDb = 2f;
-        private const float BurstKeepAboveMedianDb = 2f;
+        private const float BurstKeepAboveMedianDb = 1f;
 
         public void SuppressFitErrorBursts(ChunkHandle chunk, int nfrm, float[] segment, int nhop)
         {
-            var psdLevel = new float[nfrm]; var envDb = new float[nfrm]; var voiced = new bool[nfrm];
-            var nms = new NmView?[nfrm];
+            // バーストは Kalman 平滑後の PSD ではなく各フレームの残差 PSDRES と包絡 edc/eenv に入る
+            var resLevel = new float[nfrm]; var envDb = new float[nfrm]; var voiced = new bool[nfrm];
+            var resArr = new float[]?[nfrm]; var resPtrs = new IntPtr[nfrm];
+            var edcArr = new float[]?[nfrm]; var eenv0 = new float[]?[nfrm];
             for (int i = 0; i < nfrm; i++)
             {
                 var fr = LlsmBindings.Llsm.GetFrame(chunk, i);
                 voiced[i] = LlsmBindings.Llsm.GetFrameF0(fr) > 0;
+                resLevel[i] = float.NaN;
+                var rp = NativeLLSM.llsm_container_get(fr.Ptr, NativeLLSM.LLSM_FRAME_PSDRES);
+                if (rp == IntPtr.Zero) continue;
+                int n = NativeLLSM.llsm_fparray_length(rp);
+                if (n <= 0) continue;
+                var res = new float[n]; System.Runtime.InteropServices.Marshal.Copy(rp, res, 0, n);
+                double lin = 0; for (int j = 0; j < n; j++) lin += Math.Pow(10.0, res[j] / 10.0);
+                resLevel[i] = (float)(10.0 * Math.Log10(lin / n + 1e-30));
+                resArr[i] = res; resPtrs[i] = rp;
                 var nm = FrameAccess.TryGetNm(fr);
-                if (nm is not { HasPsd: true } nmv) { psdLevel[i] = float.NaN; continue; }
-                nms[i] = nmv;
-                float[] psd = nmv.ReadPsd();
-                double lin = 0; for (int j = 0; j < psd.Length; j++) lin += Math.Pow(10.0, psd[j] / 10.0);
-                psdLevel[i] = (float)(10.0 * Math.Log10(lin / psd.Length + 1e-30));
+                if (nm is { } nv)
+                {
+                    if (nv.HasEdc) edcArr[i] = nv.ReadEdc();
+                    if (nv.HasEenv)
+                    {
+                        var e0 = new float[nv.NChannel];
+                        for (int c = 0; c < nv.NChannel; c++)
+                        {
+                            var ch = nv.GetEenvChannel(c);
+                            e0[c] = ch is { HasAmplitudes: true } cv ? cv.ReadAmplitudes()[0] : 0f;
+                        }
+                        eenv0[i] = e0;
+                    }
+                }
                 int lo = Math.Max(0, i * nhop - nhop), hi = Math.Min(segment.Length, i * nhop + nhop);
                 double e = 0; for (int k = lo; k < hi; k++) e += (double)segment[k] * segment[k];
                 envDb[i] = hi > lo ? (float)(10.0 * Math.Log10(e / (hi - lo) + 1e-12)) : -120f;
             }
 
             int suppressed = 0; float maxCut = 0;
-            var med = new System.Collections.Generic.List<float>();
+            var med = new System.Collections.Generic.List<float>(); var envMed = new System.Collections.Generic.List<float>();
+            var nbr = new System.Collections.Generic.List<int>(); var tmp = new System.Collections.Generic.List<float>();
+            bool dbg = Environment.GetEnvironmentVariable("L2R_BURSTDBG") == "1";
+            float keepLin = MathF.Pow(10f, BurstKeepAboveMedianDb / 10f);
             for (int i = 0; i < nfrm; i++)
             {
-                if (!voiced[i] || nms[i] == null || float.IsNaN(psdLevel[i])) continue;
-                med.Clear(); var envMed = new System.Collections.Generic.List<float>();
+                if (!voiced[i] || resArr[i] == null) continue;
+                med.Clear(); envMed.Clear(); nbr.Clear();
                 for (int d = 3; d <= 8; d++)
                 {
                     foreach (int k in new[] { i - d, i + d })
                     {
-                        if (k < 0 || k >= nfrm || !voiced[k] || float.IsNaN(psdLevel[k])) continue;
-                        med.Add(psdLevel[k]); envMed.Add(envDb[k]);
+                        if (k < 0 || k >= nfrm || !voiced[k] || resArr[k] == null) continue;
+                        med.Add(resLevel[k]); envMed.Add(envDb[k]); nbr.Add(k);
                     }
                 }
                 if (med.Count < 4) continue;
                 med.Sort(); envMed.Sort();
-                float mPsd = med[med.Count / 2], mEnv = envMed[envMed.Count / 2];
-                float excess = psdLevel[i] - mPsd;
+                float mRes = med[med.Count / 2], mEnv = envMed[envMed.Count / 2];
+                float excess = resLevel[i] - mRes;
+                if (dbg) _log.Debug(Stage, $"burst? f{i}: psdres {resLevel[i]:F1} med {mRes:F1} excess {excess:+0.0;-0.0} | env {envDb[i]:F1} med {mEnv:F1}");
                 if (excess < BurstThresholdDb) continue;
                 if (MathF.Abs(envDb[i] - mEnv) > EnvelopeTolDb) continue; // 実際の過渡（子音・息継ぎ）は残す
-                float cut = excess - BurstKeepAboveMedianDb;
-                float[] psd = nms[i]!.Value.ReadPsd();
-                for (int j = 0; j < psd.Length; j++) psd[j] -= cut;
-                nms[i]!.Value.WritePsd(psd);
-                suppressed++; maxCut = MathF.Max(maxCut, cut);
+
+                // PSDRES: ビン毎に近傍中央値 + keep へクランプ（バーストは低域の倍音位置に集中する）
+                var cur = resArr[i]!; float cutMax = 0;
+                for (int j = 0; j < cur.Length; j++)
+                {
+                    tmp.Clear();
+                    foreach (int k in nbr) { var r = resArr[k]!; if (j < r.Length) tmp.Add(r[j]); }
+                    tmp.Sort();
+                    float lim = tmp[tmp.Count / 2] + BurstKeepAboveMedianDb;
+                    if (cur[j] > lim) { cutMax = MathF.Max(cutMax, cur[j] - lim); cur[j] = lim; }
+                }
+                System.Runtime.InteropServices.Marshal.Copy(cur, 0, resPtrs[i], cur.Length);
+
+                // 包絡（edc / eenv, パワー）: チャンネル毎に近傍中央値 × keep へクランプ
+                var nm = FrameAccess.TryGetNm(LlsmBindings.Llsm.GetFrame(chunk, i));
+                if (nm is { } nmv)
+                {
+                    if (nmv.HasEdc && edcArr[i] != null)
+                    {
+                        var edc = edcArr[i]!;
+                        for (int c = 0; c < edc.Length; c++)
+                        {
+                            tmp.Clear(); foreach (int k in nbr) if (edcArr[k] is { } ek && c < ek.Length) tmp.Add(ek[c]);
+                            if (tmp.Count < 4) continue; tmp.Sort();
+                            float lim = tmp[tmp.Count / 2] * keepLin;
+                            if (edc[c] > lim) edc[c] = lim;
+                        }
+                        nmv.WriteEdc(edc);
+                    }
+                    if (nmv.HasEenv && eenv0[i] != null)
+                    {
+                        var e0 = eenv0[i]!;
+                        for (int c = 0; c < nmv.NChannel; c++)
+                        {
+                            tmp.Clear(); foreach (int k in nbr) if (eenv0[k] is { } ek && c < ek.Length) tmp.Add(ek[c]);
+                            if (tmp.Count < 4) continue; tmp.Sort();
+                            float lim = tmp[tmp.Count / 2] * keepLin;
+                            if (e0[c] <= lim || e0[c] <= 0) continue;
+                            float g = lim / e0[c];
+                            var ch = nmv.GetEenvChannel(c);
+                            if (ch is not { HasAmplitudes: true } chv) continue;
+                            float[] amp = chv.ReadAmplitudes();
+                            for (int k = 0; k < amp.Length; k++) amp[k] *= g;
+                            chv.WriteAmplitudes(amp);
+                        }
+                    }
+                }
+                suppressed++; maxCut = MathF.Max(maxCut, cutMax);
             }
             if (suppressed > 0)
                 _log.Info(Stage, $"Suppressed fit-error noise bursts on {suppressed} voiced frames (max -{maxCut:F1}dB)");
