@@ -24,4 +24,17 @@
     <!-- Neural Vocoderモデル（オプション：存在する場合のみコピー） -->
     <None Include="models\**\*" CopyToOutputDirectory="PreserveNewest" Condition="Exists('models')" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- libllsm2.dll をビルド出力と publish にコピー -->
+    <None Include="..\..\..\x64\Release\libllsm2.dll" Condition="Exists('..\..\..\x64\Release\libllsm2.dll')">
+      <Link>libllsm2.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+    <None Include="..\..\..\x64\Release\libpyin.dll" Condition="Exists('..\..\..\x64\Release\libpyin.dll')">
+      <Link>libpyin.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
 </Project>

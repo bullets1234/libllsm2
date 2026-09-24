@@ -104,3 +104,15 @@ project.assets.json
 # Exceptions - include certain files if needed
 !libllsm2.def
 !libpyin.def
+
+# Local diagnostic data (third-party voicebank samples, python caches)
+diag/repo/
+__pycache__/
+*.pyc
+
+# NNSVS/WORLD sample dumps and model-derived data (large or license-bound)
+csharp/samples/NnsvsOnnx/smoke_out/
+csharp/samples/NnsvsOnnx/testdata/
+csharp/samples/WorldToLlsm/features.bin
+csharp/samples/WorldToLlsm/_export_log.txt
+csharp/samples/WorldToLlsm/onnx/

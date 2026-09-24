@@ -1,0 +1,546 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using LlsmBindings;
+using UtauEngineNg.Audio;
+using UtauEngineNg.Diagnostics;
+using UtauEngineNg.Effects;
+using UtauEngineNg.Llsm;
+using UtauEngineNg.Pitch;
+
+namespace UtauEngineNg.Synthesis
+{
+    /// <summary>合成結果（出力波形 + 分解成分）。</summary>
+    public sealed class SynthesisResult
+    {
+        public required float[] Output { get; init; }
+        public float[]? Sinusoid { get; init; }
+        public float[]? Noise { get; init; }
+        /// <summary>出力フレーム毎の F0（無声 0、パディング除去済み）。レベル正規化の有声判定に使う。</summary>
+        public float[]? FrameF0 { get; init; }
+    }
+
+    /// <summary>
+    /// 標準タイムストレッチ合成。子音部は velocity、伸縮部は均一展開で各出力フレームを
+    /// 隣接ソースから補間（フリーズ／反復を回避）し、ピッチシフト・各種エフェクトを適用して
+    /// Layer0（または Growl 時 Layer1）で合成する。
+    /// （UtauEngine SynthesizeWithConsonantAndStretch の再構成。検証済み DSP を保持）
+    /// </summary>
+    public sealed class StandardSynthesizer
+    {
+        private const string Stage = "Synthesis";
+        private const int Nfft = 16384;       // 2x オーバーサンプリング解析対応
+        private const float VtmagnFloorDb = -80f;
+        /// <summary>
+        /// 合成の端パディング（フレーム）。出力チャンクの前後に先頭/末尾フレームの複製を置いて
+        /// 合成し、その分を切り落とす。フレーム 0 の OLA 窓が半分欠けることによる先頭の
+        /// 振幅落ち・ノイズ STFT 正規化のスパイク、末尾の早いフェードアウトを防ぐ。
+        /// L2R_EDGEPAD=0 / N32 で無効化。
+        /// </summary>
+        private const int SynthesisPadFrames = 4;
+
+        // ピッチダウン時の VSPHSE 高域拡張の A/B 用トグル（L2R_VSEXT=0 で無効化）。
+        // 拡張位相が金属的リングの原因か切り分けるための診断スイッチ
+        private static readonly bool VsphseExtensionEnabled =
+            Environment.GetEnvironmentVariable("L2R_VSEXT") != "0";
+
+        private readonly DiagnosticsContext _diag;
+
+        public StandardSynthesizer(DiagnosticsContext diag) => _diag = diag;
+
+        public SynthesisResult Synthesize(ChunkHandle srcChunk, int fs, SynthesisParams p, float[]? residual = null, float[]? sourceSegment = null)
+        {
+            var log = _diag.Log;
+            float srcF0 = p.SrcF0, targetF0 = p.TargetF0;
+            float pitchShiftRatio = targetF0 / srcF0;
+            // 診断用: L2R_IDENTITY=1 でピッチ比 1（原音 F0 のまま）に固定する（等倍再合成の上限測定用）
+            if (Environment.GetEnvironmentVariable("L2R_IDENTITY") == "1") pitchShiftRatio = 1f;
+
+            var unwrappedPb = PitchBendGrid.Unwrap(p.PitchBend);
+            int srcNfrm = LlsmBindings.Llsm.GetNumFrames(srcChunk);
+            float[]?[]? harmonicDeviations = null;
+
+            // L フラグ: 声門パラメータ自動推定（Layer1 変換前、HM が存在する状態）
+            new GlottalEstimateEffect(p.UseGlottalAutoEstimate, log).Apply(srcChunk, srcNfrm, fs);
+
+            // 倍音トレース診断（L2R_HMTRACE）: 分析済みHM（Layer1変換前）
+            if (HarmonicTracer.Enabled) HarmonicTracer.TraceHm(srcChunk, srcNfrm, "pre-layer1", log);
+
+            // Layer1 へ変換 + スペクトルダウンサンプル + 逆位相伝播
+            using (_diag.Profiler.Measure("to_layer1"))
+            {
+                // 残差包絡補正: Layer1包絡フィットで失われる高域倍音振幅（実測2k-16kHzで
+                // -3〜-7dB）を残差包絡としてVTMAGNへ還元するため、変換前のHM振幅を保存する。
+                // L2R_RESIDUAL=0 で無効化（A/B用）。
+                // 既定オフ（旧 UtauEngine 相当）。s フラグ / L2R_RESIDUAL=1 で有効化、N4 で強制オフ。
+                bool residualCorrectionEnabled =
+                    (p.SmootherAndResidualCorrection || Environment.GetEnvironmentVariable("L2R_RESIDUAL") == "1")
+                    && !p.DisableResidualCorrection;
+                bool harmonicDeviationEnabled = p.HarmonicDeviation || Environment.GetEnvironmentVariable("L2R_HARMDEV") == "1";
+                if (harmonicDeviationEnabled) residualCorrectionEnabled = false; // d は s の残差包絡補正を置き換える
+                float[][]? residualSnapshots = null;
+                float[]? residualF0s = null;
+                if (residualCorrectionEnabled || harmonicDeviationEnabled)
+                    residualSnapshots = ResidualEnvelopeCorrector.Snapshot(srcChunk, srcNfrm, out residualF0s);
+
+                // 等倍解析（L2R_OS=0）では同じ周波数分解能になるよう nfft を半分にする
+                float confFnyq = LlsmBindings.Llsm.GetConfFloat(LlsmBindings.Llsm.GetConf(srcChunk), NativeLLSM.LLSM_CONF_FNYQ);
+                LlsmBindings.Llsm.ChunkToLayer1(srcChunk, confFnyq <= fs / 2f * 1.01f ? Nfft / 2 : Nfft);
+                SpectrumDownsampler.Apply(srcChunk, fs, log);
+
+                // 倍音番号索引の振幅偏差（d フラグ）: Layer1 再生成との比を倍音毎に保持
+                if (harmonicDeviationEnabled && residualSnapshots != null)
+                    harmonicDeviations = HarmonicDeviation.Measure(srcChunk, srcNfrm, residualSnapshots!, log);
+
+                // 倍音トレース診断: Layer1変換+ダウンサンプル直後（逆位相伝播前）
+                if (HarmonicTracer.Enabled)
+                {
+                    HarmonicTracer.TraceHm(srcChunk, srcNfrm, "post-layer1-hm", log);
+                    HarmonicTracer.TraceVtmagn(srcChunk, srcNfrm, "post-layer1", log, fs);
+                }
+
+                LlsmBindings.Llsm.ChunkPhasePropagate(srcChunk, -1);
+
+                // 分析ジッタ除去（倍音±フレームレートの AM/PM サイドバンド＝ジリジリ音対策）。
+                // tolayer1 の vs_phse = phse - vt_phse(最小位相) はノイズフロア帯の乱れを
+                // 全域に拡散させるため、時間方向の円環/移動平均で除去する。
+                // 補正量が閾値を超えるビン（＝実際の音声変化）は素通し。L2R_SMOOTH=0 で無効化（A/B用）。
+                // 既定オフ（旧 UtauEngine 相当）。s フラグ / L2R_SMOOTH=1 で有効化、N2 で強制オフ。
+                if ((p.SmootherAndResidualCorrection || Environment.GetEnvironmentVariable("L2R_SMOOTH") == "1") && !p.DisableVsphseSmoother)
+                {
+                    VsphseSmoother.Apply(srcChunk, srcNfrm);
+                    VsphseSmoother.SmoothVtmagn(srcChunk, srcNfrm);
+
+                    // 倍音トレース診断: VsphseSmoother 適用後
+                    if (HarmonicTracer.Enabled) HarmonicTracer.TraceVtmagn(srcChunk, srcNfrm, "post-smoother", log, fs);
+                }
+
+                // 残差包絡補正: 上記スムージング等まで完了した最終状態のVTMAGNへ加算する。
+                if (residualCorrectionEnabled && residualSnapshots != null && residualF0s != null)
+                {
+                    ResidualEnvelopeCorrector.Apply(srcChunk, srcNfrm, residualSnapshots, residualF0s, log);
+
+                    // 倍音トレース診断: ResidualEnvelopeCorrector.Apply 後
+                    if (HarmonicTracer.Enabled) HarmonicTracer.TraceVtmagn(srcChunk, srcNfrm, "post-residual", log, fs);
+                }
+            }
+
+            // ストレッチ計算（末尾不安定フレームを保護）
+            int stretchableFrames = srcNfrm - p.ConsonantFrames;
+            int tailMargin = Math.Min(3, stretchableFrames / 4);
+            // 診断用: L2R_IDENTITY=1 では末尾保護を外し、出力フレーム＝原音フレーム（複製経路）にする
+            if (Environment.GetEnvironmentVariable("L2R_IDENTITY") == "1") tailMargin = 0;
+            int effectiveStretchableFrames = Math.Max(1, stretchableFrames - tailMargin);
+            int dstConsonantFrames = (int)Math.Round(p.ConsonantFrames * p.ConsonantStretch);
+            int dstStretchedFrames = (int)Math.Round(stretchableFrames * p.StretchRatio);
+            int dstNfrm = dstConsonantFrames + dstStretchedFrames;
+            bool edgePad = Environment.GetEnvironmentVariable("L2R_EDGEPAD") != "0" && !p.DisableEdgePad;
+            int pad = edgePad ? SynthesisPadFrames : 0;
+            int dstTotal = dstNfrm + 2 * pad; // パディング込みのチャンクフレーム数
+
+            float[] interpolatedPb = PitchBendTimeline.Interpolate(unwrappedPb, dstNfrm, p.Tempo, p.ThopSeconds);
+
+            // dst チャンク生成
+            var conf = LlsmBindings.Llsm.GetConf(srcChunk);
+            var confCopy = LlsmBindings.Llsm.CopyContainer(conf);
+            var nfrmPtr = NativeLLSM.llsm_container_get(confCopy.Ptr, NativeLLSM.LLSM_CONF_NFRM);
+            Marshal.WriteInt32(nfrmPtr, dstTotal);
+            using var dstChunk = LlsmBindings.Llsm.CreateChunk(confCopy, 0);
+            // llsm_create_chunk は conf をディープコピーする（container.c）ため、
+            // confCopy はここで解放する（旧実装は合成毎にコンテナ一式をリーク）
+            NativeLLSM.llsm_delete_container(confCopy.Ptr);
+
+            // トランジェント検出（子音保護用）
+            var srcFrameList = new List<ContainerRef>(srcNfrm);
+            for (int i = 0; i < srcNfrm; i++) srcFrameList.Add(LlsmBindings.Llsm.GetFrame(srcChunk, i));
+            bool[] isTransient = TransientDetector.Detect(srcFrameList);
+
+            float[] dstF0 = new float[dstTotal];
+            log.Info(Stage, $"Pitch shift {srcF0:F1}->{targetF0:F1}Hz (ratio={pitchShiftRatio:F4}, comp=bend-relative only), {dstNfrm} frames");
+
+            var breathiness = new BreathinessEffect(p.Breathiness);
+            var gender = new GenderEffect(p.GenderFactor);
+            var formantFollow = new FormantFollowEffect(p.FormantFollow);
+            var voiceQuality = new VoiceQualityCurveEffect(p.VoiceQuality, srcF0, p.ThopSeconds, dstNfrm, fs);
+
+            // NM テクスチャ実時間転写（冷凍ノイズ対策）。L2R_NMTEX=0 / N16 で無効化（A/B 用）
+            // 既定オフ（旧 UtauEngine 相当）。t フラグ / L2R_NMTEX=1 で有効化、N16 で強制オフ。
+            bool noiseTextureEnabled = (p.TextureTransfer || Environment.GetEnvironmentVariable("L2R_NMTEX") == "1") && !p.DisableNoiseTexture;
+            var noiseTexture = new NoiseTextureTransfer(srcChunk, srcNfrm, noiseTextureEnabled, log);
+
+            // 残差励振: 原音の解析残差を実時間カーソルで並べ直し、雑音励振として使う。
+            // 4x オーバーサンプリング合成時は励振の fs が合わないため従来の乱数励振。
+            // 既定オフ（旧 UtauEngine 相当）。u（無声のみ）/ r（全フレーム）/ L2R_RESEXC=1 で有効化、N128 で強制オフ。
+            bool residualExcitation = residual != null && residual.Length > 0 && !p.UseOversampling
+                && (p.ResidualUnvoiced || p.ResidualFull || Environment.GetEnvironmentVariable("L2R_RESEXC") == "1")
+                && !p.DisableResidualExcitation;
+            var excSourceFrame = residualExcitation ? new int[dstTotal] : null;
+            float consonantLocalStretch = p.ConsonantFrames > 0 ? (float)dstConsonantFrames / p.ConsonantFrames : 1f;
+            float vowelLocalStretch = (float)dstStretchedFrames / effectiveStretchableFrames;
+
+            using (_diag.Profiler.Measure("frame_interp_loop"))
+            {
+                for (int i = 0; i < dstNfrm; i++)
+                {
+                    float srcPosFloat = i < dstConsonantFrames
+                        ? (float)((double)i / dstConsonantFrames * p.ConsonantFrames)
+                        : (float)((double)p.ConsonantFrames + (double)(i - dstConsonantFrames) / dstStretchedFrames * effectiveStretchableFrames);
+
+                    int srcIdx1 = (int)Math.Floor(srcPosFloat);
+                    int srcIdx2 = srcIdx1 + 1;
+                    float ratio = srcPosFloat - srcIdx1;
+                    srcIdx1 = Math.Clamp(srcIdx1, 0, srcNfrm - 1);
+                    srcIdx2 = Math.Clamp(srcIdx2, 0, srcNfrm - 1);
+
+                    bool isConsonant = i < dstConsonantFrames;
+                    bool isSrcTransient1 = srcIdx1 < isTransient.Length && isTransient[srcIdx1];
+                    bool isSrcTransient2 = srcIdx2 < isTransient.Length && isTransient[srcIdx2];
+                    bool isTransientRegion = (isSrcTransient1 || isSrcTransient2) && isConsonant;
+
+                    IntPtr newFramePtr = InterpolateFrameAt(srcChunk, srcIdx1, srcIdx2, ratio, srcNfrm, i, isTransientRegion);
+
+                    // 息テクスチャ（PSDRES / edc 残差）を実時間カーソルから転写。
+                    // トランジェント区間は原音フレームをそのまま使うため対象外（カーソルは進める）。
+                    float localStretch = isConsonant ? consonantLocalStretch : vowelLocalStretch;
+                    if (!isTransientRegion)
+                        noiseTexture.Apply(newFramePtr, srcPosFloat, srcIdx1, srcIdx2, ratio, localStretch);
+                    else
+                        noiseTexture.NextIndex(srcPosFloat, LlsmBindings.Llsm.GetFrameF0(new ContainerRef(newFramePtr)) > 0, localStretch, out _);
+                    if (excSourceFrame != null)
+                        excSourceFrame[i + pad] = isTransientRegion ? noiseTexture.LastNearest : noiseTexture.LastIndex;
+
+                    var newFrameRef = new ContainerRef(newFramePtr);
+                    float originalF0 = LlsmBindings.Llsm.GetFrameF0(newFrameRef);
+
+                    // 息成分（フレーム前段）
+                    breathiness.Apply(new FrameEffectContext { Frame = newFrameRef, OutFrameIdx = i, PitchRatio = pitchShiftRatio, Fs = fs });
+
+                    if (originalF0 > 0)
+                    {
+                        float dynamicMod = p.UseModPlus
+                            ? PitchBendTimeline.DynamicModulation(i, dstNfrm, p.Modulation, p.ThopSeconds, p.OverlapMs)
+                            : p.Modulation;
+
+                        float logDeviation = MathF.Log(originalF0 / srcF0);
+                        float maxLogDev = 6.0f * MathF.Log(2.0f) / 12.0f;
+                        logDeviation = Math.Clamp(logDeviation, -maxLogDev, maxLogDev);
+                        float adjustedSourceF0 = srcF0 * MathF.Exp(logDeviation * (dynamicMod / 100.0f));
+                        float newF0 = adjustedSourceF0 * pitchShiftRatio;
+
+                        if (interpolatedPb.Length > 0 && i < interpolatedPb.Length)
+                            newF0 *= (float)Math.Pow(2, interpolatedPb[i] / 1200.0);
+
+                        // マイクロプロソディ: 原音由来のジッター/シマーを「出力時間軸に
+                        // 等速」で再適用する（ストレッチしても揺れの速度が変わらない）。
+                        // モジュレーションと独立に mod=0 でも声の微細な生気を保つ。
+                        float shimmerDb = 0;
+                        if (p.JitterDepth > 0)
+                        {
+                            float depth = p.JitterDepth / 100f;
+                            float jitterCents = p.Micro.PitchAt(i) * depth;
+                            if (jitterCents != 0)
+                                newF0 *= MathF.Pow(2f, jitterCents / 1200f);
+                            shimmerDb = p.Micro.ShimmerAt(i) * depth;
+                        }
+
+                        // 振幅補正: フレーム毎の実効ピッチ比（ベンド込み）で -20log10(ratio)。
+                        // この補償は実測で合成レベルをほぼピッチ中立にする（2 オクターブで
+                        // 差 ~1dB）。除去すると母音が -3dB/oct 下がり、基準レベル正規化が
+                        // ノート全体を持ち上げる際にピッチ非依存の子音バーストのピークが
+                        // 天井へ達し、リミッタ作動でレベル一貫性が崩れる（実測で確認済み）。
+                        float frameRatio = Math.Clamp(newF0 / originalF0, 0.25f, 4.0f);
+                        float vtmagnCompensation = -20.0f * MathF.Log10(frameRatio) + shimmerDb;
+                        var vtmagnPtr = NativeLLSM.llsm_container_get(newFramePtr, NativeLLSM.LLSM_FRAME_VTMAGN);
+                        if (vtmagnPtr != IntPtr.Zero)
+                        {
+                            int nspec = NativeLLSM.llsm_fparray_length(vtmagnPtr);
+                            float[] vtmagn = new float[nspec];
+                            Marshal.Copy(vtmagnPtr, vtmagn, 0, nspec);
+                            for (int j = 0; j < nspec; j++)
+                                vtmagn[j] = Math.Max(vtmagn[j] + vtmagnCompensation, VtmagnFloorDb);
+                            // 倍音番号索引の振幅偏差を新しい倍音周波数の位置へ当て直す（d フラグ）
+                            if (harmonicDeviations != null)
+                            {
+                                float cents = 1200f * MathF.Log2(newF0 / originalF0);
+                                float wdev = HarmonicDeviation.Weight(cents);
+                                HarmonicDeviation.ApplyToVtmagn(vtmagn, fs / 2f, newF0,
+                                    srcIdx1 < harmonicDeviations.Length ? harmonicDeviations[srcIdx1] : null,
+                                    srcIdx2 < harmonicDeviations.Length ? harmonicDeviations[srcIdx2] : null,
+                                    ratio, wdev, VtmagnFloorDb);
+                            }
+                            Marshal.Copy(vtmagn, 0, vtmagnPtr, nspec);
+                        }
+
+                        NativeCallbacks.AttachF0(newFramePtr, newF0);
+
+                        // ピッチダウン時は Layer0 変換の倍音数が len(vsphse) で頭打ちになるため
+                        // 必要本数まで拡張する（不要なら関数側で no-op。
+                        // N1 フラグ / L2R_VSEXT=0 で A/B 可）
+                        if (VsphseExtensionEnabled && !p.DisableVsphseExtension)
+                            FrameInterpolator.ExtendVsphseForPitchShift(newFramePtr, newF0, fs);
+
+                        dstF0[i + pad] = newF0;
+                    }
+                    else dstF0[i + pad] = 0;
+
+                    // ジェンダー / フォルマント追従
+                    var fctx = new FrameEffectContext { Frame = newFrameRef, OutFrameIdx = i, PitchRatio = pitchShiftRatio, Fs = fs };
+                    gender.Apply(fctx);
+                    formantFollow.Apply(fctx);
+
+                    // 動的声質カーブ（Q フラグ・試験実装、Layer0 変換前に Rd/明るさ/息を変調）
+                    voiceQuality.ApplyFrame(newFramePtr, i, dstF0[i + pad]);
+
+                    LlsmBindings.Llsm.SetFrame(dstChunk, i + pad, newFramePtr);
+                }
+            }
+
+            // 端パディング: 先頭/末尾フレームの複製で前後を埋める
+            if (excSourceFrame != null)
+            {
+                for (int k = 0; k < pad; k++)
+                {
+                    excSourceFrame[k] = excSourceFrame[pad];
+                    excSourceFrame[pad + dstNfrm + k] = excSourceFrame[pad + dstNfrm - 1];
+                }
+            }
+            for (int k = 0; k < pad; k++)
+            {
+                LlsmBindings.Llsm.SetFrame(dstChunk, k, LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(dstChunk, pad)));
+                dstF0[k] = dstF0[pad];
+                int last = pad + dstNfrm - 1;
+                LlsmBindings.Llsm.SetFrame(dstChunk, last + 1 + k, LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(dstChunk, last)));
+                dstF0[last + 1 + k] = dstF0[last];
+            }
+
+            voiceQuality.LogSummary(log);
+            noiseTexture.LogSummary();
+
+            // 倍音トレース診断: フレーム補間ループ完了後
+            if (HarmonicTracer.Enabled) HarmonicTracer.TraceVtmagn(dstChunk, dstTotal, "post-interp", log, fs);
+
+            // V/UV 境界の eenv フェード（ポップノイズ防止）
+            new NoiseModelProcessor(log).FadeEenvAtVuvBoundaries(dstChunk, dstF0, dstTotal);
+
+            // チャンクレベルエフェクト
+            new SpectralTiltEffect(p.SpectralTilt).Apply(dstChunk, dstTotal, fs);
+            new GlottalClosureEffect(p.GlottalClosure, log).Apply(dstChunk, dstTotal, fs);
+            new UnvoicedAttenuationEffect(p.UnvoicedAttenuation, log).Apply(dstChunk, dstTotal, fs);
+
+            // GrowlEffect はネイティブコールバックの寿命を握るため、合成完了
+            //（Render 戻り）まで生存させてから Dispose する
+            using var growl = new GrowlEffect(p.GrowlStrength, log);
+            growl.Apply(dstChunk, dstTotal);
+            bool useLayer1Synthesis = growl.IsActive;
+
+            // Layer0 変換（Growl 時はスキップ）
+            if (!useLayer1Synthesis)
+            {
+                using (_diag.Profiler.Measure("to_layer0"))
+                {
+                    LlsmBindings.Llsm.ChunkToLayer0(dstChunk);
+                    // RPS 位相同期: 各フレームで H1 の声門位相を 0 に揃え、逆伝播後に残る F0 積分誤差の
+                    // ランダムウォークを消す処理。F0 が位相と整合している（f フラグ）ときは残りは定数で、
+                    // RPS はむしろ等倍で約 5dB の位相忠実度を損なう（実測）ため省略する。
+                    // L2R_RPS=1 で強制オン、L2R_RPS=0 で強制オフ。
+                    string? rpsEnv = Environment.GetEnvironmentVariable("L2R_RPS");
+                    bool useRps = rpsEnv == "1" || (rpsEnv != "0" && !p.PhaseConsistentF0);
+                    if (useRps)
+                        NativeLLSM.llsm_chunk_phasesync_rps(dstChunk.DangerousGetHandle(), 1);
+                    LlsmBindings.Llsm.ChunkPhasePropagate(dstChunk, +1);
+                    // 端パディングで位相伝播の起点が pad フレーム前へずれた分を戻し、
+                    // パディングなしと同じ絶対位相にする（A/B 比較で波形が揃う）。
+                    if (pad > 0) CompensatePadPhase(dstChunk, dstF0, pad, dstTotal, p.ThopSeconds);
+                }
+
+                // 倍音トレース診断: Layer0変換+位相同期+位相伝播直後
+                if (HarmonicTracer.Enabled) HarmonicTracer.TraceHm(dstChunk, dstTotal, "post-layer0", log);
+                if (HarmonicTracer.Enabled) HarmonicTracer.TracePhaseCoherence(dstChunk, dstTotal, "post-layer0", log, p.ThopSeconds);
+            }
+            else log.Info(Stage, "Keeping Layer1 for PBP synthesis (Growl active)");
+
+            float[]? excitation = null;
+            int excitationMode = 0;
+            if (excSourceFrame != null)
+            {
+                int nhopExc = Math.Max(1, (int)MathF.Round(p.ThopSeconds * fs));
+                var srcF0s = new float[srcNfrm];
+                for (int s = 0; s < srcNfrm; s++) srcF0s[s] = LlsmBindings.Llsm.GetFrameF0(LlsmBindings.Llsm.GetFrame(srcChunk, s));
+                var mode = ResidualExcitation.ResolveMode(p.ResidualFull);
+                if (mode == ResidualExcitation.Mode.Full && ResidualExcitation.FlattenAm)
+                {
+                    residual = (float[])residual!.Clone();
+                    ResidualExcitation.FlattenVoicedAm(residual, srcF0s, nhopExc);
+                }
+                ResidualExcitation.UnvoicedOnly = mode == ResidualExcitation.Mode.UnvoicedOnly;
+                excitation = ResidualExcitation.Build(residual!, excSourceFrame, nhopExc, srcNfrm, srcF0s, dstF0, sourceSegment, p.PsolaExcitation);
+                excitationMode = mode == ResidualExcitation.Mode.UnvoicedOnly ? 2
+                               : mode == ResidualExcitation.Mode.Full && ResidualExcitation.FlattenAm ? 1 : 0;
+                log.Info(Stage, $"Residual excitation ({mode}): {excitation.Length} samples from {srcNfrm} source frames" + (p.PsolaExcitation ? " (PSOLA, p flag)" : ""));
+            }
+
+            var result = Render(dstChunk, fs, p.UseOversampling, useLayer1Synthesis, log, excitation, excitationMode);
+            if (pad > 0)
+            {
+                // llsm_synthesize の出力長は (nfrm+1)*nhop。パディング分を前後から切り落とし、
+                // パディングなしと同じ長さ (dstNfrm+1)*nhop にする。
+                int nhop = Math.Max(1, (int)MathF.Round(p.ThopSeconds * fs));
+                int trimStart = pad * nhop, keepLen = (dstNfrm + 1) * nhop;
+                result = new SynthesisResult
+                {
+                    Output = Cut(result.Output, trimStart, keepLen),
+                    Sinusoid = result.Sinusoid != null ? Cut(result.Sinusoid, trimStart, keepLen) : null,
+                    Noise = result.Noise != null ? Cut(result.Noise, trimStart, keepLen) : null,
+                };
+            }
+            if (pad > 0)
+            {
+                // 端パディングで先頭が完全な定常状態から始まるため、旧経路（フレーム 0 の OLA 窓が
+                // 半分欠ける）が暗黙に持っていた約 5ms のフェードインが無くなり、破裂音の閉鎖区間に
+                // オフセットを置いたノートで先頭が「ブツ」と立ち上がる（実測で先頭 5ms が最大 +11dB）。
+                // 旧相当の 5ms フェードインを掛ける。末尾は要求長の位置で切られるため、
+                // フェードアウトは EnginePipeline 側で「要求長で終わる 8ms」として掛ける。
+                EdgeFade(result.Output, fs, 0.005f, 0f);
+                if (result.Sinusoid != null) EdgeFade(result.Sinusoid, fs, 0.005f, 0f);
+                if (result.Noise != null) EdgeFade(result.Noise, fs, 0.005f, 0f);
+            }
+            var frameF0 = new float[dstNfrm];
+            Array.Copy(dstF0, pad, frameF0, 0, dstNfrm);
+            result = new SynthesisResult { Output = result.Output, Sinusoid = result.Sinusoid, Noise = result.Noise, FrameF0 = frameF0 };
+            // JIT の生存解析による srcChunk の早期 finalize（=ネイティブ解放）防止
+            GC.KeepAlive(srcChunk);
+            return result;
+        }
+
+        /// <summary>
+        /// llsm_chunk_phasepropagate は frame 0 から f0 を累積するため、先頭パッド分
+        /// Δ = 2π·thop·Σ_{i&lt;pad} f0[i] だけ全フレームの位相が進む。全フレームに −Δ を掛けて
+        /// パディングなしの位相に揃える（Δ は double で累積し [-π, π] に折り返す）。
+        /// </summary>
+        private static void CompensatePadPhase(ChunkHandle chunk, float[] dstF0, int pad, int total, float thop)
+        {
+            double accum = 0;
+            for (int i = 0; i < pad; i++) accum += dstF0[i];
+            double theta = -accum * thop * 2.0 * Math.PI;
+            theta -= Math.Round(theta / (2.0 * Math.PI)) * 2.0 * Math.PI;
+            if (Math.Abs(theta) < 1e-12) return;
+            for (int i = 0; i < total; i++)
+                NativeLLSM.llsm_frame_phaseshift(LlsmBindings.Llsm.GetFrame(chunk, i).Ptr, (float)theta);
+        }
+
+        /// <summary>先頭 headSec の余弦フェードイン、末尾 tailSec の余弦フェードアウト（in-place）。</summary>
+        private static void EdgeFade(float[] x, int fs, float headSec, float tailSec)
+        {
+            int nh = Math.Min(x.Length / 2, (int)(headSec * fs)), nt = Math.Min(x.Length / 2, (int)(tailSec * fs));
+            for (int i = 0; i < nh; i++) x[i] *= 0.5f - 0.5f * MathF.Cos(MathF.PI * i / nh);
+            for (int i = 0; i < nt; i++) x[x.Length - 1 - i] *= 0.5f - 0.5f * MathF.Cos(MathF.PI * i / nt);
+        }
+
+        private static float[] Cut(float[] x, int start, int len)
+        {
+            start = Math.Clamp(start, 0, x.Length);
+            len = Math.Clamp(len, 0, x.Length - start);
+            var r = new float[len];
+            Array.Copy(x, start, r, 0, len);
+            return r;
+        }
+
+        /// <summary>位置 srcPos のフレームを補間生成する（整数/境界/トランジェント/4点/2点）。</summary>
+        private static IntPtr InterpolateFrameAt(ChunkHandle srcChunk, int srcIdx1, int srcIdx2, float ratio, int srcNfrm, int outIdx, bool isTransientRegion)
+        {
+            if (srcIdx1 == srcIdx2 || ratio < 0.01f)
+                return LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(srcChunk, srcIdx1));
+            if (ratio > 0.99f)
+                return LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(srcChunk, srcIdx2));
+
+            if (isTransientRegion)
+            {
+                int nearestIdx = ratio < 0.5f ? srcIdx1 : srcIdx2;
+                // 旧: 最近傍フレームを丸ごと複製。子音部が小数比で写像される（velocity≠100）と、複製された
+                // フレームと補間されたフレームの間で F0・VSPHSE（位相）が段差になり、声門アタック等の
+                // トランジェント判定フレームの境目で「ブツ」が出た（戯白メリー e+あ, 2026-09-24）。
+                // 既定は「振幅（VTMAGN）だけ最近傍から複製し、F0・位相・雑音は補間」にする。
+                // L2R_TRANSIENT=copy で旧挙動、=0 で保護なし（全補間）。
+                string? mode = Environment.GetEnvironmentVariable("L2R_TRANSIENT");
+                if (mode == "copy")
+                    return LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(srcChunk, nearestIdx));
+                if (mode != "0")
+                {
+                    IntPtr interp = InterpolateFrameAt(srcChunk, srcIdx1, srcIdx2, ratio, srcNfrm, outIdx, false);
+                    var nearPtr = NativeLLSM.llsm_container_get(LlsmBindings.Llsm.GetFrame(srcChunk, nearestIdx).Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+                    if (nearPtr != IntPtr.Zero)
+                        NativeCallbacks.AttachFpArrayCopy(interp, NativeLLSM.LLSM_FRAME_VTMAGN, nearPtr);
+                    return interp;
+                }
+            }
+
+            bool canUseCubic = srcIdx1 > 0 && srcIdx2 < srcNfrm - 1;
+            if (canUseCubic)
+            {
+                return FrameInterpolator.Interpolate4(
+                    LlsmBindings.Llsm.GetFrame(srcChunk, srcIdx1 - 1),
+                    LlsmBindings.Llsm.GetFrame(srcChunk, srcIdx1),
+                    LlsmBindings.Llsm.GetFrame(srcChunk, srcIdx2),
+                    LlsmBindings.Llsm.GetFrame(srcChunk, srcIdx2 + 1),
+                    ratio, outIdx);
+            }
+            return FrameInterpolator.Interpolate2(
+                LlsmBindings.Llsm.GetFrame(srcChunk, srcIdx1),
+                LlsmBindings.Llsm.GetFrame(srcChunk, srcIdx2),
+                ratio, outIdx);
+        }
+
+        /// <summary>Layer0/Layer1 チャンクを波形へ合成する（O フラグ時は 4x オーバーサンプリング）。</summary>
+        private SynthesisResult Render(ChunkHandle dstChunk, int fs, bool useOversampling, bool useLayer1Synthesis, ILogger log, float[]? excitation = null, int excitationMode = 0)
+        {
+            bool dump = _diag.Dump.Enabled;
+            using (_diag.Profiler.Measure("llsm_synthesize"))
+            {
+                if (useOversampling)
+                {
+                    const int oversampleRate = 4;
+                    int synthesisFs = fs * oversampleRate;
+                    log.Info(Stage, $"Oversampling {oversampleRate}x ({synthesisFs}Hz)");
+                    using var sopt = LlsmBindings.Llsm.CreateSynthesisOptions(synthesisFs);
+                    SetUseL1(sopt, useLayer1Synthesis);
+                    using var output = LlsmBindings.Llsm.Synthesize(sopt, dstChunk);
+
+                    if (dump)
+                    {
+                        var (y, ySin, yNoise) = LlsmBindings.Llsm.ReadOutputDecomposed(output);
+                        return new SynthesisResult
+                        {
+                            Output = Resampling.Downsample(y, oversampleRate),
+                            Sinusoid = Resampling.Downsample(ySin, oversampleRate),
+                            Noise = Resampling.Downsample(yNoise, oversampleRate),
+                        };
+                    }
+                    return new SynthesisResult { Output = Resampling.Downsample(LlsmBindings.Llsm.ReadOutput(output), oversampleRate) };
+                }
+                else
+                {
+                    log.Info(Stage, $"Direct synthesis at {fs}Hz" + (excitation != null ? " (residual excitation)" : ""));
+                    using var sopt = LlsmBindings.Llsm.CreateSynthesisOptions(fs);
+                    SetUseL1(sopt, useLayer1Synthesis);
+                    using var output = excitation != null
+                        ? LlsmBindings.Llsm.SynthesizeEx(sopt, dstChunk, excitation, excitationMode)
+                        : LlsmBindings.Llsm.Synthesize(sopt, dstChunk);
+
+                    if (dump)
+                    {
+                        var (y, ySin, yNoise) = LlsmBindings.Llsm.ReadOutputDecomposed(output);
+                        return new SynthesisResult { Output = y, Sinusoid = ySin, Noise = yNoise };
+                    }
+                    return new SynthesisResult { Output = LlsmBindings.Llsm.ReadOutput(output) };
+                }
+            }
+        }
+
+        private static unsafe void SetUseL1(SOptionsHandle sopt, bool useLayer1Synthesis)
+        {
+            if (!useLayer1Synthesis) return;
+            var soptPtr = (NativeLLSM.llsm_soptions*)sopt.DangerousGetHandle().ToPointer();
+            soptPtr->use_l1 = 1;
+        }
+    }
+}

@@ -13,6 +13,7 @@ namespace LlsmBindings
         // cache native lib and function pointers for attach destructors
         private static readonly IntPtr _hLib;
         private static readonly IntPtr _pDeleteFp;
+        private static readonly IntPtr _pCopyFp;
         private static readonly IntPtr _pDeleteFpArray;
         private static readonly IntPtr _pCopyFpArray;
         private static readonly IntPtr _pDeleteInt;
@@ -27,6 +28,7 @@ namespace LlsmBindings
             // Ensure the native DLL is loadable via default search (same dir as exe)
             _hLib = NativeHelpers.LoadLibrary("libllsm2.dll");
             _pDeleteFp = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_fp));
+            _pCopyFp = NativeHelpers.GetExport(_hLib, "llsm_copy_fp");
             _pDeleteFpArray = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_fparray));
             _pCopyFpArray = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_copy_fparray));
             _pDeleteInt = NativeHelpers.GetExport(_hLib, nameof(NativeLLSM.llsm_delete_int));
@@ -134,6 +136,36 @@ namespace LlsmBindings
             var p = NativeLLSM.llsm_analyze(aopts.DangerousGetHandle(), x, x.Length, fs, f0, nfrm, IntPtr.Zero);
             if (p == IntPtr.Zero) throw new Exception("llsm_analyze failed");
             return ChunkHandle.FromExisting(p);
+        }
+
+        /// <summary>
+        /// 解析と同時に残差波形（x − 調波再合成、x と同じ長さ・同じ fs）を取得します。
+        /// 残差は雑音励振の実波形として再利用できます。
+        /// </summary>
+        public static ChunkHandle AnalyzeWithResidual(AOptionsHandle aopts, float[] x, float fs, float[] f0, int nfrm, out float[] residual)
+        {
+            var p = NativeLLSM.llsm_analyze_res(aopts.DangerousGetHandle(), x, x.Length, fs, f0, nfrm, out var resPtr);
+            if (p == IntPtr.Zero) throw new Exception("llsm_analyze failed");
+            residual = new float[x.Length];
+            if (resPtr != IntPtr.Zero)
+            {
+                Marshal.Copy(resPtr, residual, 0, x.Length);
+                NativeLLSM.llsm_free_buffer(resPtr); // libllsm2 は calloc で確保し所有権を渡す（同一 CRT で解放）
+            }
+            return ChunkHandle.FromExisting(p);
+        }
+
+        /// <summary>
+        /// 雑音励振を指定して合成します（<paramref name="excitation"/> は出力 fs、
+        /// 長さは (nfrm+1)·thop·fs 以上を推奨。null なら既定の乱数励振）。
+        /// </summary>
+        /// <param name="excitationMode">0: 励振をそのまま, 1: 帯域分割＋雑音包絡, 2: 1 に加え有声フレームは白色扱い（PSDRES 再付与）</param>
+        public static OutputHandle SynthesizeEx(SOptionsHandle sopts, ChunkHandle chunk, float[]? excitation, int excitationMode = 0)
+        {
+            var p = NativeLLSM.llsm_synthesize_ex(sopts.DangerousGetHandle(), chunk.DangerousGetHandle(),
+                excitation, excitation?.Length ?? 0, excitationMode);
+            if (p == IntPtr.Zero) throw new Exception("llsm_synthesize_ex failed");
+            return OutputHandle.FromExisting(p);
         }
 
         /// <summary>
@@ -246,7 +278,7 @@ namespace LlsmBindings
         public static void SetFrameF0(ContainerRef frame, float f0)
         {
             var p = NativeLLSM.llsm_create_fp(f0);
-            NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_F0, p, _pDeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_F0, p, _pDeleteFp, _pCopyFp); // copyctor必須: NULLだとコピーがポインタをエイリアスし解放順依存のUAFになる
         }
 
         /// <summary>
@@ -255,7 +287,7 @@ namespace LlsmBindings
         public static void SetFrameRd(ContainerRef frame, float rd)
         {
             var p = NativeLLSM.llsm_create_fp(rd);
-            NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_RD, p, _pDeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(frame.Ptr, NativeLLSM.LLSM_FRAME_RD, p, _pDeleteFp, _pCopyFp); // copyctor必須: NULLだとコピーがポインタをエイリアスし解放順依存のUAFになる
         }
 
         /// <summary>
@@ -287,7 +319,7 @@ namespace LlsmBindings
         {
             var p = NativeLLSM.llsm_create_fp(newThop);
             // ホップ長は LLSM_CONF_THOP (index=1)
-            NativeLLSM.llsm_container_attach_(conf.Ptr, NativeLLSM.LLSM_CONF_THOP, p, _pDeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(conf.Ptr, NativeLLSM.LLSM_CONF_THOP, p, _pDeleteFp, _pCopyFp); // copyctor必須: NULLだとコピーがポインタをエイリアスし解放順依存のUAFになる
         }
 
         /// <summary>
@@ -305,7 +337,7 @@ namespace LlsmBindings
         public static void SetConfFloat(ContainerRef conf, int index, float value)
         {
             var p = NativeLLSM.llsm_create_fp(value);
-            NativeLLSM.llsm_container_attach_(conf.Ptr, index, p, _pDeleteFp, IntPtr.Zero);
+            NativeLLSM.llsm_container_attach_(conf.Ptr, index, p, _pDeleteFp, _pCopyFp); // copyctor必須: NULLだとコピーがポインタをエイリアスし解放順依存のUAFになる
         }
 
         /// <summary>

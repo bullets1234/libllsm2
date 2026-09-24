@@ -50,6 +50,18 @@ namespace LlsmBindings
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_analyze(IntPtr aoptions, float[] x, int nx, float fs, float[] f0, int nfrm, IntPtr x_ap);
 
+        /// <summary>llsm_analyze の残差出力版: x_ap に残差波形（nx 要素、free() 必要）のポインタを受け取る。</summary>
+        [DllImport(Dll, EntryPoint = "llsm_analyze", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_analyze_res(IntPtr aoptions, float[] x, int nx, float fs, float[] f0, int nfrm, out IntPtr x_ap);
+
+        /// <summary>llsm_synthesize の励振指定版（excitation が null なら既定の乱数励振）。</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr llsm_synthesize_ex(IntPtr soptions, IntPtr chunk, float[]? excitation, int nexc, int applyEnvelope);
+
+        /// <summary>libllsm2 が malloc/calloc したバッファを、同じ CRT ヒープで解放する。</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_free_buffer(IntPtr p);
+
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_synthesize(IntPtr soptions, IntPtr chunk);
 
@@ -99,8 +111,15 @@ namespace LlsmBindings
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_chunk_phasesync_rps(IntPtr chunk, int layer1_based);
 
+        /// <summary>フレーム内の全調波位相を theta·(k+1) だけ回す（llsm_chunk_phasepropagate の 1 フレーム版）。</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_frame_phaseshift(IntPtr frame, float theta);
+
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void llsm_frame_phasesync_rps(IntPtr frame, int layer1_based);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_compute_vsphse_from_rd(float rd, float f0, int nhar, IntPtr dst_vsphse);
 
         // コンテナ操作（get/attach/new/delete）
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -230,6 +249,10 @@ namespace LlsmBindings
         // Frame/Model creation
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_create_frame(int nhar, int nchannel, int nhar_e, int npsd);
+
+        // ノイズ帯域チャンネル構成の差し替え（chanfreq: nchannel-1個の境界周波数Hz、内容はコピーされる）
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void llsm_aoptions_set_chanfreq(IntPtr dst, float[] chanfreq, int nchannel);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr llsm_create_hmframe(int nhar);

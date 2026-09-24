@@ -352,11 +352,10 @@ FP_TYPE* llsm_synthesize_harmonic_frame_iczt(FP_TYPE* ampl, FP_TYPE* phse,
 
 FP_TYPE* llsm_generate_white_noise(int nx) {
   FP_TYPE* ret = calloc(nx, sizeof(FP_TYPE));
-  int ntemplate = min(20000, nx);
-  for(int i = 0; i < ntemplate; i ++)
+  // Generate the full length instead of looping a 20000-sample template;
+  // template repetition caused audible ~450ms-periodic noise texture.
+  for(int i = 0; i < nx; i ++)
     ret[i] = randn(0, 1);
-  for(int i = ntemplate; i < nx; i ++)
-    ret[i] = ret[(i - ntemplate) % ntemplate];
   return ret;
 }
 
@@ -382,13 +381,18 @@ static FP_TYPE* stretch_stationary_noise(FP_TYPE* x, int nx, int ny,
   return y;
 }
 
+FP_TYPE* llsm_bandpass_chebyshev(FP_TYPE* x, int nx, FP_TYPE fmin, FP_TYPE fmax) {
+  return chebyfilt(x, nx, fmin, fmax);
+}
+
 FP_TYPE* llsm_generate_bandlimited_noise(int nx, FP_TYPE fmin, FP_TYPE fmax) {
-  int ntemplate = min(20000, nx);
+  // Filter the full length instead of loop-extending a 20000-sample template;
+  // the loop period (~450ms at 44.1kHz) was audible as periodic noise.
   int extension = 128;
-  FP_TYPE* template_white = llsm_generate_white_noise(ntemplate + extension);
-  FP_TYPE* template_colored = chebyfilt(template_white, ntemplate + extension,
+  FP_TYPE* template_white = llsm_generate_white_noise(nx + extension);
+  FP_TYPE* template_colored = chebyfilt(template_white, nx + extension,
     fmin, fmax);
-  FP_TYPE* y = stretch_stationary_noise(template_colored, ntemplate, nx, 128);
+  FP_TYPE* y = stretch_stationary_noise(template_colored, nx, nx, 128);
   free(template_white); free(template_colored);
   return y;
 }

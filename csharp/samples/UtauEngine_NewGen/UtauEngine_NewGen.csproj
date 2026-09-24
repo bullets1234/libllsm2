@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>L2R</AssemblyName>
+    <!-- リポジトリのリリース番号（git タグ vX.Y.Z と揃える） -->
+    <Version>0.3.0</Version>
+    <InformationalVersion>0.3.0</InformationalVersion>
+    <RootNamespace>UtauEngineNg</RootNamespace>
+    <PublishDir>publish\</PublishDir>
+    <Optimize>true</Optimize>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- 単一ファイル発行（軽量・自己完結） -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfContained>true</IncludeNativeLibrariesForSelfContained>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <!-- 軽量化: 不要なメタデータ削減 -->
+    <DebugType>embedded</DebugType>
+    <TieredCompilation>true</TieredCompilation>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\LlsmBindings.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- libllsm2.dll / libpyin.dll をビルド出力と publish にコピー -->
+    <None Include="..\..\..\x64\Release\libllsm2.dll" Condition="Exists('..\..\..\x64\Release\libllsm2.dll')">
+      <Link>libllsm2.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+    <None Include="..\..\..\x64\Release\libpyin.dll" Condition="Exists('..\..\..\x64\Release\libpyin.dll')">
+      <Link>libpyin.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,170 @@
+expressions:
+  lB:
+    name: B - breathiness
+    abbr: lB
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 50
+    is_flag: true
+    flag: B
+  lg:
+    name: g - gender
+    abbr: lg
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: g
+  lF:
+    name: F - formant follow
+    abbr: lF
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 100
+    is_flag: true
+    flag: F
+  lT:
+    name: T - tension
+    abbr: lT
+    type: Numerical
+    min: -12
+    max: 12
+    default_value: 0
+    is_flag: true
+    flag: T
+  lK:
+    name: K - glottal closure
+    abbr: lK
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 50
+    is_flag: true
+    flag: K
+  lG:
+    name: G - growl
+    abbr: lG
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: G
+  lU:
+    name: U - unvoiced attenuation (dB)
+    abbr: lU
+    type: Numerical
+    min: 0
+    max: 20
+    default_value: 0
+    is_flag: true
+    flag: U
+  lD:
+    name: D - denoise (HNR)
+    abbr: lD
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: D
+  lC:
+    name: C - consonant PCM blend
+    abbr: lC
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: C
+  lP:
+    name: P - force PYIN
+    abbr: lP
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    options:
+    - ""
+    - P
+  lH:
+    name: H - dynamic harmonics
+    abbr: lH
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    options:
+    - ""
+    - H
+  lQ:
+    name: Q - F0 refinement
+    abbr: lQ
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    options:
+    - ""
+    - Q
+  lW:
+    name: W - adaptive window
+    abbr: lW
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    options:
+    - ""
+    - W
+  lE:
+    name: E - use FRQ F0
+    abbr: lE
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    options:
+    - ""
+    - E
+  lL:
+    name: L - auto glottal estimation
+    abbr: lL
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    options:
+    - ""
+    - L
+  lX:
+    name: X - fixed amplitude ratio
+    abbr: lX
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    options:
+    - ""
+    - X
+  lM1:
+    name: M+ - boundary modulation fade
+    abbr: lM1
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    options:
+    - ""
+    - M1

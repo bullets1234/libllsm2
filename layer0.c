@@ -48,6 +48,15 @@ void llsm_delete_aoptions(llsm_aoptions* dst) {
   free(dst);
 }
 
+void llsm_aoptions_set_chanfreq(llsm_aoptions* dst, FP_TYPE* chanfreq,
+  int nchannel) {
+  if(dst == NULL || nchannel < 2) return;
+  free(dst -> chanfreq);
+  dst -> nchannel = nchannel;
+  dst -> chanfreq = calloc(nchannel - 1, sizeof(FP_TYPE));
+  memcpy(dst -> chanfreq, chanfreq, sizeof(FP_TYPE) * (nchannel - 1));
+}
+
 llsm_container* llsm_aoptions_toconf(llsm_aoptions* src, FP_TYPE fnyq) {
   llsm_container* ret = llsm_create_container(10);
   llsm_container_attach(ret, LLSM_CONF_NFRM,
@@ -532,8 +541,11 @@ static int llsm_synthesis_check_integrity(llsm_chunk* src) {
   return 1;
 }
 
-static FP_TYPE* llsm_synthesize_noise_excitation(llsm_soptions* options,
-  llsm_chunk* src, FP_TYPE* f0, int nfrm, FP_TYPE thop, FP_TYPE fs, int ny) {
+// Band-split `excitation` (or generate band-limited white noise when NULL)
+// and multiply each channel by the pulse-synchronous noise envelope.
+static FP_TYPE* llsm_synthesize_noise_excitation_ex(llsm_soptions* options,
+  llsm_chunk* src, FP_TYPE* f0, int nfrm, FP_TYPE thop, FP_TYPE fs, int ny,
+  FP_TYPE* excitation) {
   FP_TYPE* y = calloc(ny, sizeof(FP_TYPE));
   FP_TYPE* chanfreq = llsm_container_get(src -> conf, LLSM_CONF_CHANFREQ);
   int nchannel = *((int*)llsm_container_get(src -> conf, LLSM_CONF_NCHANNEL));
@@ -541,7 +553,9 @@ static FP_TYPE* llsm_synthesize_noise_excitation(llsm_soptions* options,
     FP_TYPE fmin = c == 0 ? 0 : chanfreq[c - 1];
     FP_TYPE fmax = c == nchannel - 1 ? fs / 2.0 : chanfreq[c];
     if(fmin >= fs / 2.0) break;
-    FP_TYPE* x = llsm_generate_bandlimited_noise(ny, fmin / fs, fmax / fs);
+    FP_TYPE* x = excitation == NULL
+      ? llsm_generate_bandlimited_noise(ny, fmin / fs, fmax / fs)
+      : llsm_bandpass_chebyshev(excitation, ny, fmin / fs, fmax / fs);
     FP_TYPE* env = llsm_synthesize_noise_envelope(options, src, c, f0, nfrm,
       thop, fs, ny);
     for(int i = 0; i < ny; i ++) {
@@ -554,8 +568,27 @@ static FP_TYPE* llsm_synthesize_noise_excitation(llsm_soptions* options,
   return y;
 }
 
+static FP_TYPE* llsm_synthesize_noise_excitation(llsm_soptions* options,
+  llsm_chunk* src, FP_TYPE* f0, int nfrm, FP_TYPE thop, FP_TYPE fs, int ny) {
+  return llsm_synthesize_noise_excitation_ex(options, src, f0, nfrm, thop, fs,
+    ny, NULL);
+}
+
+// preserve_fine: the excitation is a real waveform (e.g. the analysis residual)
+// whose within-frame fine structure (pulse-synchronous bursts, transients)
+// should survive. The usual +/-3-bin whitening already keeps it (measured:
+// waveform correlation with the residual ~0.49 vs ~0.01 for white noise, and
+// widening the envelope did not help), so the only difference is that PSDRES
+// is not re-imposed - the excitation carries its own fine spectral texture -
+// while the LOGRESBIAS level offset is still applied so the output level
+// matches the default path.
+// exc_mode: 0 = internal white noise (PSDRES re-imposed on every frame),
+//           1 = provided excitation, raw (PSDRES never re-imposed),
+//           2 = provided excitation, AM-flattened + envelope (PSDRES never),
+//           3 = provided excitation only meaningful on unvoiced frames; voiced
+//               frames carry white noise, so PSDRES is re-imposed there only.
 static FP_TYPE* llsm_filter_noise(llsm_chunk* src, int nfrm, FP_TYPE thop,
-  FP_TYPE fs, FP_TYPE* x, int nx) {
+  FP_TYPE fs, FP_TYPE* x, int nx, int exc_mode) {
   const int nfade = 16;
   int nwin = round(thop * fs * 2);
   FP_TYPE* w = hanning(nwin);
@@ -583,6 +616,10 @@ static FP_TYPE* llsm_filter_noise(llsm_chunk* src, int nfrm, FP_TYPE thop,
     FP_TYPE* resvec = llsm_container_get(src -> frames[i], LLSM_FRAME_PSDRES);
     FP_TYPE peak = maxfp(nm -> psd, npsd);
     if(peak < -100) continue; // -100 dB noise floor
+    FP_TYPE* if0 = llsm_container_get(src -> frames[i], LLSM_FRAME_F0);
+    int frame_voiced = if0 != NULL && if0[0] > 0;
+    int preserve_fine = exc_mode == 1 || exc_mode == 2 ||
+      (exc_mode == 3 && ! frame_voiced);
 
     // STFT
     int center = round(i * thop * fs);
@@ -596,9 +633,11 @@ static FP_TYPE* llsm_filter_noise(llsm_chunk* src, int nfrm, FP_TYPE thop,
     llsm_fft_to_psd(x_re, x_im, nfft, wsqr, psd);
     FP_TYPE* env = moving_avg(psd, nspec, 3);
     for(int j = 0; j < npsd; j ++) src_psd[j] = nm -> psd[j];
-    if(resvec != NULL)
+    if(resvec != NULL && ! preserve_fine)
     for(int j = 0; j < npsd; j ++)
-      src_psd[j] += resvec[j] - LOG2IN(LOGRESBIAS);
+      src_psd[j] += resvec[j];
+    for(int j = 0; j < npsd; j ++)
+      src_psd[j] -= LOG2IN(LOGRESBIAS);
     FP_TYPE* H = llsm_spectrum_from_envelope(
       src_axis, src_psd, npsd, nspec - 1, fs / 2.0);
     for(int j = 0; j < nspec - 1; j ++)
@@ -633,7 +672,8 @@ static FP_TYPE* llsm_filter_noise(llsm_chunk* src, int nfrm, FP_TYPE thop,
   return y;
 }
 
-llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src) {
+llsm_output* llsm_synthesize_ex(llsm_soptions* options, llsm_chunk* src,
+  FP_TYPE* excitation, int nexc, int apply_envelope) {
   if(! llsm_synthesis_check_integrity(src)) return NULL;
   int nfrm;
   FP_TYPE thop = *((FP_TYPE*)llsm_container_get(src -> conf, LLSM_CONF_THOP));
@@ -649,9 +689,39 @@ llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src) {
     thop, fs, ny);
   ret -> y_sin = y_sin;
 
-  FP_TYPE* y_exc = llsm_synthesize_noise_excitation(options, src, f0, nfrm,
-    thop, fs, ny);
-  FP_TYPE* y_nos = llsm_filter_noise(src, nfrm, thop, fs, y_exc, ny);
+  // Noise excitation: either the model's own (band-limited white noise shaped
+  // by the pulse-synchronous envelopes), or a caller-provided waveform (e.g.
+  // the analysis residual re-timed to the output). llsm_filter_noise whitens
+  // the excitation per frame before imposing PSD + PSDRES, so only the
+  // within-frame time structure of a provided excitation is retained.
+  FP_TYPE* y_exc;
+  if(excitation != NULL && nexc > 0) {
+    FP_TYPE* padded = calloc(ny, sizeof(FP_TYPE));
+    int ncopy = nexc < ny ? nexc : ny;
+    for(int i = 0; i < ncopy; i ++) padded[i] = excitation[i];
+    if(apply_envelope) {
+      // AM-flattened excitation: re-impose the model's pulse-synchronous
+      // envelope (at the output f0) per noise channel. Normalise the
+      // excitation to unit RMS first, like the internal white noise, so the
+      // envelope-scaled result stays above llsm_filter_noise's floor.
+      double sumsq = 0;
+      for(int i = 0; i < ny; i ++) sumsq += (double)padded[i] * padded[i];
+      FP_TYPE rms = sqrt(sumsq / ny);
+      if(rms > 1e-12) for(int i = 0; i < ny; i ++) padded[i] /= rms;
+      y_exc = llsm_synthesize_noise_excitation_ex(options, src, f0, nfrm,
+        thop, fs, ny, padded);
+      free(padded);
+    } else {
+      y_exc = padded;
+    }
+  } else {
+    y_exc = llsm_synthesize_noise_excitation(options, src, f0, nfrm,
+      thop, fs, ny);
+  }
+  int exc_mode = 0;
+  if(excitation != NULL && nexc > 0)
+    exc_mode = apply_envelope == 2 ? 3 : apply_envelope == 1 ? 2 : 1;
+  FP_TYPE* y_nos = llsm_filter_noise(src, nfrm, thop, fs, y_exc, ny, exc_mode);
   ret -> y_noise = y_nos;
 
   ret -> y = calloc(ny, sizeof(FP_TYPE));
@@ -661,6 +731,14 @@ llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src) {
   free(y_exc);
   free(f0);
   return ret;
+}
+
+llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src) {
+  return llsm_synthesize_ex(options, src, NULL, 0, 0);
+}
+
+void llsm_free_buffer(void* p) {
+  free(p);
 }
 
 void llsm_delete_output(llsm_output* dst) {
@@ -696,11 +774,22 @@ void llsm_chunk_phasepropagate(llsm_chunk* dst, int sign) {
   FP_TYPE* f0 = llsm_chunk_getf0(dst, & nfrm);
   FP_TYPE* thop = llsm_container_get(dst -> conf, LLSM_CONF_THOP);
   if(thop == NULL || f0 == NULL) return;
-  FP_TYPE* delta_phase = cumsum(f0, nfrm);
+  // NOTE: accumulate the running phase in double precision and wrap it to
+  // [-pi, pi] before downcasting to FP_TYPE (float). For long recordings
+  // (many thousands of frames) a plain float32 cumulative sum of f0 loses
+  // enough precision that the resulting per-frame phase becomes noisy;
+  // since llsm_frame_phaseshift() multiplies this value by the harmonic
+  // index (up to maxnhar), even a sub-radian error gets amplified into an
+  // audible high-harmonic buzzing/"fan"-like artifact that grows over the
+  // course of the recording. Wrapping in double keeps the value small so
+  // the final float32 cast retains full precision regardless of duration.
+  double factor = (double)(*thop) * sign * 2.0 * M_PI;
+  double accum = 0.0;
   for(int i = 0; i < nfrm; i ++) {
-    delta_phase[i] *= *thop * sign * 2.0 * M_PI;
-    llsm_frame_phaseshift(dst -> frames[i], delta_phase[i]);
+    accum += (double)f0[i];
+    double theta = accum * factor;
+    theta -= round(theta / (2.0 * M_PI)) * 2.0 * M_PI;
+    llsm_frame_phaseshift(dst -> frames[i], (FP_TYPE)theta);
   }
-  free(delta_phase);
   free(f0);
 }

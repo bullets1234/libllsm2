@@ -40,6 +40,7 @@ EXPORTS
 	llsm_delete_output
 	llsm_create_aoptions
 	llsm_delete_aoptions
+	llsm_aoptions_set_chanfreq
 	llsm_aoptions_toconf
 	llsm_create_soptions
 	llsm_delete_soptions
@@ -51,8 +52,11 @@ EXPORTS
 	llsm_chunk_phasesync_rps
 	llsm_chunk_phasepropagate
 	llsm_chunk_getf0
+	llsm_compute_vsphse_from_rd
 	llsm_analyze
 	llsm_synthesize
+	llsm_synthesize_ex
+	llsm_free_buffer
 	llsm_create_coder
 	llsm_delete_coder
 	llsm_coder_encode

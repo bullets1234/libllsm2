@@ -279,6 +279,10 @@ typedef struct {
 llsm_aoptions* llsm_create_aoptions();
 /** @brief Delete and free analysis options. */
 void llsm_delete_aoptions(llsm_aoptions* dst);
+/** @brief Replace the noise channel layout. chanfreq holds the nchannel - 1
+ *    boundary frequencies (Hz) in ascending order; the contents are copied. */
+void llsm_aoptions_set_chanfreq(llsm_aoptions* dst, FP_TYPE* chanfreq,
+  int nchannel);
 /** @brief Create a model configuration from analysis options. */
 llsm_container* llsm_aoptions_toconf(llsm_aoptions* src, FP_TYPE fnyq);
 
@@ -336,11 +340,29 @@ void llsm_chunk_phasepropagate(llsm_chunk* dst, int sign);
 /** @brief Get F0 and number of frames from a parameter chunk. */
 FP_TYPE* llsm_chunk_getf0(llsm_chunk* src, int* dst_nfrm);
 
+/** @brief Compute the LF-model phase response at harmonic frequencies
+ *    f0*(1..nhar) for a given Rd and F0, writing nhar floats into
+ *    dst_vsphse. Useful for recomputing VSPHSE after changing F0. */
+void llsm_compute_vsphse_from_rd(FP_TYPE rd, FP_TYPE f0, int nhar,
+  FP_TYPE* dst_vsphse);
+
 /** @brief Perform layer 0 analysis on a speech signal. */
 llsm_chunk* llsm_analyze(llsm_aoptions* options, FP_TYPE* x, int nx,
   FP_TYPE fs, FP_TYPE* f0, int nfrm, FP_TYPE** x_ap);
 /** @brief Generate speech from a LLSM parameter chunk. */
 llsm_output* llsm_synthesize(llsm_soptions* options, llsm_chunk* src);
+/** @brief Same as llsm_synthesize, but uses the caller-provided waveform
+ *    (length nexc, at options->fs) as the noise excitation instead of the
+ *    internally generated band-limited white noise. NULL falls back to the
+ *    default behaviour. apply_envelope 1 band-splits the excitation and
+ *    multiplies each channel by the pulse-synchronous noise envelope (use
+ *    with an AM-flattened excitation); 2 does the same but treats voiced
+ *    frames as carrying white noise (PSDRES is re-imposed there). */
+llsm_output* llsm_synthesize_ex(llsm_soptions* options, llsm_chunk* src,
+  FP_TYPE* excitation, int nexc, int apply_envelope);
+/** @brief Free a buffer allocated by libllsm2 (e.g. the residual from
+ *    llsm_analyze's x_ap) with the library's own CRT. */
+void llsm_free_buffer(void* p);
 /** @} */
 
 /** @defgroup group_coder LLSM Coder
