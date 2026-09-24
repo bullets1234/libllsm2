@@ -12,6 +12,13 @@ namespace UtauEngineNg
     /// </summary>
     public static class Program
     {
+        /// <summary>エンジンのリリース番号（csproj の Version / git タグ vX.Y.Z と揃える）。</summary>
+        public static readonly string Version =
+            typeof(Program).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                is System.Reflection.AssemblyInformationalVersionAttribute[] { Length: > 0 } a
+                ? a[0].InformationalVersion.Split('+')[0]
+                : "0.0.0";
+
         public static int Main(string[] rawArgs)
         {
             // UTAU は Shift-JIS でパスを渡すため、コンソール/引数エンコーディングを合わせる
@@ -91,7 +98,7 @@ namespace UtauEngineNg
                 if (string.IsNullOrEmpty(logPath)) return;
 
                 var sb = new StringBuilder();
-                sb.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append('	');
+                sb.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append('	').Append('v').Append(Version).Append('	');
                 foreach (var a in rawArgs)
                 {
                     bool quote = a.Length == 0 || a.IndexOf(' ') >= 0;
@@ -112,7 +119,7 @@ namespace UtauEngineNg
 
         private static void PrintUsage()
         {
-            Console.WriteLine("L2R — libllsm UTAU resampler");
+            Console.WriteLine($"L2R v{Version} — libllsm UTAU resampler");
             Console.WriteLine("Usage: L2R <input.wav> <output.wav> <pitch> <velocity> <flags> <offset> <length> <consonant> <cutoff> <volume> <modulation> [tempo!pitchbend]");
             Console.WriteLine();
             Console.WriteLine("Environment: L2R_LOG=Trace|Debug|Info|Warn|Error|Silent  L2R_TRACE=<path>  L2R_DUMP=<dir>");

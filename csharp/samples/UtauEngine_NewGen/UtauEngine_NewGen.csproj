@@ -6,6 +6,9 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>L2R</AssemblyName>
+    <!-- リポジトリのリリース番号（git タグ vX.Y.Z と揃える） -->
+    <Version>0.3.0</Version>
+    <InformationalVersion>0.3.0</InformationalVersion>
     <RootNamespace>UtauEngineNg</RootNamespace>
     <PublishDir>publish\</PublishDir>
     <Optimize>true</Optimize>
