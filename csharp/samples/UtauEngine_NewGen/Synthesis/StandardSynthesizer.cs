@@ -456,7 +456,22 @@ namespace UtauEngineNg.Synthesis
             if (isTransientRegion)
             {
                 int nearestIdx = ratio < 0.5f ? srcIdx1 : srcIdx2;
-                return LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(srcChunk, nearestIdx));
+                // 旧: 最近傍フレームを丸ごと複製。子音部が小数比で写像される（velocity≠100）と、複製された
+                // フレームと補間されたフレームの間で F0・VSPHSE（位相）が段差になり、声門アタック等の
+                // トランジェント判定フレームの境目で「ブツ」が出た（戯白メリー e+あ, 2026-09-24）。
+                // 既定は「振幅（VTMAGN）だけ最近傍から複製し、F0・位相・雑音は補間」にする。
+                // L2R_TRANSIENT=copy で旧挙動、=0 で保護なし（全補間）。
+                string? mode = Environment.GetEnvironmentVariable("L2R_TRANSIENT");
+                if (mode == "copy")
+                    return LlsmBindings.Llsm.CopyFrame(LlsmBindings.Llsm.GetFrame(srcChunk, nearestIdx));
+                if (mode != "0")
+                {
+                    IntPtr interp = InterpolateFrameAt(srcChunk, srcIdx1, srcIdx2, ratio, srcNfrm, outIdx, false);
+                    var nearPtr = NativeLLSM.llsm_container_get(LlsmBindings.Llsm.GetFrame(srcChunk, nearestIdx).Ptr, NativeLLSM.LLSM_FRAME_VTMAGN);
+                    if (nearPtr != IntPtr.Zero)
+                        NativeCallbacks.AttachFpArrayCopy(interp, NativeLLSM.LLSM_FRAME_VTMAGN, nearPtr);
+                    return interp;
+                }
             }
 
             bool canUseCubic = srcIdx1 > 0 && srcIdx2 < srcNfrm - 1;

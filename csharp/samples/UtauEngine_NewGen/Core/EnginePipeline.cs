@@ -267,7 +267,11 @@ namespace UtauEngineNg.Core
             float consonantMs = consonantFrames * actualThop * 1000f * consonantStretch;
             float stretchableMs = stretchableFrames * actualThop * 1000f;
             float targetStretchableMs = lengthReq - consonantMs;
-            return targetStretchableMs > 0 ? targetStretchableMs / stretchableMs : 1.0f;
+            // 母音部は伸長のみで、圧縮はしない。要求長に収まらない分は要求長の位置で切り捨てられる
+            // （wavtool が要求長で切る。一般的なリサンプラーと同じ挙動）。従来は残りの母音部を
+            // 全部詰め込む（例: 355ms → 24ms、14 倍圧縮）ため、フォルマント遷移が駆け抜けて
+            // ノート末尾で「ブツ」と鳴った（戯白メリー e+あ, 2026-09-24）。
+            return targetStretchableMs > stretchableMs ? targetStretchableMs / stretchableMs : 1.0f;
         }
 
         private static float MedianVoicedF0(ChunkHandle chunk, int nfrm, float fallback)
