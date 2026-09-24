@@ -171,12 +171,29 @@ namespace UtauEngineNg.Core
             // 基準は原音・出力とも有声フレームのみの実効レベル（無音/子音/ノイズ床の割合に非依存）
             PostProcessor.Apply(output, args.Volume, log, PostProcessor.VoicedLevelDb(segment, f0, nhop), synth.FrameF0, nhop);
 
+            // 末尾フェード: 出力バッファは (nfrm+1)·nhop で要求長より約 1 フレーム長く、wavtool は要求長で
+            // 切る。端パディング前は OLA の半窓で末尾約 8ms が自然に減衰していたが、パディング後は
+            // 要求長の位置まで全レベルが続き、UTAU 既定エンベロープ（末尾 p4=0）でハードカットになって
+            // 母音同士の連結で「ブツ」が出た。要求長の位置で 0 になる 8ms の余弦フェードを掛け、以降は無音。
+            TailFadeAtRequestedLength(output, args.LengthMs, fs, 0.008f);
+
             // 12. 書き出し
             _diag.Dump.DumpWav("output", output, fs);
             if (synth.Sinusoid != null) _diag.Dump.DumpWav("sinusoid", synth.Sinusoid, fs);
             if (synth.Noise != null) _diag.Dump.DumpWav("noise", synth.Noise, fs);
             WavIo.WriteMono16(args.OutputWav, output, fs);
             log.Info(Stage, $"Wrote {Path.GetFileName(args.OutputWav)} ({output.Length} samples, {output.Length / (float)fs * 1000:F1}ms)");
+        }
+
+        /// <summary>要求長 lengthMs の位置で 0 になる fadeSec の余弦フェードアウトを掛け、以降を無音にする（lengthMs≤0 なら末尾）。</summary>
+        private static void TailFadeAtRequestedLength(float[] x, float lengthMs, int fs, float fadeSec)
+        {
+            int end = lengthMs > 0 ? (int)Math.Round(lengthMs / 1000.0 * fs) : x.Length;
+            end = Math.Clamp(end, 1, x.Length);
+            int n = Math.Min(end, (int)(fadeSec * fs));
+            for (int i = 0; i < n; i++)
+                x[end - 1 - i] *= 0.5f - 0.5f * MathF.Cos(MathF.PI * i / n);
+            for (int i = end; i < x.Length; i++) x[i] = 0f;
         }
 
         /// <summary>
@@ -186,6 +203,7 @@ namespace UtauEngineNg.Core
         private static float LimitPadLevel(float[] x, int padStart, int padLen, int refStart, int refLen)
         {
             if (padLen <= 0 || refLen <= 0) return 1f;
+            if (Environment.GetEnvironmentVariable("L2R_PADLIMIT") == "0") return 1f; // 診断用
             double Rms(int a, int n) { double e = 0; for (int i = a; i < a + n; i++) e += (double)x[i] * x[i]; return Math.Sqrt(e / n); }
             double padRms = Rms(padStart, padLen), refRms = Rms(refStart, refLen);
             if (padRms <= refRms || padRms <= 1e-9) return 1f;

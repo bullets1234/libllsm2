@@ -398,10 +398,11 @@ namespace UtauEngineNg.Synthesis
                 // 端パディングで先頭が完全な定常状態から始まるため、旧経路（フレーム 0 の OLA 窓が
                 // 半分欠ける）が暗黙に持っていた約 5ms のフェードインが無くなり、破裂音の閉鎖区間に
                 // オフセットを置いたノートで先頭が「ブツ」と立ち上がる（実測で先頭 5ms が最大 +11dB）。
-                // 旧相当の 5ms フェードインと、末尾に短い 3ms フェードアウトを掛ける。
-                EdgeFade(result.Output, fs, 0.005f, 0.003f);
-                if (result.Sinusoid != null) EdgeFade(result.Sinusoid, fs, 0.005f, 0.003f);
-                if (result.Noise != null) EdgeFade(result.Noise, fs, 0.005f, 0.003f);
+                // 旧相当の 5ms フェードインを掛ける。末尾は要求長の位置で切られるため、
+                // フェードアウトは EnginePipeline 側で「要求長で終わる 8ms」として掛ける。
+                EdgeFade(result.Output, fs, 0.005f, 0f);
+                if (result.Sinusoid != null) EdgeFade(result.Sinusoid, fs, 0.005f, 0f);
+                if (result.Noise != null) EdgeFade(result.Noise, fs, 0.005f, 0f);
             }
             var frameF0 = new float[dstNfrm];
             Array.Copy(dstF0, pad, frameF0, 0, dstNfrm);
