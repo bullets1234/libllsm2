@@ -86,7 +86,13 @@ namespace UtauEngineNg.Core
             {
                 analysisSegment = new float[seg.TotalLength + padStart + padEnd];
                 Array.Copy(samples, seg.StartSample - padStart, analysisSegment, 0, analysisSegment.Length);
-                log.Debug(Stage, $"Analysis edge padding: +{padStartFrames}f head, +{padEndFrames}f tail");
+                // パディング区間のレベルを区間端のレベル以下に制限する。オフセットが破裂音の閉鎖（無音）に
+                // あるとき、直前の母音の尾が解析窓へ漏れ込んでノート先頭に「ブツ」が出た（実測で先頭 5ms
+                // が最大 +11.6dB）。母音の途中から切る場合は両者同レベルなので従来通りの効果を保つ。
+                float headScale = LimitPadLevel(analysisSegment, 0, padStart, padStart, Math.Min(padStart, seg.TotalLength));
+                float tailScale = LimitPadLevel(analysisSegment, padStart + seg.TotalLength, padEnd,
+                    padStart + Math.Max(0, seg.TotalLength - padEnd), Math.Min(padEnd, seg.TotalLength));
+                log.Debug(Stage, $"Analysis edge padding: +{padStartFrames}f head (x{headScale:F2}), +{padEndFrames}f tail (x{tailScale:F2})");
             }
             int expectedFrames = seg.TotalLength / nhop + 1; // パディングなしの場合のフレーム数
 
@@ -171,6 +177,21 @@ namespace UtauEngineNg.Core
             if (synth.Noise != null) _diag.Dump.DumpWav("noise", synth.Noise, fs);
             WavIo.WriteMono16(args.OutputWav, output, fs);
             log.Info(Stage, $"Wrote {Path.GetFileName(args.OutputWav)} ({output.Length} samples, {output.Length / (float)fs * 1000:F1}ms)");
+        }
+
+        /// <summary>
+        /// パディング区間 [padStart, padStart+padLen) の RMS が参照区間 [refStart, refStart+refLen) の RMS を
+        /// 超える場合、パディング区間を参照レベルまで減衰する。適用した倍率を返す（1 なら無変更）。
+        /// </summary>
+        private static float LimitPadLevel(float[] x, int padStart, int padLen, int refStart, int refLen)
+        {
+            if (padLen <= 0 || refLen <= 0) return 1f;
+            double Rms(int a, int n) { double e = 0; for (int i = a; i < a + n; i++) e += (double)x[i] * x[i]; return Math.Sqrt(e / n); }
+            double padRms = Rms(padStart, padLen), refRms = Rms(refStart, refLen);
+            if (padRms <= refRms || padRms <= 1e-9) return 1f;
+            float scale = (float)(refRms / padRms);
+            for (int i = padStart; i < padStart + padLen; i++) x[i] *= scale;
+            return scale;
         }
 
         private static FrqData? TryLoadFrq(string inputWav, ILogger log)

@@ -393,6 +393,16 @@ namespace UtauEngineNg.Synthesis
                     Noise = result.Noise != null ? Cut(result.Noise, trimStart, keepLen) : null,
                 };
             }
+            if (pad > 0)
+            {
+                // 端パディングで先頭が完全な定常状態から始まるため、旧経路（フレーム 0 の OLA 窓が
+                // 半分欠ける）が暗黙に持っていた約 5ms のフェードインが無くなり、破裂音の閉鎖区間に
+                // オフセットを置いたノートで先頭が「ブツ」と立ち上がる（実測で先頭 5ms が最大 +11dB）。
+                // 旧相当の 5ms フェードインと、末尾に短い 3ms フェードアウトを掛ける。
+                EdgeFade(result.Output, fs, 0.005f, 0.003f);
+                if (result.Sinusoid != null) EdgeFade(result.Sinusoid, fs, 0.005f, 0.003f);
+                if (result.Noise != null) EdgeFade(result.Noise, fs, 0.005f, 0.003f);
+            }
             var frameF0 = new float[dstNfrm];
             Array.Copy(dstF0, pad, frameF0, 0, dstNfrm);
             result = new SynthesisResult { Output = result.Output, Sinusoid = result.Sinusoid, Noise = result.Noise, FrameF0 = frameF0 };
@@ -415,6 +425,14 @@ namespace UtauEngineNg.Synthesis
             if (Math.Abs(theta) < 1e-12) return;
             for (int i = 0; i < total; i++)
                 NativeLLSM.llsm_frame_phaseshift(LlsmBindings.Llsm.GetFrame(chunk, i).Ptr, (float)theta);
+        }
+
+        /// <summary>先頭 headSec の余弦フェードイン、末尾 tailSec の余弦フェードアウト（in-place）。</summary>
+        private static void EdgeFade(float[] x, int fs, float headSec, float tailSec)
+        {
+            int nh = Math.Min(x.Length / 2, (int)(headSec * fs)), nt = Math.Min(x.Length / 2, (int)(tailSec * fs));
+            for (int i = 0; i < nh; i++) x[i] *= 0.5f - 0.5f * MathF.Cos(MathF.PI * i / nh);
+            for (int i = 0; i < nt; i++) x[x.Length - 1 - i] *= 0.5f - 0.5f * MathF.Cos(MathF.PI * i / nt);
         }
 
         private static float[] Cut(float[] x, int start, int len)
