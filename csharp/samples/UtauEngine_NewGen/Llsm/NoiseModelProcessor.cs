@@ -300,6 +300,69 @@ namespace UtauEngineNg.Llsm
         }
 
         /// <summary>
+        /// 調波フィット誤差による雑音バーストの抑制。
+        /// フォルマントが速く動く区間や声門の再アタックでは、調波フィットが一時的に外れて残差
+        /// （雑音モデルの入力）が跳ね、原音には無い雑音バースト（「ブツ」）が合成される
+        /// （戯白メリー e+あ: 原音包絡は平坦なまま雑音 PSD が +14dB, 2026-09-24）。
+        /// 有声フレームについて、雑音 PSD の広帯域レベルが近傍（±3〜±8 フレーム）の中央値より
+        /// <see cref="BurstThresholdDb"/> 以上高く、かつ原音の包絡が近傍中央値から
+        /// <see cref="EnvelopeTolDb"/> 以内（＝実際の過渡ではない）のフレームを、中央値 + 2dB まで下げる。
+        /// 子音の破裂や息継ぎは包絡が変化するので対象にならない。N256 で無効化。
+        /// </summary>
+        private const float BurstThresholdDb = 6f;
+        private const float EnvelopeTolDb = 2f;
+        private const float BurstKeepAboveMedianDb = 2f;
+
+        public void SuppressFitErrorBursts(ChunkHandle chunk, int nfrm, float[] segment, int nhop)
+        {
+            var psdLevel = new float[nfrm]; var envDb = new float[nfrm]; var voiced = new bool[nfrm];
+            var nms = new NmView?[nfrm];
+            for (int i = 0; i < nfrm; i++)
+            {
+                var fr = LlsmBindings.Llsm.GetFrame(chunk, i);
+                voiced[i] = LlsmBindings.Llsm.GetFrameF0(fr) > 0;
+                var nm = FrameAccess.TryGetNm(fr);
+                if (nm is not { HasPsd: true } nmv) { psdLevel[i] = float.NaN; continue; }
+                nms[i] = nmv;
+                float[] psd = nmv.ReadPsd();
+                double lin = 0; for (int j = 0; j < psd.Length; j++) lin += Math.Pow(10.0, psd[j] / 10.0);
+                psdLevel[i] = (float)(10.0 * Math.Log10(lin / psd.Length + 1e-30));
+                int lo = Math.Max(0, i * nhop - nhop), hi = Math.Min(segment.Length, i * nhop + nhop);
+                double e = 0; for (int k = lo; k < hi; k++) e += (double)segment[k] * segment[k];
+                envDb[i] = hi > lo ? (float)(10.0 * Math.Log10(e / (hi - lo) + 1e-12)) : -120f;
+            }
+
+            int suppressed = 0; float maxCut = 0;
+            var med = new System.Collections.Generic.List<float>();
+            for (int i = 0; i < nfrm; i++)
+            {
+                if (!voiced[i] || nms[i] == null || float.IsNaN(psdLevel[i])) continue;
+                med.Clear(); var envMed = new System.Collections.Generic.List<float>();
+                for (int d = 3; d <= 8; d++)
+                {
+                    foreach (int k in new[] { i - d, i + d })
+                    {
+                        if (k < 0 || k >= nfrm || !voiced[k] || float.IsNaN(psdLevel[k])) continue;
+                        med.Add(psdLevel[k]); envMed.Add(envDb[k]);
+                    }
+                }
+                if (med.Count < 4) continue;
+                med.Sort(); envMed.Sort();
+                float mPsd = med[med.Count / 2], mEnv = envMed[envMed.Count / 2];
+                float excess = psdLevel[i] - mPsd;
+                if (excess < BurstThresholdDb) continue;
+                if (MathF.Abs(envDb[i] - mEnv) > EnvelopeTolDb) continue; // 実際の過渡（子音・息継ぎ）は残す
+                float cut = excess - BurstKeepAboveMedianDb;
+                float[] psd = nms[i]!.Value.ReadPsd();
+                for (int j = 0; j < psd.Length; j++) psd[j] -= cut;
+                nms[i]!.Value.WritePsd(psd);
+                suppressed++; maxCut = MathF.Max(maxCut, cut);
+            }
+            if (suppressed > 0)
+                _log.Info(Stage, $"Suppressed fit-error noise bursts on {suppressed} voiced frames (max -{maxCut:F1}dB)");
+        }
+
+        /// <summary>
         /// V/UV 境界（±1 フレーム）の有声側 eenv 振幅を最小 50% まで漸減し、
         /// 有声→無声の急変によるポップノイズを抑える。
         /// </summary>
